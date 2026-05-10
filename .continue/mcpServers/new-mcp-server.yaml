@@ -1,0 +1,17 @@
+name: MCP-Local-Server
+version: 0.0.1
+schema: v1
+mcpServers:
+  - name: filesystem
+    command: /opt/homebrew/bin/npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem@latest"
+      - "/Users/rahulkumar/dev/large-language-model"
+    env: {}
+  - name: memory
+    command: /opt/homebrew/bin/npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-memory"
+    env: {}
