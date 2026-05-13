@@ -41,7 +41,7 @@ def add_code_cell(source):
         "source": [line + "\n" for line in source.split("\n")]
     })
 
-add_markdown_cell("# GPT-style Large Language Model (LLM) Training\n\nThis notebook implements a Decoder-only Transformer (GPT architecture) from scratch to perform next-token prediction on 'the-verdict.txt'.")
+add_markdown_cell("# GPT-style Large Language Model (LLM) Training\n\nThis notebook implements a Decoder-only Transformer (GPT architecture) from scratch to perform next-token prediction on '../data/the-verdict.txt'.")
 
 add_code_cell("""import urllib.request
 import torch
@@ -71,7 +71,7 @@ add_markdown_cell("## Data Preparation\nDownload the dataset, tokenize it using 
 
 add_code_cell("""# Download dataset
 url = "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch02/01_main-chapter-code/the-verdict.txt"
-filepath = "the-verdict.txt"
+filepath = "../data/the-verdict.txt"
 try:
     with open(filepath, "r", encoding="utf-8") as f:
         text = f.read()
