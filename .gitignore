@@ -43,6 +43,7 @@ env/
 *.swp
 *.swo
 *~
+runs/
 
 # OS
 .DS_Store
@@ -55,3 +56,4 @@ Thumbs.db
 
 # Logs
 *.log
+apple-silicon/data/
