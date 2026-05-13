@@ -3,7 +3,5 @@ torch>=2.0.0
 datasets>=2.14.0
 tiktoken>=0.3.0
 tqdm>=4.65.0
-ipykernel>=6.0.0
-ipywidgets>=8.0.0
 python-dotenv
-
+hf_transfer
