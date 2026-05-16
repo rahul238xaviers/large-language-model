@@ -50,6 +50,7 @@ class TrainingConfig:
     
     # Hardware & Precision
     dtype: str = "bfloat16" # Critical for M3 AMX performance
+    profile_methods: bool = False
     save_interval: int = 500
     keep_checkpoints: int = 3
     checkpoint_dir: Path = Path("checkpoints")

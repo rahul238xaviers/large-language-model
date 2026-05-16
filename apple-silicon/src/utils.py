@@ -1,6 +1,8 @@
 import math
 import pickle
 import logging
+import time
+from contextlib import contextmanager
 from typing import Optional
 from dataclasses import asdict
 from pathlib import Path
@@ -11,6 +13,44 @@ import mlx.utils as mut
 from config import TrainingConfig
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def timed_log(label: str, enabled: bool = True, log: Optional[logging.Logger] = None):
+    """
+    Context manager that measures wall-clock time for a code block and emits
+    a structured log line when `enabled` is True.
+
+    When `enabled` is False the block executes normally with zero overhead
+    (no timing, no logging).
+
+    Implementation note:
+        Uses `time.perf_counter()` (monotonic, sub-microsecond resolution on
+        macOS) rather than `time.time()` to avoid being affected by NTP adjustments.
+
+    Args:
+        label:   Human-readable name for the timed region.
+        enabled: If False the context manager is a no-op.  Defaults to True.
+        log:     Logger to emit to.  Falls back to the "train" logger if None.
+
+    Example:
+        with timed_log("model_forward", enabled=config.profile_methods, log=logger):
+            logits = model(x)
+        # Emits: "model_forward | 0.342s"
+
+        # Disabled (zero overhead):
+        with timed_log("data_fetch", enabled=False):
+            batch = get_batch()
+    """
+    if not enabled:
+        yield
+        return
+    active_logger = log or logging.getLogger("train")
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        active_logger.info("%s | %.3fs", label, time.perf_counter() - start)
 
 def get_lr(iteration: int, config: TrainingConfig) -> float:
     """
@@ -39,11 +79,29 @@ def get_lr(iteration: int, config: TrainingConfig) -> float:
 class CheckpointManager:
     """
     Manages saving and pruning of MLX model checkpoints and optimizer states.
-    
-    Ensures that only the 'keep_checkpoints' most recent states are kept on disk
-    to prevent storage exhaustion.
+
+    Ensures that only the `keep_checkpoints` most recent states are kept on
+    disk to prevent storage exhaustion during long training runs.
+
+    Checkpoint format:
+        Model weights → `.safetensors`  (flat key-value, safe to load cross-framework)
+        Metadata      → `.meta.pkl`     (iteration, step, val_loss, config dict)
+
+    A `best_model.safetensors` is maintained separately for the weights
+    corresponding to the lowest validation loss seen so far.
     """
     def __init__(self, config: TrainingConfig):
+        """
+        Initialise the checkpoint manager and create the checkpoint directory.
+
+        Args:
+            config: TrainingConfig carrying `checkpoint_dir` and
+                    `keep_checkpoints` fields.
+
+        Example:
+            mgr = CheckpointManager(config)
+            # config.checkpoint_dir/ is created if it did not exist
+        """
         self.config = config
         self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoints = []
