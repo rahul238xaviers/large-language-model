@@ -8,3 +8,4 @@ hf_transfer
 gradio>=3.0.0
 pytest>=8.0.0
 safetensors>=0.4.0
+matplotlib

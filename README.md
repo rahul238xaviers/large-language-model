@@ -1,56 +1,52 @@
-# Large Language Model from Scratch
+# 🦀 Large Language Model from Scratch (Apple Silicon MLX)
 
-This project implements a Large Language Model (LLM) from scratch, based on the book **"Large Language Model from Scratch"** by **Sebastian Raschka**.
+This repository houses a custom **1.6B parameter decoder-only GPT model** optimized for Rust code completion, built and trained on Apple Silicon via MLX.
 
-## Overview
+---
 
-The goal of this project is to demonstrate how to build a language model step by step, starting from the very basics. We will cover:
+## 📖 The Training Journey Book
 
-- Tokenization
-- Building a vocabulary
-- Implementing a Transformer architecture
-- Training the model on a dataset
-- Generating text using the trained model
+We documented our entire engineering path—from architectural layout and resolving 500GB+ OOM crashes on an M3 Ultra to GQA acceleration and implementing advanced decoding engines—in a comprehensive, book-style documentation structure inside the `doc` folder:
 
-This is an educational project aimed at understanding the core concepts behind modern language models like GPT.
+👉 **[Read the Full Rust-GPT LLM Training Journey Book (Chapter-by-Chapter)](doc/training_journey.md)**
 
-## Requirements
+*   **[Chapter 1: The Architectural Blueprint](doc/chapter1_architecture.md)**
+*   **[Chapter 2: The M3 Ultra & The OOM Crash](doc/chapter2_oom_crash.md)**
+*   **[Chapter 3: Stabilization & Memory Control](doc/chapter3_stabilization.md)**
+*   **[Chapter 4: Hardware Optimization & Scaling](doc/chapter4_hardware_acceleration.md)**
+*   **[Chapter 5: The Repetition Crisis & Decoding Engine](doc/chapter5_decoding_upgrades.md)**
+*   **[Chapter 6: The Interactive Playground UI](doc/chapter6_developer_playground.md)**
 
-To run this project, you need:
+---
 
-- Python 3.10+
-- A virtual environment (recommended)
-- Required Python packages listed in `requirements.txt`
+## 🚀 Quick Setup & Playground Launch
 
-## Setup Instructions
+### 1. Requirements & Setup
+Ensure you are using **Python 3.10+** on Apple Silicon (M-series processor recommended) and install dependencies inside your virtual environment:
 
-1. Clone this repository.
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-3. Install the required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+cd apple-silicon
+python3 -m venv .apple_env
+source .apple_env/bin/activate
+pip install -r requirements.txt
+```
 
-## Usage
+### 2. Configure Checkpoint Location
+Set the `CHECKPOINT_PATH` inside a `.env` file at the root of `apple-silicon/`:
 
-1. Download the dataset (`the-verdict.txt`) as described in the notebook.
-2. Run the Jupyter notebook `create_large_language_mode.ipynb` step by step.
-3. Each cell is accompanied by markdown explanations describing what the code does.
+```env
+CHECKPOINT_PATH=runs/run_20260514_183932/checkpoints/step_001000.safetensors
+```
 
-## Project Structure
+### 3. Launch the Developer Playground
+Launch the Gradio 6.0 playground workspace:
 
-- `create_large_language_mode.ipynb` – Main notebook with step-by-step implementation
-- `requirements.txt` – Python dependencies
-- `README.md` – This file
+```bash
+python3 tests/functional/gradio_app.py
+```
 
-## Author
+Open `http://localhost:7860` in your web browser to generate Rust code completions in real time with built-in copy-to-clipboard fallbacks!
 
-Based on the book **"Large Language Model from Scratch"** by **Sebastian Raschka**.
+---
 
-## License
-
-See [LICENSE](LICENSE) for details.
+*Educational project inspired by Sebastian Raschka's "Large Language Models from Scratch" and fully scaled to 1.6 Billion parameters on Metal/Apple Silicon.*

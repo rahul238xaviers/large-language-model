@@ -79,7 +79,7 @@ In practice MLX may use bf16 for gradients too (12–14 bytes/param = ~20 GB), b
 - Effective batch = 128 (same training compute as before, just safer memory distribution)
 - Expected step 0: **~180 GB** (285 / 8 × 5 with some compile reduction for smaller graph)
 - **Expected sustained: ~42.7 GB** (29 GB weights+optimizer+grads + 0.8 GB other activations + 12.9 GB attention scores for batch=4)
-- **Safety margin to 480 GB ceiling: 300 GB** at step 0, 430+ GB sustained ← very safe
+- **Safety margin to 512 GB ceiling: 332 GB** at step 0, 469+ GB sustained ← very safe
 
 ### Comparison Table
 
@@ -134,11 +134,11 @@ print(f"num_prefetch_batches:     {cfg.num_prefetch_batches} (should be ≤ 4)")
 print("\n=== Memory Prediction ===")
 expected_sustained_gb = 42.7
 expected_step0_gb = 180
-margin_step0 = 480 - expected_step0_gb
-margin_sustained = 480 - expected_sustained_gb
+margin_step0 = 512 - expected_step0_gb
+margin_sustained = 512 - expected_sustained_gb
 
 print(f"Expected step 0 peak:      {expected_step0_gb} GB")
-print(f"Safety margin:             {margin_step0} GB (to 480 GB OOM ceiling)")
+print(f"Safety margin:             {margin_step0} GB (to 512 GB OOM ceiling)")
 print(f"Expected sustained:        {expected_sustained_gb} GB")
 print(f"Sustained margin:          {margin_sustained} GB")
 
