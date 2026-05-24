@@ -117,7 +117,7 @@ Only after confirming stable baseline. **Priority order by impact on M3 Ultra:**
 Run this **BEFORE** executing `python3 src/train.py`:
 
 ```bash
-cd /Users/rahulkumar/dev/large-language-model/apple-silicon
+cd apple-silicon
 python3 << 'EOF'
 import mlx.core as mx
 from src.config import TrainingConfig
