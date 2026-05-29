@@ -121,7 +121,11 @@ def build_app() -> gr.Blocks:
                 with gr.Tabs() as tabs:
 
                     with gr.Tab("📦  Data", id="tab_data"):
-                        render_data_preparation_tab(state)
+                        render_data_preparation_tab(
+                            state,
+                            run_id_display=run_id_display,
+                            progress_bar=progress_bar,
+                        )
 
                     with gr.Tab("🧠  Pre-training", id="tab_pretrain"):
                         render_pretraining_tab(state)
@@ -189,7 +193,15 @@ def build_app() -> gr.Blocks:
             inputs  = [state],
             outputs = [state, existing_runs],
         )
+        # Keep global progress bar in sync with any state mutations
+        def _sync_progress(s: dict) -> str:
+            return progress_html(s.get("stage_status", {}))
 
+        state.change(
+            fn      = _sync_progress,
+            inputs  = [state],
+            outputs = [progress_bar],
+        )
         def _on_profile_change(profile: str, current_state: dict) -> tuple[dict, str]:
             from pipeline.orchestration.config_loader import ConfigLoader
             cfg       = ConfigLoader().load(profile)
