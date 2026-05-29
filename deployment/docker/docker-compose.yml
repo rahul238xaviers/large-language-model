@@ -1,0 +1,49 @@
+# =============================================================================
+# GPT Pipeline — Docker Compose
+# =============================================================================
+# Build context is the repository root (../../ relative to this file).
+# Volumes bind-mount host data/, runs/, configs/, and env/ so that:
+#   - The container reads already-downloaded datasets from the host
+#   - Run artifacts written inside the container are persisted to the host
+#   - Config changes on the host are reflected without a rebuild
+#
+# Usage (from repo root via Makefile):
+#   make build     # docker compose build
+#   make up        # docker compose up -d
+#   make down      # docker compose down
+#   make logs      # docker compose logs -f
+# =============================================================================
+
+services:
+  frontend:
+    build:
+      context: ../..                          # repo root
+      dockerfile: deployment/docker/Dockerfile
+    image: gpt-pipeline-frontend:latest
+    platform: linux/arm64                     # native on Apple Silicon M-series
+    container_name: gpt-pipeline-frontend
+    ports:
+      - "${GRADIO_PORT:-7860}:7860"
+    volumes:
+      # Data and run artifacts live on the host filesystem
+      - ../../data:/app/data
+      - ../../runs:/app/runs
+      # Runtime config and env (override baked-in copies)
+      - ../../configs:/app/configs
+      - ../../env:/app/env
+    env_file:
+      # env/.env is created by `make env-init` (copied from env/.env.example)
+      - ../../env/.env
+    environment:
+      # Explicit container-side paths so the pipeline resolves correctly
+      PIPELINE_RUNS_DIR:   /app/runs
+      PIPELINE_CACHE_DIR:  /app/data/datasets
+      GRADIO_SERVER_NAME:  "0.0.0.0"
+      GRADIO_SERVER_PORT:  "7860"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s

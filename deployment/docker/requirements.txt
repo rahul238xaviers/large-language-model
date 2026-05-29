@@ -1,0 +1,20 @@
+# Docker image requirements — mlx intentionally excluded.
+# mlx depends on Apple Metal (macOS) and cannot run inside a Linux container.
+# Stages 5 (pre-training) and 7 (live inference) must be run natively.
+# All other pipeline stages and the Gradio frontend work fully in this image.
+
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# HuggingFace / dataset handling (Stages 1-3)
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+hf_transfer
+
+# Data profiling (Stage 2)
+pandas>=2.0.0
+pyarrow>=14.0.0
+tiktoken>=0.3.0
+
+# Gradio UI (Stages 1-3, 6, 8, 9)
+gradio>=4.0.0
