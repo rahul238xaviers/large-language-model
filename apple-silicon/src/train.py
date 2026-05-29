@@ -61,7 +61,7 @@ def build_run_logger(log_file: Path) -> logging.Logger:
     logger.addHandler(stream_handler)
     return logger
 
-def setup_run_dir(config):
+def setup_run_dir(config: TrainingConfig) -> Path:
     """
     Create a timestamped run directory and save the resolved config as JSON.
 
@@ -97,7 +97,7 @@ def setup_run_dir(config):
     return run_dir
 
 class MetricsLogger:
-    def __init__(self, run_dir):
+    def __init__(self, run_dir: Path):
         """
         Initialise the CSV metrics logger and write the header row.
 
@@ -122,7 +122,7 @@ class MetricsLogger:
             writer = csv.writer(f)
             writer.writerow(self.headers)
 
-    def log(self, metrics_dict):
+    def log(self, metrics_dict: dict[str, float]) -> None:
         """
         Append one row of scalar metrics to the CSV file.
 
@@ -140,7 +140,7 @@ class MetricsLogger:
             writer = csv.writer(f)
             writer.writerow([metrics_dict.get(h, "") for h in self.headers])
 
-def get_lr(it, config):
+def get_lr(it: int, config: TrainingConfig) -> float:
     """
     Cosine learning-rate schedule with linear warmup.
 
@@ -180,7 +180,7 @@ def get_lr(it, config):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
-def make_step(model, optimizer, config):
+def make_step(model: GPTModel, optimizer: optim.Optimizer, config: TrainingConfig):
     """
     Build and return a compiled MLX micro-step function.
 
@@ -551,7 +551,7 @@ def _check_model_dtype(model: Any, expected_dtype_str: str, iteration: int, logg
     else:
         logger.info("DtypeCheck OK   | Iter %d | model params are [%s]", iteration, actual)
 
-def train():
+def train() -> None:
     """
     Main training entry point for the 1.518B GPT model on Apple Silicon.
 
