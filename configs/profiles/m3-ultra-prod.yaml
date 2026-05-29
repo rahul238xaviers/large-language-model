@@ -1,0 +1,11 @@
+# M3 Ultra production training profile.
+# Merged on top of configs/base/*.yaml.
+
+log_level: "INFO"
+
+download:
+  cache_dir: "data/datasets"
+
+generation:
+  ollama_base_url: "http://localhost:11434"
+  ollama_model: "llama3"

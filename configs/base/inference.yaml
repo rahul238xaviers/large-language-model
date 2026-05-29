@@ -1,0 +1,14 @@
+# Inference / serving defaults.
+# These values are used by the `serve` CLI sub-command and InferenceServer.
+# All keys can be overridden at the CLI level or via env vars.
+inference:
+  # ── Decode hyperparameters ──────────────────────────────────────── #
+  max_new_tokens:     128
+  temperature:        0.7
+  top_k:              50
+  top_p:              0.9
+  repetition_penalty: 1.15
+  # ── Server settings ─────────────────────────────────────────────── #
+  port:               7860
+  server_name:        "0.0.0.0"
+  share:              false

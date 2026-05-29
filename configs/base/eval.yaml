@@ -1,0 +1,17 @@
+# Evaluation configuration.
+
+eval:
+  # Fraction of sequences.npy used as the held-out eval split.
+  # The TAIL of the dataset is used (no shuffle) for determinism.
+  eval_fraction: 0.05
+
+  # Sequences per forward pass during evaluation.
+  # Larger values are faster but consume more memory.
+  eval_batch_size: 8
+
+  # Which checkpoints to evaluate.
+  # Options:
+  #   "all"   — evaluate every step_*.safetensors in the run
+  #   "last"  — evaluate only the final checkpoint
+  #   "latest" — evaluate only the highest-numbered checkpoint present
+  checkpoints: "all"

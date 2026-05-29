@@ -1,0 +1,5 @@
+# Top-level application configuration.
+# Overridden by profile configs, .env, and CLI flags in that order.
+
+runs_dir: "runs"
+log_level: "INFO"
