@@ -73,7 +73,11 @@ def build_app() -> gr.Blocks:
         # ``state`` carries a PipelineState dict across all components.
         # Every callback that mutates workflow data must accept it as input
         # and return an updated copy as output.
-        state = gr.State(value=initial_state)
+        # NOTE: pass the result of initial_state(), not the function.
+        # Passing a callable causes Gradio to register a load event; before
+        # that event completes, handlers receive the function object instead
+        # of a dict, making every .get() call raise AttributeError.
+        state = gr.State(value=initial_state())
 
         # ── Header ──────────────────────────────────────────────── #
         with gr.Row(elem_classes=["pipeline-header"]):
