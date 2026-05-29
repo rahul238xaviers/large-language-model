@@ -345,7 +345,6 @@ def render_data_preparation_tab(
                     max_lines     = 30,
                     interactive   = False,
                     elem_classes  = ["log-terminal"],
-                    show_copy_button = True,
                 )
 
             # ── Stage 2: Profile ─────────────────────────────────── #
@@ -379,7 +378,6 @@ def render_data_preparation_tab(
                     max_lines     = 30,
                     interactive   = False,
                     elem_classes  = ["log-terminal"],
-                    show_copy_button = True,
                 )
 
             # ── Stage 3: Select ──────────────────────────────────── #
@@ -438,7 +436,6 @@ def render_data_preparation_tab(
                     max_lines     = 30,
                     interactive   = False,
                     elem_classes  = ["log-terminal"],
-                    show_copy_button = True,
                 )
 
     # ── Derive the profile string from state for callbacks ─────────── #

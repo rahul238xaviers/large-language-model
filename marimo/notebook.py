@@ -148,11 +148,12 @@ def _():
     import numpy as np
     import hashlib
     import psutil
+    import time
 
     print("✅ Imports loaded")
     print(f"CPU Cores: {psutil.cpu_count()}")
     print(f"RAM Available: {psutil.virtual_memory().available / (1024**3):.1f} GB")
-    return Counter, hashlib, np, tqdm
+    return Counter, hashlib, np, time, tqdm
 
 
 @app.cell(hide_code=True)
@@ -542,15 +543,14 @@ def _(mo):
 
 
 @app.cell
-def _():
+def _(tqdm):
     import requests
-    from tqdm import tqdm
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def get_score(text, doc_type):
         model = "qwen2.5-coder:7b" if doc_type == "python" else "qwen2.5:7b-instruct"
         prompt = f"Rate this {'code' if doc_type=='python' else 'text'} quality 0-1. Reply only number:\n\n{text[:2000]}"
-    
+
         try:
             r = requests.post("http://localhost:11434/api/generate", 
                              json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0}})
@@ -574,12 +574,12 @@ def _(
     def add_scores(dataset, text_field, doc_type, sample_size=50000):
         dataset = dataset.select(range(min(sample_size, len(dataset))))
         scores = [None] * len(dataset)
-    
+
         with ThreadPoolExecutor(max_workers=8) as ex:
             futures = {ex.submit(get_score, doc[text_field], doc_type): i for i, doc in enumerate(dataset)}
             for f in tqdm(as_completed(futures), total=len(futures)):
                 scores[futures[f]] = f.result()
-    
+
         return dataset.add_column("ask_llm_score", scores)
 
     # Run

@@ -373,7 +373,6 @@ def render_analytics_tab(state: gr.State) -> None:
                     lines=10, max_lines=25,
                     interactive=False,
                     elem_classes=["log-terminal"],
-                    show_copy_button=True,
                 )
 
                 eval_results_panel = gr.HTML(
@@ -393,7 +392,6 @@ def render_analytics_tab(state: gr.State) -> None:
                     lines=8, max_lines=20,
                     interactive=False,
                     elem_classes=["log-terminal"],
-                    show_copy_button=True,
                 )
 
                 gr.Markdown("#### Figures")

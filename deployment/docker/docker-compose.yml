@@ -40,6 +40,13 @@ services:
       PIPELINE_CACHE_DIR:  /app/data/datasets
       GRADIO_SERVER_NAME:  "0.0.0.0"
       GRADIO_SERVER_PORT:  "7860"
+      # Force Python to flush stdout/stderr immediately — critical for live log tailing
+      PYTHONUNBUFFERED: "1"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"     # rotate at 50 MB
+        max-file: "5"       # keep 5 rotated files
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:7860/"]

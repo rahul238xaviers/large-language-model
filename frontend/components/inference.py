@@ -410,10 +410,8 @@ def render_inference_tab(state: gr.State) -> None:
                 chatbot = gr.Chatbot(
                     label="",
                     height=420,
-                    show_copy_button=True,
                     elem_classes=["chatbot"],
                     avatar_images=(None, None),
-                    bubble_full_width=False,
                 )
 
                 with gr.Row():
@@ -456,7 +454,6 @@ def render_inference_tab(state: gr.State) -> None:
                     lines=8, max_lines=20,
                     interactive=False,
                     elem_classes=["log-terminal"],
-                    show_copy_button=True,
                 )
 
                 metadata_panel = gr.HTML(_meta_placeholder(), label="Model metadata")

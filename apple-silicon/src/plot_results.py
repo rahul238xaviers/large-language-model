@@ -46,7 +46,7 @@ def plot_run(run_dir):
     axes[1, 1].ticklabel_format(style='sci', axis='y', scilimits=(0,0))
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout(rect=(0, 0.03, 1, 0.95))
     
     output_path = run_path / "training_curves.png"
     plt.savefig(output_path)

@@ -23,10 +23,21 @@ All backend calls live exclusively in ``frontend/components/``.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import gradio as gr
+
+# ── Logging ── configure once at import time so every module's logger
+# writes timestamped lines to stdout, visible in both Docker and native logs.
+logging.basicConfig(
+    level   = logging.INFO,
+    format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt = "%Y-%m-%d %H:%M:%S",
+    stream  = sys.stdout,
+)
+log = logging.getLogger("frontend")
 
 from frontend.theme import THEME, CSS
 from frontend.state import (
@@ -55,8 +66,6 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(
         title      = "GPT Pipeline",
-        theme      = THEME,
-        css        = CSS,
         fill_height= True,
     ) as app:
 
@@ -232,13 +241,17 @@ def main() -> None:
     parser.add_argument("--debug",  action="store_true",       help="Enable Gradio debug mode")
     args = parser.parse_args()
 
+    log.info("Starting GPT Pipeline UI  port=%s  host=%s", args.port, args.host)
     app = build_app()
+    log.info("App built — launching Gradio")
     app.launch(
         server_name = args.host,
         server_port = args.port,
         share       = args.share,
         debug       = args.debug,
         show_error  = True,
+        theme       = THEME,
+        css         = CSS,
     )
 
 

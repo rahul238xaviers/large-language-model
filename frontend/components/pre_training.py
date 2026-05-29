@@ -348,7 +348,6 @@ def render_pretraining_tab(state: gr.State) -> None:
                     lines=10, max_lines=25,
                     interactive=False,
                     elem_classes=["log-terminal"],
-                    show_copy_button=True,
                 )
 
             # ── Stage 5: Pretrain ─────────────────────────────────── #
@@ -428,7 +427,6 @@ def render_pretraining_tab(state: gr.State) -> None:
                             lines=14, max_lines=40,
                             interactive=False,
                             elem_classes=["log-terminal"],
-                            show_copy_button=True,
                         )
                     with gr.Column(scale=2):
                         metrics_panel = gr.HTML(

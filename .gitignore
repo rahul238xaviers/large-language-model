@@ -48,6 +48,9 @@ runs/
 
 # OS
 .DS_Store
+
+# Application logs
+logs/
 Thumbs.db
 
 # Data files (optional - uncomment if you don't want to commit data)
