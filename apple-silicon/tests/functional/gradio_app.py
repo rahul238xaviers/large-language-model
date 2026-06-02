@@ -9,7 +9,7 @@ import tiktoken
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[2]
-SRC = ROOT / "src"
+SRC = ROOT / "src" / "pre-training"
 sys.path.insert(0, str(SRC))
 
 from config import TrainingConfig

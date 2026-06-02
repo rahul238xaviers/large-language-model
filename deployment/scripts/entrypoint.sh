@@ -9,6 +9,6 @@
 # =============================================================================
 set -e
 
-export PYTHONPATH="/app/apple-silicon/src:/app${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/app/apple-silicon/src/pre-training:/app${PYTHONPATH:+:$PYTHONPATH}"
 
 exec python3 -m frontend "$@"

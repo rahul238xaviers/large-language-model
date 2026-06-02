@@ -20,7 +20,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT  = Path(__file__).parents[2]       # .../large-language-model/
-_LEGACY_SRC = _REPO_ROOT / "apple-silicon" / "src"
+_LEGACY_SRC = _REPO_ROOT / "apple-silicon" / "src" / "pre-training"
 
 
 def _ensure_legacy_on_path() -> None:
