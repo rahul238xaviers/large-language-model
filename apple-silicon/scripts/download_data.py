@@ -2,7 +2,10 @@ import os
 from huggingface_hub import hf_hub_download, HfApi
 
 def download_rust_data():
-    local_dir = "./data"
+    from pathlib import Path
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent  # large-language-model/
+    local_dir = str(repo_root / "data" / "datasets")
     repo_id = "bigcode/the-stack"
     data_dir = "data/rust"
     

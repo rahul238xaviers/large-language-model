@@ -44,7 +44,10 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
     """
     try:
         encoder = tiktoken.get_encoding("cl100k_base")
-        local_data_path = os.path.join(os.getcwd(), "data/rust")
+        from pathlib import Path
+        file_dir = Path(__file__).resolve().parent
+        repo_root = file_dir.parents[2]  # large-language-model/
+        local_data_path = str(repo_root / "data" / "datasets" / "rust")
         local_files = sorted(glob.glob(os.path.join(local_data_path, "*.parquet")))
         if not local_files: return
         my_files = [f for i, f in enumerate(local_files) if i % num_workers == worker_id]
