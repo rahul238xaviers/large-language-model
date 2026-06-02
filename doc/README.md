@@ -22,13 +22,12 @@ We documented our entire engineering path—from architectural layout and resolv
 ## 🚀 Quick Setup & Playground Launch
 
 ### 1. Requirements & Setup
-Ensure you are using **Python 3.10+** on Apple Silicon (M-series processor recommended) and install dependencies inside your virtual environment:
+Ensure you are using **Python 3.10+** and install dependencies using **uv** inside your virtual environment:
 
 ```bash
-cd apple-silicon
-python3 -m venv .apple_env
-source .apple_env/bin/activate
-pip install -r requirements.txt
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements/requirements.txt
 ```
 
 ### 2. Configure Checkpoint Location

@@ -8,7 +8,7 @@
 #     linux/arm64 container. No mlx — training and live inference are excluded.
 #
 #   NATIVE  (make run / make train / make <stage>)
-#     Runs all 9 stages directly in the apple-silicon/.apple_env virtualenv.
+#     Runs all 9 stages directly in the .venv virtualenv.
 #     Requires macOS Apple Silicon. Stages 5 and 7 (mlx) only work here.
 #
 # Quick start:
@@ -18,7 +18,7 @@
 
 SHELL        := /bin/bash
 COMPOSE_FILE := deployment/docker/docker-compose.yml
-VENV         := apple-silicon/.apple_env/bin/activate
+VENV         := .venv/bin/activate
 PYTHON       := python3
 PROFILE      ?= local-dev
 RUN_ID       ?=
@@ -83,11 +83,10 @@ ps: ## Show container status
 # ── Native · Apple Silicon ────────────────────────────────────────────────────
 install: ## Create / update the Python virtualenv and install all deps
 	@if [ ! -f "$(VENV)" ]; then \
-	  $(PYTHON) -m venv apple-silicon/.apple_env; \
+	  uv venv .venv; \
 	  echo "Virtualenv created."; \
 	fi
-	source $(VENV) && pip install --upgrade pip && \
-	  pip install -r pipeline/requirements.txt
+	source $(VENV) && uv pip install -r requirements/requirements.txt
 	@echo "Done — activate with: source $(VENV)"
 
 run: ## Launch the Gradio frontend natively (mlx available, all 9 stages)
@@ -139,7 +138,7 @@ env-init: ## Copy env/.env.example → env/.env if not present
 	fi
 
 clean: ## Remove Python bytecode and __pycache__ directories
-	find . \( -path './.git' -o -path './apple-silicon/.apple_env' -o -path './.venv' \) \
+	find . \( -path './.git' -o -path './.venv' \) \
 	  -prune -o \( -type d -name '__pycache__' -print \) | xargs -r rm -rf
 	find . -name '*.pyc' -not -path './.git/*' -delete
 

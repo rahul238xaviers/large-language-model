@@ -1,0 +1,37 @@
+# Consolidated Python Dependencies for GPT Pipeline
+# Supports local pipeline, macOS MLX training, and Windows CUDA training.
+
+# Core pipeline infrastructure
+pyyaml>=6.0
+python-dotenv>=1.0
+requests>=2.28.0
+
+# Dataset downloads & Hugging Face integrations
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+hf_transfer
+safetensors>=0.4.0
+
+# Stage 2 profiling & analytics
+pandas>=2.0.0
+pyarrow>=14.0.0
+tiktoken>=0.3.0
+matplotlib
+
+# Stage 5 training / execution
+# Note: torch is used for CUDA pre-training and vocab checks.
+torch>=2.0.0
+
+# Note: mlx requires Apple Silicon (macOS 13.5+). It will install and run only on macOS.
+mlx>=0.22.0
+
+# Gradio Playground & Developer UI
+gradio>=4.0.0
+
+# Testing and Notebook environments
+pytest>=8.0.0
+tqdm>=4.65.0
+ipykernel>=6.0.0
+
+# For CUDA support on Windows/Linux, you can uncomment this:
+# --extra-index-url https://download.pytorch.org/whl/cu121
