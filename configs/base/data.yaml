@@ -32,6 +32,18 @@ download:
       subset: "sample-10BT"
       split: "train"
 
+    - name: rust_coder
+      repo_id: "Convence/Rust-Coder"
+      repo_type: "dataset"
+      method: "load_dataset"
+      split: "train"
+
+    - name: rust_github_issues
+      repo_id: "matteopilotto/rust-github-issues"
+      repo_type: "dataset"
+      method: "load_dataset"
+      split: "train"
+
 profiling:
   # tiktoken encoding used for token-level metrics
   tokenizer: "cl100k_base"

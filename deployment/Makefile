@@ -83,7 +83,7 @@ ps: ## Show container status
 # ── Native · Apple Silicon ────────────────────────────────────────────────────
 install: ## Create / update the Python virtualenv and install all deps
 	@if [ ! -f "$(VENV)" ]; then \
-	  uv venv .venv; \
+	  uv venv --python 3.13 .venv; \
 	  echo "Virtualenv created."; \
 	fi
 	source $(VENV) && uv pip install -r requirements/requirements.txt
