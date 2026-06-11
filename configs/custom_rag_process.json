@@ -1,0 +1,25 @@
+{
+  "sources": [
+    {
+      "name": "Convence/Rust-Coder",
+      "cache_dir": "data/datasets/rust_coder_cache",
+      "field_mapping": {
+        "instruction": "instruction",
+        "context": "explanation",
+        "response": "code"
+      }
+    },
+    {
+      "name": "matteopilotto/rust-github-issues",
+      "cache_dir": "data/datasets/rust_github_issues_cache",
+      "field_mapping": {
+        "instruction": "title",
+        "context": "body",
+        "response": ""
+      }
+    }
+  ],
+  "output_dir": "data/processed",
+  "seed": 42,
+  "train_ratio": 0.85
+}

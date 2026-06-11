@@ -1,0 +1,7 @@
+# Local development profile.
+# Merged on top of configs/base/*.yaml.
+
+log_level: "DEBUG"
+
+download:
+  cache_dir: "data/datasets"

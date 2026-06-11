@@ -25,6 +25,11 @@ venv/
 ENV/
 env/
 .venv/
+data/
+
+# Environment variables
+.env
+*.env
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -39,9 +44,13 @@ env/
 *.swp
 *.swo
 *~
+runs/
 
 # OS
 .DS_Store
+
+# Application logs
+logs/
 Thumbs.db
 
 # Data files (optional - uncomment if you don't want to commit data)
@@ -51,3 +60,5 @@ Thumbs.db
 
 # Logs
 *.log
+apple-silicon/data/
+.continue/

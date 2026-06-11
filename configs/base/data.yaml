@@ -1,0 +1,98 @@
+# Data lifecycle configuration.
+# All paths are relative to the repository root unless absolute.
+
+download:
+  # Centralized cache root for raw dataset files (shared across runs).
+  cache_dir: "data/datasets"
+
+  # Hugging Face authentication token.
+  # Prefer setting HF_TOKEN in .env or the environment rather than here.
+  hf_token: null
+
+  # Named dataset sources.  Each source is downloaded exactly once per run
+  # when `pipeline data-download` is invoked (unless --source filters apply).
+  sources:
+    - name: rust_stack
+      repo_id: "bigcode/the-stack"
+      repo_type: "dataset"
+      method: "hf_hub_files"   # enumerate + download individual parquet files
+      data_dir: "data/rust"    # sub-path inside the HF repository to target
+
+    - name: starcoder_python
+      repo_id: "bigcode/starcoderdata"
+      repo_type: "dataset"
+      method: "load_dataset"
+      subset: "python"
+      split: "train"
+
+    - name: fineweb_edu
+      repo_id: "HuggingFaceFW/fineweb-edu"
+      repo_type: "dataset"
+      method: "load_dataset"
+      subset: "sample-10BT"
+      split: "train"
+
+    - name: rust_coder
+      repo_id: "Convence/Rust-Coder"
+      repo_type: "dataset"
+      method: "load_dataset"
+      split: "train"
+
+    - name: rust_github_issues
+      repo_id: "matteopilotto/rust-github-issues"
+      repo_type: "dataset"
+      method: "load_dataset"
+      split: "train"
+
+profiling:
+  # tiktoken encoding used for token-level metrics
+  tokenizer: "cl100k_base"
+
+  # Max documents sampled per source.  Reduce for faster iterations.
+  sample_size: 100000
+
+  # Maps source name → the column that holds the raw text
+  text_columns:
+    rust_stack: "content"
+    starcoder_python: "content"
+    fineweb_edu: "text"
+
+selection:
+  # How many rows to buffer per Arrow record batch when writing
+  batch_size: 2048
+
+  policy:
+    # Heuristic quality gate (0–1).  Documents below this are dropped.
+    min_quality_score: 0.2
+
+    # Code-likeness bounds.  Set min to 0.0 to include prose as well.
+    min_code_score: 0.0
+    max_code_score: 1.0
+
+    # Raw character-length filter.  max_char_length: 0 means no upper limit.
+    min_char_length: 150
+    max_char_length: 0
+
+    # Hash-based exact deduplication within each source.
+    deduplicate: true
+
+    # Abort if source-level duplicate rate exceeds this fraction.
+    max_duplicate_rate: 0.50
+
+    # Optional per-source blend weights for the merged dataset.
+    # Omit or leave empty to include all sources proportionally.
+    source_blend: {}
+
+tokenisation:
+  # tiktoken encoding (must match profiling.tokenizer)
+  encoding: "cl100k_base"
+
+  # Tokens per training sequence.  Must match model block_size.
+  block_size: 2048
+
+  # Window stride.  null = non-overlapping (stride == block_size).
+  # Set to 1024 for 50% overlap — doubles the number of sequences.
+  stride: null
+
+  # Column in the Stage 3 Arrow file that holds the raw text.
+  text_column: "text"
