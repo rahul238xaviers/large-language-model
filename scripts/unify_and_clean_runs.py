@@ -13,8 +13,16 @@ import sys
 import json
 import random
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+
+def get_record_hash(record: Dict[str, Any]) -> str:
+    """Generate SHA-256 hash for instruction-response pair."""
+    instruction = record.get("instruction", "").strip()
+    response = record.get("response", "").strip()
+    content = f"{instruction}\n{response}"
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 # Set repository root absolutely
 repo_root = Path("/Users/rahulkumar/dev/large-language-model")
@@ -148,22 +156,65 @@ async def main():
         print("❌ No candidates collected. Exiting.")
         return
         
+    # Setup cache directory and file path
+    cache_file = TARGET_DIR / "validation_cache.json"
+    validation_cache = {}
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                validation_cache = json.load(f)
+            print(f"📦 Loaded {len(validation_cache)} entries from validation cache.")
+        except Exception as e:
+            print(f"⚠️ Failed to load validation cache: {e}")
+
     # Validate candidates
     print("\n⚡ Validating and filtering candidates...")
     valid_records = []
     validated_count = 0
+    cache_hits = 0
+    cache_updated = False
     
     for record in candidates:
         validated_count += 1
-        cleaned, reason = await validate_candidate(record, compilation_lock)
+        r_hash = get_record_hash(record)
         
-        if cleaned:
-            valid_records.append(cleaned)
-            print(f"  [{validated_count}/{len(candidates)}] ✅ VALID: {record.get('instruction')[:60]}...")
-        else:
-            print(f"  [{validated_count}/{len(candidates)}] ❌ DISCARDED ({reason}): {record.get('instruction')[:60]}...")
+        if r_hash in validation_cache:
+            cache_hits += 1
+            entry = validation_cache[r_hash]
+            is_valid = entry.get("is_valid", False)
+            reason = entry.get("reason", "Unknown cached reason")
+            cleaned = entry.get("cleaned_record")
             
-    print(f"\n✨ Validation phase complete. {len(valid_records)}/{len(candidates)} records passed validation.")
+            if is_valid and cleaned:
+                valid_records.append(cleaned)
+        else:
+            cleaned, reason = await validate_candidate(record, compilation_lock)
+            is_valid = cleaned is not None
+            validation_cache[r_hash] = {
+                "is_valid": is_valid,
+                "reason": reason,
+                "cleaned_record": cleaned
+            }
+            cache_updated = True
+            
+            if is_valid:
+                valid_records.append(cleaned)
+                print(f"  [{validated_count}/{len(candidates)}] ✅ VALID (Compiled): {record.get('instruction')[:60]}...")
+            else:
+                print(f"  [{validated_count}/{len(candidates)}] ❌ DISCARDED ({reason}): {record.get('instruction')[:60]}...")
+                
+    print(f"\n⚡ Validation stats: {cache_hits} cache hits, {len(candidates) - cache_hits} new evaluations compiled.")
+    print(f"✨ Validation phase complete. {len(valid_records)}/{len(candidates)} records passed validation.")
+    
+    # Save validation cache if new evaluations occurred
+    if cache_updated:
+        try:
+            TARGET_DIR.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(validation_cache, f, indent=2)
+            print(f"💾 Saved updated validation cache to {cache_file} ({len(validation_cache)} total entries).")
+        except Exception as e:
+            print(f"⚠️ Failed to save validation cache: {e}")
     
     # Deduplicate by instruction (keeping the longest/richest response)
     print("\n⚡ Deduplicating by instruction...")
