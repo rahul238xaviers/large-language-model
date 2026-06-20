@@ -1,21 +1,29 @@
-# 🦀 Large Language Model from Scratch (Apple Silicon MLX)
+# 🦀 Large Language Model from Scratch
 
-This repository houses a custom **1.6B parameter decoder-only GPT model** optimized for Rust code completion, built and trained on Apple Silicon via MLX.
+This repository contains two pipelines for training a Large Language Model from scratch: a native **C++ Training Engine** and an **Apple Silicon MLX (Python) Pipeline**.
 
 ---
 
-## 📖 The Training Journey Book
+## 🏛️ C++ Native Training Pipeline
+Contains the native C++ implementation of Parquet data ingestion, BPE tokenization, and model training.
 
-We documented our entire engineering path—from architectural layout and resolving 500GB+ OOM crashes on an M3 Ultra to GQA acceleration and implementing advanced decoding engines—in a comprehensive, book-style documentation structure inside the `doc` folder:
+*   👉 **[C4 Architecture & Development Sprint Plan](../cpp/doc/c4_sprint_plan.md)**
+*   👉 **[System Container Architecture](../cpp/doc/architecture.md)**
 
-👉 **[Read the Full Rust-GPT LLM Training Journey Book (Chapter-by-Chapter)](doc/training_journey.md)**
+---
 
-*   **[Chapter 1: The Architectural Blueprint](doc/chapter1_architecture.md)**
-*   **[Chapter 2: The M3 Ultra & The OOM Crash](doc/chapter2_oom_crash.md)**
-*   **[Chapter 3: Stabilization & Memory Control](doc/chapter3_stabilization.md)**
-*   **[Chapter 4: Hardware Optimization & Scaling](doc/chapter4_hardware_acceleration.md)**
-*   **[Chapter 5: The Repetition Crisis & Decoding Engine](doc/chapter5_decoding_upgrades.md)**
-*   **[Chapter 6: The Interactive Playground UI](doc/chapter6_developer_playground.md)**
+## 🐍 Python MLX training Pipeline
+Contains the Python-based 1.6B parameter decoder-only GPT model optimization journey on Apple Silicon.
+
+👉 **[Read the Full Python MLX Training Journey Book](../python/doc/training_journey.md)**
+
+*   **[Chapter 1: The Architectural Blueprint](../python/doc/chapter1_architecture.md)**
+*   **[Chapter 2: The M3 Ultra & The OOM Crash](../python/doc/chapter2_oom_crash.md)**
+*   **[Chapter 3: Stabilization & Memory Control](../python/doc/chapter3_stabilization.md)**
+*   **[Chapter 4: Hardware Optimization & Scaling](../python/doc/chapter4_hardware_acceleration.md)**
+*   **[Chapter 5: The Repetition Crisis & Decoding Engine](../python/doc/chapter5_decoding_upgrades.md)**
+*   **[Chapter 6: The Interactive Playground UI](../python/doc/chapter6_developer_playground.md)**
+*   **[Memory Analysis & Safety Checklist](../python/doc/MEMORY_ANALYSIS.md)**
 
 ---
 
