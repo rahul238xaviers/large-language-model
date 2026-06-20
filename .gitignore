@@ -45,6 +45,8 @@ data/
 *.swo
 *~
 runs/
+.cache/
+compile_commands.json
 
 # OS
 .DS_Store
