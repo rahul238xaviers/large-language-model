@@ -11,10 +11,13 @@ import os
 import sys
 from pathlib import Path
 
-# Add repository root to path
-repo_root = Path(__file__).resolve().parent.parent
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+# Add python codebase root to path
+python_root = Path(__file__).resolve().parent.parent
+if str(python_root) not in sys.path:
+    sys.path.insert(0, str(python_root))
+
+# Git repository root
+repo_root = python_root.parent
 
 from dotenv import load_dotenv
 load_dotenv(repo_root / "env" / ".env")
@@ -42,7 +45,7 @@ def parse_args():
 def main():
     args = parse_args()
     
-    config_dir = repo_root / "configs"
+    config_dir = python_root / "configs"
     loader = ConfigLoader(config_dir)
     cfg = loader.load(profile=args.profile)
     

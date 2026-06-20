@@ -33,10 +33,13 @@ import orjson
 from tqdm import tqdm
 from datasets import load_dataset
 
-# Add repository root to path
-repo_root = Path(__file__).resolve().parent.parent
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+# Add python codebase root to path
+python_root = Path(__file__).resolve().parent.parent
+if str(python_root) not in sys.path:
+    sys.path.insert(0, str(python_root))
+
+# Git repository root
+repo_root = python_root.parent
 
 # Default configuration
 DEFAULT_CONFIG = {

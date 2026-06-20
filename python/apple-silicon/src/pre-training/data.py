@@ -47,7 +47,7 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
         encoder = tiktoken.get_encoding("cl100k_base")
         from pathlib import Path
         file_dir = Path(__file__).resolve().parent
-        repo_root = file_dir.parents[2]  # large-language-model/
+        repo_root = file_dir.parents[3]  # large-language-model/ (git root)
         local_data_path = str(repo_root / "data" / "datasets" / "rust")
         local_files = sorted(glob.glob(os.path.join(local_data_path, "*.parquet")))
         if not local_files: return

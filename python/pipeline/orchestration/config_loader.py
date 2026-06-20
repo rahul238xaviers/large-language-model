@@ -25,7 +25,25 @@ class ConfigLoader:
         base = self._load_base()
         profile_cfg = self._load_profile(profile)
         merged = self._deep_merge(base, profile_cfg)
-        return self._apply_env_overrides(merged)
+        resolved = self._apply_env_overrides(merged)
+
+        # Git repository root (parent of python/)
+        repo_root = Path(__file__).resolve().parents[3]
+
+        # Resolve runs_dir relative to git root
+        runs_dir_str = resolved.get("runs_dir", "runs")
+        runs_dir = Path(runs_dir_str)
+        if not runs_dir.is_absolute():
+            resolved["runs_dir"] = str(repo_root / runs_dir)
+
+        # Resolve cache_dir relative to git root
+        download_cfg = resolved.setdefault("download", {})
+        cache_dir_str = download_cfg.get("cache_dir", "data/datasets")
+        cache_dir = Path(cache_dir_str)
+        if not cache_dir.is_absolute():
+            download_cfg["cache_dir"] = str(repo_root / cache_dir)
+
+        return resolved
 
     # ------------------------------------------------------------------ #
     # Private helpers                                                       #
