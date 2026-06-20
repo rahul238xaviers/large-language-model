@@ -18,7 +18,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 # Set repository root absolutely
 repo_root = Path("/Users/rahulkumar/dev/large-language-model")
-sys.path.insert(0, str(repo_root))
+python_root = repo_root / "python"
+sys.path.insert(0, str(python_root))
 
 # Try importing tomllib, fallback to toml
 try:
