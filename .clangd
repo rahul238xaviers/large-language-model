@@ -1,0 +1,7 @@
+CompileFlags:
+  Add: [
+    "-std=c++20",
+    "-I/opt/homebrew/include",
+    "-Icpp/include",
+    "-isysroot/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+  ]
