@@ -7,11 +7,15 @@
 #include <iostream>
 #include <memory>
 #include <parquet/arrow/reader.h>
+#include <vector>
 
 DataIngestion::DataIngestion(const std::string &data_dir,
-                             size_t max_shard_bytes) {
+                             size_t max_shard_bytes, size_t batch_size,
+                             size_t sequence_length) {
   data_dir_ = data_dir;
   max_shard_bytes_ = max_shard_bytes;
+  batch_size_ = batch_size;
+  sequence_length_ = sequence_length;
 
   for (const auto &entry : std::filesystem::directory_iterator(data_dir)) {
 
@@ -65,12 +69,30 @@ void DataIngestion::tokenize_cpp_corpus(std::shared_ptr<arrow::Table> table,
     for (int64_t j = 0; j < string_array->length(); ++j) {
       if (string_array->IsValid(j)) {
         std::string text = string_array->GetString(j);
+        // The raw tokens are sent for tokenisation.
+        bpe_encode(text, flat_tokens_, vocab_);
       }
     }
   }
 }
 void DataIngestion::generate_training_sequences() {
   std::cout << "Generating training sequences..." << std::endl;
+
+  token_batches_.clear();
+  current_batch_idx_ = 0;
+
+  size_t step = sequence_length_ + 1;
+
+  if (flat_tokens_.size() < step) {
+    return; // Not enough tokens to create sequence
+  }
+
+  for (size_t i = 0; i + step <= flat_tokens_.size(); i += step) {
+
+    std::vector<int> sequence(flat_tokens_.begin() + i,
+                              flat_tokens_.begin() + i + step);
+    token_batches_.push_back(sequence);
+  }
 }
 void DataIngestion::bpe_encode(
     const std::string &text, std::vector<int> &tokens,

@@ -9,8 +9,8 @@
 
 class DataIngestion {
 public:
-  DataIngestion(const std::string &data_dir,
-                size_t max_shard_bytes = 100ULL << 20);
+  DataIngestion(const std::string &data_dir, size_t max_shard_bytes,
+                size_t batch_size, size_t sequence_length);
   std::vector<std::vector<int>> get_batch();
 
 private:
@@ -18,7 +18,10 @@ private:
   std::vector<std::shared_ptr<arrow::Table>> shards_;
   std::vector<std::string> file_paths_;
   std::vector<std::vector<int>> token_batches_;
+  std::vector<int> flat_tokens_;
   size_t max_shard_bytes_;
+  size_t batch_size_;
+  size_t sequence_length_;
   int current_shard_idx_ = 0;
   int current_batch_idx_ = 0;
   std::unordered_map<std::string, int> vocab_;
