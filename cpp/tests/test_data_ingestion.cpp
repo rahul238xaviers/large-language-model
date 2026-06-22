@@ -39,22 +39,19 @@ int main() {
   std::cout << "✓ Initialization complete" << std::endl << std::endl;
 
   // Test parameters
-  const int num_batches_to_fetch = 5;
   int total_sequences = 0;
-  int total_tokens = 0;
+  long long total_tokens = 0;
   size_t min_sequence_size = SIZE_MAX;
   size_t max_sequence_size = 0;
 
-  std::cout << "Fetching " << num_batches_to_fetch << " batches..."
-            << std::endl;
+  std::cout << "Fetching all batches..." << std::endl;
   std::cout << "----------------------------------------" << std::endl;
 
   auto batch_start = std::chrono::high_resolution_clock::now();
+  int batch_num = 0;
 
-  for (int batch_num = 0; batch_num < num_batches_to_fetch; ++batch_num) {
+  while (true) {
     auto batch_loop_start = std::chrono::high_resolution_clock::now();
-
-    std::cout << "\nBatch " << batch_num + 1 << ":" << std::endl;
 
     auto batch = ingestion.get_batch();
 
@@ -64,15 +61,21 @@ int main() {
                                                               batch_loop_start);
 
     if (batch.empty()) {
-      std::cout << "  ⚠ No more batches available (end of data)" << std::endl;
       break;
     }
 
-    std::cout << "  Size: " << batch.size() << " sequences" << std::endl;
-    std::cout << "  Load time: " << batch_loop_duration.count() << " ms"
-              << std::endl;
-
+    batch_num++;
     total_sequences += batch.size();
+
+    // Print first 5 batches and then every 500,000 batches to prevent console spam
+    bool print_detail = (batch_num <= 5) || (batch_num % 500000 == 0);
+
+    if (print_detail) {
+      std::cout << "\nBatch " << batch_num << ":" << std::endl;
+      std::cout << "  Size: " << batch.size() << " sequences" << std::endl;
+      std::cout << "  Load time: " << batch_loop_duration.count() << " ms"
+                << std::endl;
+    }
 
     // Analyze each sequence in the batch
     for (size_t i = 0; i < batch.size(); ++i) {
@@ -82,7 +85,7 @@ int main() {
       max_sequence_size = std::max(max_sequence_size, seq_size);
 
       // Print first 20 tokens of first sequence only (to avoid spam)
-      if (i == 0) {
+      if (print_detail && i == 0) {
         std::cout << "  First sequence (" << seq_size << " tokens): ";
         int tokens_to_show = std::min(20, (int)seq_size);
         for (int j = 0; j < tokens_to_show; ++j) {
@@ -94,17 +97,19 @@ int main() {
       }
     }
 
-    // Print token range in this batch
-    int min_token = INT_MAX;
-    int max_token = INT_MIN;
-    for (const auto &seq : batch) {
-      for (int token : seq) {
-        min_token = std::min(min_token, token);
-        max_token = std::max(max_token, token);
+    if (print_detail) {
+      // Print token range in this batch
+      int min_token = INT_MAX;
+      int max_token = INT_MIN;
+      for (const auto &seq : batch) {
+        for (int token : seq) {
+          min_token = std::min(min_token, token);
+          max_token = std::max(max_token, token);
+        }
       }
+      std::cout << "  Token range: [" << min_token << ", " << max_token << "]"
+                << std::endl;
     }
-    std::cout << "  Token range: [" << min_token << ", " << max_token << "]"
-              << std::endl;
   }
 
   auto batch_end = std::chrono::high_resolution_clock::now();
@@ -118,11 +123,11 @@ int main() {
   if (total_sequences > 0) {
     double avg_tokens_per_sequence = (double)total_tokens / total_sequences;
     double avg_sequences_per_batch =
-        (double)total_sequences / num_batches_to_fetch;
-    double avg_tokens_per_batch = (double)total_tokens / num_batches_to_fetch;
+        (double)total_sequences / batch_num;
+    double avg_tokens_per_batch = (double)total_tokens / batch_num;
 
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  Total batches fetched: " << num_batches_to_fetch
+    std::cout << "  Total batches fetched: " << batch_num
               << std::endl;
     std::cout << "  Total sequences: " << total_sequences << std::endl;
     std::cout << "  Total tokens: " << total_tokens << std::endl;
