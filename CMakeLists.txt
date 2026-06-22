@@ -30,3 +30,14 @@ target_link_libraries(data_ingestion PUBLIC
     arrow_shared
     parquet_shared
 )
+
+# Define our test executable
+add_executable(test_data_ingestion
+    cpp/tests/test_data_ingestion.cpp
+)
+
+# Link against our library
+target_link_libraries(test_data_ingestion PUBLIC
+    data_ingestion
+)
+
