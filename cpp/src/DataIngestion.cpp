@@ -49,6 +49,177 @@
  */
 
 #include "DataIngestion.hpp"
+#include <tokenizers_cpp.h>
+#include <cstdlib>
+#include <unordered_map>
+
+namespace {
+
+std::string base64_decode(const std::string &in) {
+  std::string out;
+  std::vector<int> T(256, -1);
+  const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (int i = 0; i < 64; i++) {
+    T[static_cast<unsigned char>(chars[i])] = i;
+  }
+  
+  int val = 0, valb = -8;
+  for (char c : in) {
+    if (T[static_cast<unsigned char>(c)] == -1) break;
+    val = (val << 6) + T[static_cast<unsigned char>(c)];
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return out;
+}
+
+std::string bytes_to_unicode(const std::string &bytes) {
+  std::string result;
+  for (unsigned char b : bytes) {
+    int cp = b;
+    bool directly_mapped = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+    if (!directly_mapped) {
+      if (b <= 32) {
+        cp = 256 + b;
+      } else if (b >= 127 && b <= 160) {
+        cp = 256 + 33 + (b - 127);
+      } else if (b == 173) {
+        cp = 256 + 33 + 34; // 323
+      }
+    }
+    
+    if (cp < 128) {
+      result.push_back(static_cast<char>(cp));
+    } else {
+      result.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  return result;
+}
+
+std::string escape_json(const std::string &s) {
+  std::string result;
+  for (char c : s) {
+    if (c == '\\') {
+      result += "\\\\";
+    } else if (c == '"') {
+      result += "\\\"";
+    } else if (c == '\n') {
+      result += "\\n";
+    } else if (c == '\r') {
+      result += "\\r";
+    } else if (c == '\t') {
+      result += "\\t";
+    } else if (static_cast<unsigned char>(c) < 32) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+      result += buf;
+    } else {
+      result.push_back(c);
+    }
+  }
+  return result;
+}
+
+std::string build_tokenizer_json(const std::string &vocab_json, const std::string &merges_json) {
+  std::string json = R"({
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 100257,
+      "content": "<|endoftext|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 100258,
+      "content": "<|fim_prefix|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 100259,
+      "content": "<|fim_middle|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 100260,
+      "content": "<|fim_suffix|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 100276,
+      "content": "<|detokenizer_all_special_tokens|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": false,
+    "use_regex": true
+  },
+  "post_processor": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": false,
+    "use_regex": true
+  },
+  "decoder": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": false,
+    "use_regex": true
+  },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": null,
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "vocab": )";
+  
+  json += vocab_json;
+  json += R"(,
+    "merges": [
+)";
+  
+  json += merges_json;
+  json += R"(
+    ]
+  }
+})";
+  return json;
+}
+
+} // namespace
+
 #include <algorithm>
 #include <arrow/api.h>
 #include <arrow/io/file.h>
@@ -61,7 +232,6 @@
 #include <memory>
 #include <parquet/arrow/reader.h>
 #include <string>
-#include <tokenizers_cpp.h>
 #include <vector>
 
 DataIngestion::DataIngestion(const std::string &data_dir,
@@ -73,52 +243,99 @@ DataIngestion::DataIngestion(const std::string &data_dir,
       batch_size_(batch_size), sequence_length_(sequence_length),
       max_shard_bytes_(max_shard_bytes), vocab_path_(vocab_path),
       current_batch_idx_(0), current_shard_idx_(0) {
-  // Determine JSON configuration file path from .tiktoken vocab_path
-  std::string json_path = vocab_path;
-  size_t ext_pos = json_path.rfind(".tiktoken");
-  if (ext_pos != std::string::npos) {
-    json_path.replace(ext_pos, 9, ".json");
-  }
+  
+  std::cout << "Loading tiktoken vocabulary directly in C++: " << vocab_path << std::endl;
 
-  // If JSON file doesn't exist, run the python conversion script to generate it
-  if (!std::filesystem::exists(json_path)) {
-    if (!std::filesystem::exists(vocab_path)) {
-      std::cerr << "Error: Vocab path " << vocab_path << " does not exist."
-                << std::endl;
-      exit(1);
-    }
-    std::cout << "Converting " << vocab_path
-              << " to Hugging Face JSON format..." << std::endl;
-    // Command to run converter: python3 cpp/scripts/convert_tiktoken.py
-    // vocab_path json_path
-    std::string cmd = "python3 cpp/scripts/convert_tiktoken.py " + vocab_path +
-                      " " + json_path;
-    int ret = std::system(cmd.c_str());
-    if (ret != 0) {
-      std::cerr << "Error: Failed to convert tiktoken to JSON." << std::endl;
-      exit(1);
-    }
-  }
-
-  // Read the JSON contents into a string blob
-  std::ifstream json_file(json_path, std::ios::in | std::ios::binary);
-  if (!json_file.is_open()) {
-    std::cerr << "Error: Failed to open tokenizer JSON at " << json_path
-              << std::endl;
+  std::ifstream file(vocab_path);
+  if (!file.is_open()) {
+    std::cerr << "Error: Failed to open vocab file at " << vocab_path << std::endl;
     exit(1);
   }
-  std::string json_blob;
-  json_file.seekg(0, std::ios::end);
-  json_blob.resize(json_file.tellg());
-  json_file.seekg(0, std::ios::beg);
-  json_file.read(&json_blob[0], json_blob.size());
-  json_file.close();
 
-  // Instantiate the tokenizer
+  std::vector<std::pair<std::string, int>> sorted_vocab;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty()) continue;
+    size_t space_idx = line.find(' ');
+    if (space_idx != std::string::npos) {
+      std::string base64_token = line.substr(0, space_idx);
+      int rank = std::stoi(line.substr(space_idx + 1));
+      std::string token_bytes = base64_decode(base64_token);
+      sorted_vocab.push_back({token_bytes, rank});
+    }
+  }
+  file.close();
+
+  // Sort by rank
+  std::sort(sorted_vocab.begin(), sorted_vocab.end(), [](const auto &a, const auto &b) {
+    return a.second < b.second;
+  });
+
+  // Reconstruct merges in memory
+  std::unordered_map<std::string, int> vocab_ranks_restricted;
+  for (const auto &p : sorted_vocab) {
+    if (p.first.length() == 1) {
+      vocab_ranks_restricted[p.first] = p.second;
+    }
+  }
+
+  std::vector<std::string> merges;
+  for (const auto &p : sorted_vocab) {
+    const std::string &token_bytes = p.first;
+    int rank = p.second;
+    if (token_bytes.length() <= 1) continue;
+
+    // Run BPE tokenization on token_bytes using vocab_ranks_restricted
+    std::vector<std::string> parts;
+    for (char c : token_bytes) {
+      parts.push_back(std::string(1, c));
+    }
+    while (parts.size() > 1) {
+      int min_rank = std::numeric_limits<int>::max();
+      size_t best_idx = -1;
+      for (size_t i = 0; i < parts.size() - 1; i++) {
+        std::string pair = parts[i] + parts[i+1];
+        auto it = vocab_ranks_restricted.find(pair);
+        if (it != vocab_ranks_restricted.end() && it->second < min_rank) {
+          min_rank = it->second;
+          best_idx = i;
+        }
+      }
+      if (min_rank == std::numeric_limits<int>::max()) {
+        break;
+      }
+      parts[best_idx] = parts[best_idx] + parts[best_idx+1];
+      parts.erase(parts.begin() + best_idx + 1);
+    }
+
+    if (parts.size() == 2) {
+      std::string left = bytes_to_unicode(parts[0]);
+      std::string right = bytes_to_unicode(parts[1]);
+      merges.push_back(left + " " + right);
+    }
+    vocab_ranks_restricted[token_bytes] = rank;
+  }
+
+  // Build vocab JSON
+  std::string vocab_json = "{";
+  for (size_t i = 0; i < sorted_vocab.size(); i++) {
+    if (i > 0) vocab_json += ",";
+    std::string hf_token = bytes_to_unicode(sorted_vocab[i].first);
+    vocab_json += "\"" + escape_json(hf_token) + "\":" + std::to_string(sorted_vocab[i].second);
+  }
+  vocab_json += "}";
+
+  // Build merges JSON
+  std::string merges_json;
+  for (size_t i = 0; i < merges.size(); i++) {
+    if (i > 0) merges_json += ",\n";
+    merges_json += "      \"" + escape_json(merges[i]) + "\"";
+  }
+
+  std::string json_blob = build_tokenizer_json(vocab_json, merges_json);
   tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(json_blob);
   if (!tokenizer_) {
-    std::cerr << "Error: Failed to parse tokenizer JSON from " << json_path
-              << std::endl;
+    std::cerr << "Error: Failed to instantiate tokenizer in memory." << std::endl;
     exit(1);
   }
 

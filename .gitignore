@@ -25,7 +25,12 @@ venv/
 ENV/
 env/
 .venv/
-data/
+data/*
+!data/raw_chunks/
+data/raw_chunks/*
+!data/raw_chunks/vocabulary/
+data/raw_chunks/vocabulary/*
+!data/raw_chunks/vocabulary/cl100k_base.tiktoken
 
 # Environment variables
 .env
