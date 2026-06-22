@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
+
+# Set the macOS deployment target to match the host OS and Rust cargo target
+set(CMAKE_OSX_DEPLOYMENT_TARGET "26.5" CACHE STRING "macOS Deployment Target" FORCE)
+
 project(LLM_Pipeline LANGUAGES CXX)
 
 # Set the C++20 standard
@@ -15,6 +19,10 @@ list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
 find_package(Arrow REQUIRED)
 find_package(Parquet REQUIRED)
 
+# Add tokenizers-cpp library target (disable SentencePiece to reduce build complexity)
+set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "Disable SentencePiece" FORCE)
+add_subdirectory(cpp/tokenizers-cpp)
+
 # Define our library target
 add_library(data_ingestion
     cpp/src/DataIngestion.cpp
@@ -25,10 +33,11 @@ target_include_directories(data_ingestion PUBLIC
     cpp/include
 )
 
-# Link against Arrow and Parquet shared libraries
+# Link against Arrow, Parquet, and tokenizers-cpp static libraries
 target_link_libraries(data_ingestion PUBLIC
     arrow_shared
     parquet_shared
+    tokenizers_cpp
 )
 
 # Define our test executable
