@@ -1,5 +1,4 @@
-#ifndef DATA_INGESTION_HPP
-#define DATA_INGESTION_HPP
+#pragma once
 
 #include <arrow/api.h>
 #include <arrow/status.h>
@@ -43,5 +42,3 @@ private:
   void generate_training_sequences();
   void bpe_encode(const std::string &text, std::vector<int> &tokens);
 };
-
-#endif // DATA_INGESTION_HPP

@@ -1,6 +1,6 @@
 # C4 Architecture & Development Sprint Plan: C++ LLM Training Engine
 
-This document outlines the software architecture and development roadmap for building a native C++ Large Language Model (LLM) training engine from scratch on macOS (Apple Silicon). The engine is designed to ingest code dataset shards (specifically StarCoder-v2 C++ data in Parquet format) and perform local model training.
+This document outlines the software architecture and development roadmap for building a native C++ Large Language Model (LLM) training engine from scratch on macOS (Apple Silicon). The engine is designed to ingest code dataset shards (specifically The Stack v1 C++ data in Parquet format, downloaded using `python/scripts/download_cpp_blobs.py` to fetch the actual raw code content) and perform local model training.
 
 ---
 
@@ -12,7 +12,7 @@ The system context defines the training engine boundaries, data dependencies, an
 ```mermaid
 graph TD
     User([ML Engineer / Developer]) -->|Configures & Runs| Engine[C++ LLM Training Engine]
-    Engine -->|Reads Shards| ParquetData[(StarCoder-v2 Parquet Files)]
+    Engine -->|Reads Shards| ParquetData[(The Stack v1 Parquet Files)]
     Engine -->|Saves| Checkpoints[(Safetensors Checkpoints)]
     Engine -->|Logs Metrics| CSVLogs[(metrics.csv)]
     Engine -->|Utilizes| MacOS[macOS Accelerate / Metal GPU]
@@ -27,7 +27,7 @@ Breaks the repository codebase down into high-level build targets and namespaces
 graph TD
     subgraph Repository Root
         subgraph python/ [Python Tools]
-            HFDownloader[Dataset Download/Prep Scripts]
+            HFDownloader[download_cpp_blobs.py Script]
         end
         
         subgraph cpp/ [C++ LLM Codebase]
@@ -38,7 +38,8 @@ graph TD
         end
     end
     
-    ParquetData[(Parquet files)] -->|Reads| DataIngest
+    HFDownloader -->|Downloads actual files| ParquetData[(The Stack v1 Parquet Files)]
+    ParquetData -->|Reads| DataIngest
     DataIngest -->|Streams Token Batches| TrainerApp
     TrainerApp -->|Feeds Forward/Backward| ModelCore
     ModelCore -->|Updates Gradients| Optimizer
@@ -57,7 +58,7 @@ graph TD
     Trainer -->|Instantiates| AdamW[AdamW Class]
     
     DataIngestion -->|Reads| ParquetReader[Parquet Reader API]
-    DataIngestion -->|Encodes| BPETokenizer[BPE Tokenizer]
+    DataIngestion -->|Encodes| Tokenizer[tokenizers-cpp Wrapper]
     
     Transformer -->|Composite of| RMSNorm[RMSNorm Component]
     Transformer -->|Composite of| Attention[GQA Attention Component]
@@ -75,9 +76,13 @@ Declares the base class structures and programmatic interfaces.
 // DataIngestion.hpp
 class DataIngestion {
 public:
-    DataIngestion(const std::string& data_dir, const std::string& vocab_path);
-    bool load_shard(const std::string& shard_name);
-    std::pair<std::vector<int>, std::vector<int>> get_next_batch(int batch_size, int block_size);
+  DataIngestion(const std::string &data_dir,
+                const std::string &single_data_file, size_t max_shard_bytes,
+                size_t batch_size, size_t sequence_length,
+                const std::string &vocab_path);
+  ~DataIngestion();
+  std::vector<std::vector<int>> get_batch();
+  static constexpr int EOT = 100257;
 };
 
 // Transformer.hpp
@@ -98,6 +103,7 @@ The codebase development is structured into **6 execution sprints**. Each sprint
 ```
 ┌────────────────────────────────────────────────────────┐
 │  Sprint 1: Data Ingestion (Parquet & BPE)              │
+│  - Completed: tokenizers-cpp with C++ tiktoken loader │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
@@ -131,7 +137,7 @@ The codebase development is structured into **6 execution sprints**. Each sprint
   * `cpp/tests/test_data_ingestion.cpp` (Validation driver executable)
 * **Implementation Guidelines**:
   * Utilize the Apache Arrow/Parquet C++ APIs (or a lightweight custom reader) to read binary Parquet shards without full memory loading.
-  * Implement BPE vocabulary lookup to convert raw source code characters into integer token arrays.
+  * Integrate the Hugging Face `tokenizers-cpp` library, parsing the `cl100k_base.tiktoken` file natively and reconstructing the merges in memory to generate the tokenizer configuration entirely in RAM.
   * Formulate sequential training matrices $X$ and shifted targets $Y$ where $Y_{i} = X_{i+1}$.
 
 ---

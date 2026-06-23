@@ -2,6 +2,8 @@
 
 This document provides a low-level, systems-engineering breakdown of the `DataIngestion` class. It explains how C++ code is compiled, loaded into memory, and executed by the CPU, followed by a step-by-step memory and execution blueprint for each method in the pipeline.
 
+The pipeline is designed to ingest code dataset shards (specifically The Stack v1 C++ data in Parquet format, downloaded via `python/scripts/download_cpp_blobs.py` to obtain the actual raw code content instead of symlink blobs) and perform local model training.
+
 ---
 
 ## ⚙️ Part 1: Compilation to CPU Execution
@@ -51,7 +53,10 @@ sequenceDiagram
     participant Tokens as flat_tokens_ (RAM)
     participant Batches as token_batches_ (RAM)
 
-    Trainer->>DI: Instantiates(data_dir, batch_size, seq_len)
+    Trainer->>DI: Instantiates(data_dir, single_file, max_shard_bytes, batch_size, seq_len, vocab_path)
+    DI->>DI: Reads & parses cl100k_base.tiktoken directly in C++
+    DI->>DI: Reconstructs BPE merges in RAM
+    DI->>DI: Instantiates tokenizers-cpp Wrapper (in RAM)
     DI->>DI: Scans directory & sorts file paths
     
     loop Every Training Step
@@ -84,18 +89,24 @@ Here is exactly how the CPU and RAM behave during the execution of each method.
 #### C++ Code:
 ```cpp
 DataIngestion::DataIngestion(const std::string &data_dir,
+                             const std::string &single_data_file,
                              size_t max_shard_bytes, size_t batch_size,
-                             size_t sequence_length)
-    : data_dir_(data_dir), batch_size_(batch_size),
-      sequence_length_(sequence_length), max_shard_bytes_(max_shard_bytes),
-      current_batch_idx_(0), current_shard_idx_(0)
-{
-  for (const auto &entry : std::filesystem::directory_iterator(data_dir)) {
-    if (entry.is_regular_file() && entry.path().extension() == ".parquet") {
-      file_paths_.push_back(entry.path().string());
-    }
-  }
-  std::sort(file_paths_.begin(), file_paths_.end());
+                             size_t sequence_length,
+                             const std::string &vocab_path)
+    : data_dir_(data_dir), single_data_file(single_data_file),
+      batch_size_(batch_size), sequence_length_(sequence_length),
+      max_shard_bytes_(max_shard_bytes), vocab_path_(vocab_path),
+      current_batch_idx_(0), current_shard_idx_(0) {
+  
+  // 1. Reads & parses cl100k_base.tiktoken
+  // 2. Reconstructs BPE merges in memory (via simulation)
+  // 3. Formats BPE merges & vocab mapping using ByteLevel unicode mapping
+  // 4. Instantiates tokenizers-cpp Wrapper entirely in RAM
+  std::string json_blob = build_tokenizer_json(vocab_json, merges_json);
+  tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(json_blob);
+  
+  // 5. Scans data directory and registers parquet file paths
+  // ...
 }
 ```
 
@@ -104,21 +115,23 @@ When the constructor finishes, the `DataIngestion` object is fully formed on the
 
 ```
 HEAP (DataIngestion Object Memory Layout)
-+-----------------------------------------------------------+
-| Variable Name        | Type         | Value / RAM Size    |
-+----------------------+--------------+---------------------+
-| data_dir_            | std::string  | "data/raw" (32 B)   |
-| max_shard_bytes_     | size_t       | 104,857,600 (8 B)   |
-| batch_size_          | size_t       | 32 (8 B)            |
-| sequence_length_     | size_t       | 1024 (8 B)          |
-| current_shard_idx_   | int          | 0 (4 B)             |
-| current_batch_idx_   | int          | 0 (4 B)             |
-| file_paths_          | std::vector  | Pointer to Heap list|
-| shards_              | std::vector  | Pointer to Heap list|
-| flat_tokens_         | std::vector  | Pointer to Heap list|
-| token_batches_       | std::vector  | Pointer to Heap list|
-| vocab_               | std::map     | Hash table structure|
-+-----------------------------------------------------------+
++-------------------------------------------------------------+
+| Variable Name        | Type           | Value / RAM Size    |
++----------------------+----------------+---------------------+
+| data_dir_            | std::string    | "data/raw" (32 B)   |
+| single_data_file     | std::string    | "train-..." (32 B)  |
+| vocab_path_          | std::string    | "cl100k..." (32 B)  |
+| max_shard_bytes_     | size_t         | 104,857,600 (8 B)   |
+| batch_size_          | size_t         | 32 (8 B)            |
+| sequence_length_     | size_t         | 1024 (8 B)          |
+| current_shard_idx_   | int            | 0 (4 B)             |
+| current_batch_idx_   | int            | 0 (4 B)             |
+| file_paths_          | std::vector    | Pointer to Heap list|
+| shards_              | std::vector    | Pointer to Heap list|
+| flat_tokens_         | std::vector    | Pointer to Heap list|
+| token_batches_       | std::vector    | Pointer to Heap list|
+| tokenizer_           | std::unique_ptr| Ptr to Tokenizer(8B)|
++-------------------------------------------------------------+
 ```
 
 #### Hardware & CPU Steps:
@@ -189,7 +202,7 @@ void DataIngestion::tokenize_cpp_corpus(std::shared_ptr<arrow::Table> table,
     for (int64_t j = 0; j < string_array->length(); ++j) {
       if (string_array->IsValid(j)) {
         std::string text = string_array->GetString(j);
-        bpe_encode(text, flat_tokens_, vocab_);
+        bpe_encode(text, flat_tokens_);
       }
     }
   }
@@ -216,7 +229,7 @@ HEAP (StringArray Buffers Layout)
 1. **LSP Casting:** `std::static_pointer_cast` runs at compile-time. At runtime, the CPU simply copies the pointer address from `chunk` to `string_array` (zero overhead).
 2. **Checking Validity:** The CPU reads the validity bitmap buffer. It performs a bitwise operation to check if the $j$-th bit is `1` (Valid) or `0` (`NULL`). If `0`, it branches past the tokenization step, saving CPU cycles.
 3. **String Slicing:** `GetString(j)` looks at indices $j$ and $j+1$ in the Offsets Buffer. It calculates `length = offsets[j+1] - offsets[j]`. It allocates `length` bytes on the heap, copies the characters from the Values Char Buffer into the new string `text` on the stack (via Small String Optimization if length < 22 bytes, preventing heap allocation).
-4. **Encoding Pipeline:** `bpe_encode` scans `text`, matches characters to vocabulary tokens, and pushes integer IDs directly to `flat_tokens_` in the heap.
+4. **Encoding Pipeline:** `bpe_encode` calls `tokenizer_->Encode(text)` which crosses the C++ to Rust FFI boundary. Rust executes fast BPE encoding and returns an array of token IDs, which are pushed directly into `flat_tokens_` on the heap.
 
 ---
 
