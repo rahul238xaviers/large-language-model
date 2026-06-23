@@ -85,7 +85,9 @@ Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data)
     throw std::invalid_argument("Data size does not match shape dimensions");
   }
 }
-void Tensor::fill(float val) { std::fill(data_.begin(), data_.end(), val); }
+void Tensor::fill(const float val) {
+  std::fill(data_.begin(), data_.end(), val);
+}
 void Tensor::print(const std::string &name) const {
   if (!name.empty()) {
     std::cout << name << " ";
