@@ -26,6 +26,7 @@ add_subdirectory(cpp/tokenizers-cpp)
 # Define our library target
 add_library(data_ingestion
     cpp/src/DataIngestion.cpp
+    cpp/src/Tensor.cpp
 )
 
 # Set include directories
@@ -47,6 +48,15 @@ add_executable(test_data_ingestion
 
 # Link against our library
 target_link_libraries(test_data_ingestion PUBLIC
+    data_ingestion
+)
+
+# Define our mathematical operations test executable
+add_executable(test_math_ops
+    cpp/tests/test_math_ops.cpp
+)
+# Link it against our library
+target_link_libraries(test_math_ops PUBLIC
     data_ingestion
 )
 

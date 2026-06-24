@@ -54,7 +54,7 @@ public:
   void scale_(float factor);
 
   // Matrix multiplication (2D or Batched 2D)
-  static Tensor matmul(const Tensor &A, const Tensor &B);
+  Tensor matmul(const Tensor &other) const;
 
 private:
   std::vector<size_t> shape_;
