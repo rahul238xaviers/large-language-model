@@ -3,6 +3,7 @@
 #include <functional>
 #include <iostream>
 #include <numeric>
+#include <stdexcept>
 
 Tensor::Tensor() : shape_({}), strides_({}), data_({}) {}
 
@@ -42,12 +43,20 @@ size_t Tensor::get_index(const std::vector<size_t> &indices) const {
   size_t idx = 0;
   for (size_t i = 0; i < indices.size(); i++) {
     if (indices[i] >= shape_[i]) {
-      throw std::invalid_argument("Index out of bounds");
+      throw std::out_of_range("Index out of bounds");
     }
 
     idx += indices[i] * strides_[i];
   }
   return idx;
+}
+
+float &Tensor::operator()(const std::vector<size_t> &indices) {
+  return data_[get_index(indices)];
+}
+
+const float &Tensor::operator()(const std::vector<size_t> &indices) const {
+  return data_[get_index(indices)];
 }
 
 float &Tensor::operator()(size_t i) { return data_[i]; }
