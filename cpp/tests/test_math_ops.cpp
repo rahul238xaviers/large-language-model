@@ -260,19 +260,16 @@ int main() {
 
     // Benchmark 1: GQA-sized math
     {
-        std::vector<size_t> shapeA = {1, 8, 1024, 64};
-        std::vector<size_t> shapeB = {1, 8, 64, 1024};
+        std::vector<size_t> shapeA = {64, 16, 2048, 128};
+        std::vector<size_t> shapeB = {64, 16, 128, 2048};
         Tensor MA(shapeA, 0.01f);
         Tensor MB(shapeB, 0.02f);
         
         std::cout << "GQA Matrix Multiplication:" << std::endl;
-        std::cout << "  Dimensions:           [1, 8, 1024, 64] * [1, 8, 64, 1024]" << std::endl;
-        double flops = 2.0 * 8.0 * 1024.0 * 64.0 * 1024.0;
+        std::cout << "  Dimensions:           [64, 16, 2048, 128] * [64, 16, 128, 2048]" << std::endl;
+        double flops = 2.0 * 64.0 * 16.0 * 2048.0 * 128.0 * 2048.0;
         
-        // Warmup
-        for (int i = 0; i < 3; ++i) { Tensor tmp = MA.matmul(MB); }
-        
-        const int runs = 10;
+        const int runs = 1;
         std::vector<double> latencies;
         latencies.reserve(runs);
         
@@ -284,35 +281,24 @@ int main() {
             latencies.push_back(duration_ms);
         }
         
-        double avg_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) / runs;
-        double min_ms = latencies[0];
-        double max_ms = latencies[0];
-        for (double l : latencies) {
-            if (l < min_ms) min_ms = l;
-            if (l > max_ms) max_ms = l;
-        }
+        double avg_ms = latencies[0];
         double avg_seconds = avg_ms / 1000.0;
         double gflops = (flops / 1e9) / avg_seconds;
         
         std::cout << "  Average Latency:      " << avg_ms << " ms" << std::endl;
-        std::cout << "  Minimum Latency:      " << min_ms << " ms" << std::endl;
-        std::cout << "  Maximum Latency:      " << max_ms << " ms" << std::endl;
         std::cout << "  Throughput:           " << gflops << " GFLOPS" << std::endl << std::endl;
     }
 
     // Benchmark 2: Attention Projection (Width=2048)
     {
-        Tensor MA({2048, 2048}, 0.01f);
-        Tensor MB({2048, 2048}, 0.02f);
+        Tensor MA({64, 2048, 2048}, 0.01f);
+        Tensor MB({64, 2048, 2048}, 0.02f);
         
         std::cout << "Attention Projection:" << std::endl;
-        std::cout << "  Dimensions:           [2048, 2048] * [2048, 2048]" << std::endl;
-        double flops = 2.0 * 2048.0 * 2048.0 * 2048.0;
+        std::cout << "  Dimensions:           [64, 2048, 2048] * [64, 2048, 2048]" << std::endl;
+        double flops = 2.0 * 64.0 * 2048.0 * 2048.0 * 2048.0;
         
-        // Warmup
-        for (int i = 0; i < 2; ++i) { Tensor tmp = MA.matmul(MB); }
-        
-        const int runs = 5;
+        const int runs = 1;
         std::vector<double> latencies;
         latencies.reserve(runs);
         
@@ -324,35 +310,24 @@ int main() {
             latencies.push_back(duration_ms);
         }
         
-        double avg_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) / runs;
-        double min_ms = latencies[0];
-        double max_ms = latencies[0];
-        for (double l : latencies) {
-            if (l < min_ms) min_ms = l;
-            if (l > max_ms) max_ms = l;
-        }
+        double avg_ms = latencies[0];
         double avg_seconds = avg_ms / 1000.0;
         double gflops = (flops / 1e9) / avg_seconds;
         
         std::cout << "  Average Latency:      " << avg_ms << " ms" << std::endl;
-        std::cout << "  Minimum Latency:      " << min_ms << " ms" << std::endl;
-        std::cout << "  Maximum Latency:      " << max_ms << " ms" << std::endl;
         std::cout << "  Throughput:           " << gflops << " GFLOPS" << std::endl << std::endl;
     }
 
     // Benchmark 3: FFN Projection (Width=2048)
     {
-        Tensor MA({2048, 2048}, 0.01f);
-        Tensor MB({2048, 10922}, 0.02f);
+        Tensor MA({64, 2048, 2048}, 0.01f);
+        Tensor MB({64, 2048, 10922}, 0.02f);
         
         std::cout << "FFN Projection:" << std::endl;
-        std::cout << "  Dimensions:           [2048, 2048] * [2048, 10922]" << std::endl;
-        double flops = 2.0 * 2048.0 * 2048.0 * 10922.0;
+        std::cout << "  Dimensions:           [64, 2048, 2048] * [64, 2048, 10922]" << std::endl;
+        double flops = 2.0 * 64.0 * 2048.0 * 2048.0 * 10922.0;
         
-        // Warmup
-        for (int i = 0; i < 2; ++i) { Tensor tmp = MA.matmul(MB); }
-        
-        const int runs = 5;
+        const int runs = 1;
         std::vector<double> latencies;
         latencies.reserve(runs);
         
@@ -364,19 +339,11 @@ int main() {
             latencies.push_back(duration_ms);
         }
         
-        double avg_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) / runs;
-        double min_ms = latencies[0];
-        double max_ms = latencies[0];
-        for (double l : latencies) {
-            if (l < min_ms) min_ms = l;
-            if (l > max_ms) max_ms = l;
-        }
+        double avg_ms = latencies[0];
         double avg_seconds = avg_ms / 1000.0;
         double gflops = (flops / 1e9) / avg_seconds;
         
         std::cout << "  Average Latency:      " << avg_ms << " ms" << std::endl;
-        std::cout << "  Minimum Latency:      " << min_ms << " ms" << std::endl;
-        std::cout << "  Maximum Latency:      " << max_ms << " ms" << std::endl;
         std::cout << "  Throughput:           " << gflops << " GFLOPS" << std::endl;
     }
 
