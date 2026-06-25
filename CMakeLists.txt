@@ -27,6 +27,7 @@ add_subdirectory(cpp/tokenizers-cpp)
 add_library(data_ingestion
     cpp/src/DataIngestion.cpp
     cpp/src/Tensor.cpp
+    cpp/src/RMSNorm.cpp
 )
 
 # Set include directories
@@ -57,6 +58,15 @@ add_executable(test_math_ops
 )
 # Link it against our library
 target_link_libraries(test_math_ops PUBLIC
+    data_ingestion
+)
+
+# Define our RMSNorm test executable
+add_executable(test_rmsnorm
+    cpp/tests/test_rmsnorm.cpp
+)
+# Link it against our library
+target_link_libraries(test_rmsnorm PUBLIC
     data_ingestion
 )
 
