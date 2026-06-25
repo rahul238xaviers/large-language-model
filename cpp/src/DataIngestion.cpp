@@ -368,8 +368,7 @@ DataIngestion::DataIngestion(const std::string &data_dir,
     std::vector<std::filesystem::directory_entry> parquet_entries;
     std::copy_if(std::filesystem::directory_iterator(data_dir),
                  std::filesystem::directory_iterator(),
-                 std::back_inserter(parquet_entries),
-                 [](const auto &entry) {
+                 std::back_inserter(parquet_entries), [](const auto &entry) {
                    return entry.is_regular_file() &&
                           entry.path().extension() == ".parquet";
                  });
@@ -463,7 +462,7 @@ void DataIngestion::bpe_encode(const std::string &text,
 }
 
 std::vector<std::vector<int>> DataIngestion::get_batch() {
-  std::cout << "Getting batch..." << std::endl;
+  // std::cout << "Getting batch..." << std::endl;
 
   while (current_batch_idx_ + batch_size_ > token_batches_.size()) {
 

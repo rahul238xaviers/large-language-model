@@ -162,7 +162,7 @@ int main() {
     std::cout << "================================================================================" << std::endl;
     
     // Config large shapes representing typical 1.6B model layer activations
-    size_t batch = 4;
+    size_t batch = 64;
     size_t seq_len = 2048;
     size_t hidden_dim = 2048;
     
@@ -185,7 +185,7 @@ int main() {
     }
 
     // Profiling runs
-    const int runs = 50;
+    const int runs = 10;
     std::vector<double> latencies;
     latencies.reserve(runs);
 

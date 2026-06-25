@@ -17,9 +17,9 @@ int main() {
     std::string vocab_path = "data/raw_chunks/vocabulary/cl100k_base.tiktoken";
 
     // Configuration
-    size_t batch_size = 2;
-    size_t sequence_length = 10;
-    size_t max_shard_bytes = 10 * 1024 * 1024; // 10MB
+    size_t batch_size = 64;
+    size_t sequence_length = 2048;
+    size_t max_shard_bytes = 100 * 1024 * 1024; // 100MB
 
     std::cout << "================================================================================" << std::endl;
     std::cout << "SECTION 1: PIPELINE CONFIGURATION" << std::endl;
