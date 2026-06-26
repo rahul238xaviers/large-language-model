@@ -159,6 +159,7 @@ The codebase development is structured into **6 execution sprints**. Each sprint
 ### Sprint 3: Grouped Query Attention (GQA) & Model Forward Pass
 * **Objective**: Assemble attention projections and stack layers to execute a full model forward pass.
 * **Deliverables**:
+  * `cpp/include/TransformerConfig.hpp` (Model Configuration and KV Cache structures)
   * `cpp/src/Attention.cpp` (Grouped Query Attention mapping query heads to grouped key/value head pairs)
   * `cpp/src/Transformer.cpp` (Assembling 24 stacked layers combining RMSNorm, Attention, and SwiGLU FFN)
 * **Implementation Guidelines**:

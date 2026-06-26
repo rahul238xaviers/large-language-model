@@ -28,6 +28,8 @@ add_library(data_ingestion
     cpp/src/DataIngestion.cpp
     cpp/src/Tensor.cpp
     cpp/src/RMSNorm.cpp
+    cpp/src/Activations.cpp
+    cpp/src/Positional.cpp
 )
 
 # Set include directories
@@ -69,4 +71,23 @@ add_executable(test_rmsnorm
 target_link_libraries(test_rmsnorm PUBLIC
     data_ingestion
 )
+
+# Define our Activations test executable
+add_executable(test_activations
+    cpp/tests/test_activations.cpp
+)
+# Link it against our library
+target_link_libraries(test_activations PUBLIC
+    data_ingestion
+)
+
+# Define our RoPE test executable
+add_executable(test_rope
+    cpp/tests/test_rope.cpp
+)
+# Link it against our library
+target_link_libraries(test_rope PUBLIC
+    data_ingestion
+)
+
 
