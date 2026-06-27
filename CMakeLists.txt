@@ -30,6 +30,8 @@ add_library(data_ingestion
     cpp/src/RMSNorm.cpp
     cpp/src/Activations.cpp
     cpp/src/Positional.cpp
+    cpp/src/Attention.cpp
+    cpp/src/Transformer.cpp
 )
 
 # Set include directories
@@ -87,6 +89,15 @@ add_executable(test_rope
 )
 # Link it against our library
 target_link_libraries(test_rope PUBLIC
+    data_ingestion
+)
+
+# Define our Attention test executable
+add_executable(test_attention
+    cpp/tests/test_attention.cpp
+)
+# Link it against our library
+target_link_libraries(test_attention PUBLIC
     data_ingestion
 )
 
