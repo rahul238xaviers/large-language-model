@@ -33,57 +33,6 @@ Attention::Attention(const ModelConfig &config)
       Wk_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
       Wv_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
       Wo_({config.n_heads * config.head_dim, config.hidden_dim}) {};
-
-/**
- * @brief Performs batch-wise projection matrix multiplication.
- *
- * Multiplies a 3D input tensor `x` of shape [batch, seq_len, hidden_dim]
- * with a 2D weight matrix `w` of shape [hidden_dim, out_dim].
- *
- * This is an optimized raw-pointer implementation to perform projection
- * without allocating extra copies of the weights per batch.
- *
- * Example:
- *   If x has shape [1, 2, 3] and w has shape [3, 4],
- *   then matmul_project(x, w) returns a tensor of shape [1, 2, 4].
- *
- * @param x Input tensor of shape [batch_size, seq_len, hidden_dim].
- * @param w Weight matrix of shape [hidden_dim, out_dim].
- * @return Tensor Result tensor of shape [batch_size, seq_len, out_dim].
- */
-Tensor matmul_project(const Tensor &x, const Tensor &w) {
-
-  size_t batch_size = x.shape()[0];
-  size_t seq_len = x.shape()[1];
-  size_t hidden_dim = x.shape()[2];
-  size_t out_dim = w.shape()[1];
-
-  Tensor result({batch_size, seq_len, out_dim}, 0.0f);
-
-  const float *x_data = x.data().data();
-  const float *w_data = w.data().data();
-  float *res_data = result.data().data();
-
-  for (size_t b = 0; b < batch_size; ++b) {
-    size_t x_batch_offset = b * seq_len * hidden_dim;
-    size_t res_batch_offset = b * seq_len * out_dim;
-
-    for (size_t s = 0; s < seq_len; ++s) {
-      size_t x_row_offset = x_batch_offset + s * hidden_dim;
-      size_t res_row_offset = res_batch_offset + s * out_dim;
-
-      for (size_t d = 0; d < hidden_dim; ++d) {
-        float val = x_data[x_row_offset + d];
-        for (size_t o = 0; o < out_dim; ++o) {
-          res_data[res_row_offset + o] += val * w_data[d * out_dim + o];
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
 /**
  * @brief Reshapes a 3D tensor of shape [batch, seq_len, n_heads * head_dim]
  *        into a 4D tensor of shape [batch, n_heads, seq_len, head_dim].
@@ -153,12 +102,12 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
 
   Tensor x_norm = rms_norm.forward(x);
 
-  Tensor q4 = reshape_to_4d(matmul_project(x_norm, Wq_), config_.n_heads,
-                            config_.head_dim);
-  Tensor k4 = reshape_to_4d(matmul_project(x_norm, Wk_), config_.n_kv_heads,
-                            config_.head_dim);
-  Tensor v4 = reshape_to_4d(matmul_project(x_norm, Wv_), config_.n_kv_heads,
-                            config_.head_dim);
+  Tensor q4 =
+      reshape_to_4d(x_norm.matmul(Wq_), config_.n_heads, config_.head_dim);
+  Tensor k4 =
+      reshape_to_4d(x_norm.matmul(Wk_), config_.n_kv_heads, config_.head_dim);
+  Tensor v4 =
+      reshape_to_4d(x_norm.matmul(Wv_), config_.n_kv_heads, config_.head_dim);
 
   rope.forward(q4, k4);
 
@@ -208,6 +157,6 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
       }
     }
   }
-  Tensor out = matmul_project(attn_output, Wo_);
+  Tensor out = attn_output.matmul(Wo_);
   return out;
 }
