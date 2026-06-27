@@ -1,3 +1,14 @@
+/**
+ * @file Positional.hpp
+ * @brief Rotary Position Embeddings (RoPE) layer declaration
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * RoPE embeds relative positional information into the Queries and Keys of
+ * the attention mechanism by rotating pairs of dimensions in the complex plane.
+ */
+
 #pragma once
 
 #include "Tensor.hpp"

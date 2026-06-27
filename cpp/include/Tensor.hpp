@@ -1,3 +1,15 @@
+/**
+ * @file Tensor.hpp
+ * @brief Multidimensional Tensor structure declaration
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * The Tensor class provides a general-purpose, multidimensional array representation
+ * for floating-point values. It supports shape metadata, strided indexing, and basic
+ * tensor operations (addition, multiplication, matrix multiplication).
+ */
+
 #pragma once
 
 #include <cstddef>

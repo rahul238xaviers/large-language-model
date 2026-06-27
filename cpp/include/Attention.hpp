@@ -1,3 +1,15 @@
+/**
+ * @file Attention.hpp
+ * @brief Grouped Query Attention (GQA) layer declaration
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * Attention computes context-weighted vectors from queries, keys, and values.
+ * It supports Grouped Query Attention (GQA) where multiple query heads share
+ * a single key/value head, reducing memory consumption and improving speed.
+ */
+
 #pragma once
 #include "Positional.hpp"
 #include "Tensor.hpp"
