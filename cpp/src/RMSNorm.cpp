@@ -21,23 +21,26 @@
 
 /**
  * @brief Construct a new RMSNorm object
- * 
- * @param dims Dimension size to normalize over (typically the hidden dimension).
+ *
+ * @param dims Dimension size to normalize over (typically the hidden
+ * dimension).
  * @param eps Small epsilon to prevent division by zero (defaults to 1e-5f).
  */
 RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f), eps_(eps) {}
 
 /**
- * @brief Performs RMSNorm normalization on the input tensor in the forward pass.
- * 
+ * @brief Performs RMSNorm normalization on the input tensor in the forward
+ * pass.
+ *
  * Each row (representing the features of a single token) is normalized
  * independently along its last dimension.
- * 
+ *
  * Mathematical Formula:
  *   y = (x / RMS(x)) * weight
  *   where RMS(x) = sqrt(1/d * sum(x_i^2) + eps)
- * 
- * @param x Input tensor of shape (batch, seq_len, hidden_dim) or (seq_len, hidden_dim).
+ *
+ * @param x Input tensor of shape (batch, seq_len, hidden_dim) or (seq_len,
+ * hidden_dim).
  * @return Tensor Normalized tensor of the same shape as input x.
  */
 Tensor RMSNorm::forward(const Tensor &x) const {
@@ -82,4 +85,64 @@ Tensor RMSNorm::forward(const Tensor &x) const {
   }
 
   return result;
+}
+
+Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
+                         Tensor &grad_weight) const {
+
+  if (grad_output.shape() != input.shape()) {
+    throw std::invalid_argument(
+        "grad_output and input shapes must match in RMSNorm::backward");
+  }
+
+  size_t dims = weight_.shape()[0];
+  if (grad_weight.shape() != std::vector<size_t>{dims}) {
+    throw std::invalid_argument(
+        "grad_weight must match RMSNorm weight dimensions");
+  }
+
+  Tensor grad_input(input.shape(), 0.0f);
+  size_t total_elements = input.size();
+  size_t num_rows = total_elements / dims;
+
+  const float *x_data = input.data().data();
+  const float *g_data = grad_output.data().data();
+  const float *w_data = weight_.data().data();
+  float *dx_data = grad_input.data().data();
+  float *dw_data = grad_weight.data().data();
+
+  for (size_t r = 0; r < num_rows; ++r) {
+    size_t offset = r * dims;
+
+    // 1. Calculate sum of squares for this row to compute RMS
+    float sum_sq = 0.0f;
+    for (size_t col = 0; col < dims; ++col) {
+      float val = x_data[offset + col];
+      sum_sq += val * val;
+    }
+    float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
+
+    // 2. Compute inner sum_term: mean(g * w * xhat)
+    float sum_g_w_xhat = 0.0f;
+    for (size_t col = 0; col < dims; ++col) {
+      float xhat = x_data[offset + col] / rms;
+      sum_g_w_xhat += g_data[offset + col] * w_data[col] * xhat;
+    }
+    sum_g_w_xhat /= static_cast<float>(dims);
+
+    // 3. Compute gradients w.r.t input and accumulate weights gradients
+    for (size_t col = 0; col < dims; ++col) {
+      float xhat = x_data[offset + col] / rms;
+
+      // grad_input calculation
+      dx_data[offset + col] =
+          (1.0f / rms) *
+          (g_data[offset + col] * w_data[col] - xhat * sum_g_w_xhat);
+
+      // Accumulate weight gradient
+      dw_data[col] += g_data[offset + col] * xhat;
+    }
+  }
+
+  return grad_input;
 }

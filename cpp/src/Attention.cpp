@@ -70,6 +70,70 @@ Tensor reshape_to_4d(const Tensor &src, size_t n_heads, size_t head_dim) {
 }
 
 /**
+ * @brief Reshapes a 4D tensor of shape [batch, n_heads, seq_len, head_dim]
+ *        into a 3D tensor of shape [batch, seq_len, n_heads * head_dim].
+ *
+ * Used to isolate attention heads so self-attention can be computed
+ * head-by-head.
+ *
+ * Example:
+ *   If src shape is [2, 128, 256], calling reshape_to_4d(src, 8, 32)
+ *   returns a tensor of shape [2, 8, 128, 32].
+ *
+ * @param src Input 3D tensor to reshape.
+ * @param n_heads Number of attention heads.
+ * @param head_dim Dimension of each attention head.
+ * @return Tensor Reshaped 4D tensor.
+ */
+
+Tensor reshape_to_3d(const Tensor &src) {
+  size_t batch = src.shape()[0];
+  size_t n_heads = src.shape()[1];
+  size_t seq_len = src.shape()[2];
+  size_t head_dim = src.shape()[3];
+
+  Tensor dest({batch, seq_len, n_heads * head_dim}, 0.0f);
+
+  for (size_t b = 0; b < batch; ++b) {
+
+    for (size_t h = 0; h < n_heads; h++) {
+      for (size_t s = 0; s < seq_len; ++s) {
+        for (size_t d = 0; d < head_dim; ++d) {
+          dest(b, s, h * head_dim + d) = src(b, h, s, d);
+        }
+      }
+    }
+  }
+  return dest;
+}
+
+/**
+ * @brief Transposes the last two dimensions of a 4D tensor.
+ *
+ * Used to swap sequence length and head dimension for matrix multiplication.
+ *
+ * Example:
+ *   If src shape is [2, 8, 128, 32], calling transpose_2d(src)
+ *   returns a tensor of shape [2, 8, 32, 128].
+ *
+ * @param src Input 4D tensor to transpose.
+ * @return Tensor Transposed 2D tensor.
+ */
+Tensor transpose_2d(const Tensor &src) {
+  size_t rows = src.shape()[0];
+  size_t cols = src.shape()[1];
+
+  Tensor dest({cols, rows}, 0.0f);
+
+  for (size_t i = 0; i < rows; ++i) {
+    for (size_t j = 0; j < cols; ++j) {
+      dest(j, i) = src(i, j);
+    }
+  }
+  return dest;
+}
+
+/**
  * @brief Performs the forward pass of the Attention layer.
  *
  * Flow:
@@ -159,4 +223,211 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
   }
   Tensor out = attn_output.matmul(Wo_);
   return out;
+}
+/**
+ * @brief Helper function to perform GQA backward pass calculations for a single query token.
+ *
+ * Implements softmax backward and accumulates gradients w.r.t queries, keys, and values.
+ */
+static void gqa_backward_query_token(
+    size_t b, size_t h, size_t kv_h, size_t s_q, size_t seq_len, size_t head_dim,
+    float scale, const Tensor &q4, const Tensor &k4, const Tensor &v4,
+    const Tensor &grad_attn_output, Tensor &grad_q4, Tensor &grad_k4, Tensor &grad_v4) {
+
+  std::vector<float> raw_scores(seq_len);
+  std::vector<float> prob(seq_len);
+  std::vector<float> dP(seq_len);
+
+  // Step A: Recompute probabilities (prob[s_k])
+  float max_score = -INFINITY;
+  for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+    float dot = 0.0f;
+    for (size_t d = 0; d < head_dim; ++d) {
+      dot += q4(b, h, s_q, d) * k4(b, kv_h, s_k, d);
+    }
+    raw_scores[s_k] = dot * scale;
+    if (raw_scores[s_k] > max_score) {
+      max_score = raw_scores[s_k];
+    }
+  }
+
+  float sum_exp = 0.0f;
+  for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+    sum_exp += std::exp(raw_scores[s_k] - max_score);
+  }
+
+  for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+    prob[s_k] = std::exp(raw_scores[s_k] - max_score) / sum_exp;
+  }
+
+  // Step B: Backprop w.r.t probabilities (dP) and accumulate grad_v4
+  float sum_dP_prob = 0.0f;
+  for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+    float dot_g_v = 0.0f;
+    for (size_t d = 0; d < head_dim; ++d) {
+      float g = grad_attn_output(b, s_q, h * head_dim + d);
+      dot_g_v += g * v4(b, kv_h, s_k, d);
+      grad_v4(b, kv_h, s_k, d) += prob[s_k] * g;
+    }
+    dP[s_k] = dot_g_v;
+    sum_dP_prob += dP[s_k] * prob[s_k];
+  }
+
+  // Step C: Backprop through Softmax and Scaled Dot-Product to grad_q4 & grad_k4
+  for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+    float dS = prob[s_k] * (dP[s_k] - sum_dP_prob);
+    float dS_scaled = dS * scale;
+    for (size_t d = 0; d < head_dim; ++d) {
+      grad_q4(b, h, s_q, d) += dS_scaled * k4(b, kv_h, s_k, d);
+      grad_k4(b, kv_h, s_k, d) += dS_scaled * q4(b, h, s_q, d);
+    }
+  }
+}
+
+/**
+ * @brief Performs the backward pass of the Attention layer.
+ *
+ * @param grad_output Gradient from the next layer.
+ * @param x Input tensor.
+ * @param rope Rotary Position Embedding (RoPE) helper.
+ * @param grad_Wq Gradient for Wq.
+ * @param grad_Wk Gradient for Wk.
+ * @param grad_Wv Gradient for Wv.
+ * @param grad_Wo Gradient for Wo.
+ * @param cache Optional pointer to Key-Value Cache.
+ * @param pos_offset Optional position offset for cache mapping.
+ * @return Tensor Gradient for the input tensor x.
+ *
+ */
+Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
+                           const RoPE &rope, Tensor &grad_Wq, Tensor &grad_Wk,
+                           Tensor &grad_Wv, Tensor &grad_Wo, KVCache *cache,
+                           size_t pos_offset) const {
+  size_t batch = x.shape()[0];
+  size_t seq_len = x.shape()[1];
+  size_t hidden_dim = x.shape()[2];
+  size_t n_heads = config_.n_heads;
+  size_t n_kv_heads = config_.n_kv_heads;
+  size_t head_dim = config_.head_dim;
+  size_t gqa_factor = n_heads / n_kv_heads;
+  float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  // 1. Recompute forward states
+  RMSNorm rms_norm(hidden_dim, config_.rms_norm_eps);
+  Tensor x_norm = rms_norm.forward(x);
+
+  Tensor q4 = reshape_to_4d(x_norm.matmul(Wq_), n_heads, head_dim);
+  Tensor k4 = reshape_to_4d(x_norm.matmul(Wk_), n_kv_heads, head_dim);
+  Tensor v4 = reshape_to_4d(x_norm.matmul(Wv_), n_kv_heads, head_dim);
+  rope.forward(q4, k4);
+
+  Tensor attn_output({batch, seq_len, hidden_dim}, 0.0f);
+
+  // --- Run the forward GQA pass loops to populate attn_output ---
+  std::vector<float> raw_scores(seq_len);
+  for (size_t b = 0; b < batch; ++b) {
+    for (size_t h = 0; h < n_heads; ++h) {
+      size_t kv_h = h / gqa_factor;
+      for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+        float max_score = -INFINITY;
+        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+          float dot = 0.0f;
+          for (size_t d = 0; d < head_dim; ++d) {
+            dot += q4(b, h, s_q, d) * k4(b, kv_h, s_k, d);
+          }
+          raw_scores[s_k] = dot * scale;
+          if (raw_scores[s_k] > max_score)
+            max_score = raw_scores[s_k];
+        }
+        float sum_exp = 0.0f;
+        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+          sum_exp += std::exp(raw_scores[s_k] - max_score);
+        }
+        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+          float prob = std::exp(raw_scores[s_k] - max_score) / sum_exp;
+          for (size_t d = 0; d < head_dim; ++d) {
+            size_t out_channel = h * head_dim + d;
+            attn_output(b, s_q, out_channel) += prob * v4(b, kv_h, s_k, d);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Wo weight gradient accumulation (grad_Wo += attn_output^T @ grad_output)
+  grad_Wo.fill(0.0f);
+  for (size_t b = 0; b < batch; ++b) {
+    for (size_t s = 0; s < seq_len; ++s) {
+      for (size_t r = 0; r < n_heads * head_dim; ++r) {
+        float val = attn_output(b, s, r);
+        for (size_t c = 0; c < hidden_dim; ++c) {
+          grad_Wo(r, c) += val * grad_output(b, s, c);
+        }
+      }
+    }
+  }
+
+  // 3. Backpropagate to attention head outputs
+  Tensor grad_attn_output = grad_output.matmul(transpose_2d(Wo_));
+
+  // 4. Initialize head gradients
+  Tensor grad_q4({batch, n_heads, seq_len, head_dim}, 0.0f);
+  Tensor grad_k4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
+  Tensor grad_v4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
+
+  // 5. GQA attention backpropagation loops
+  for (size_t b = 0; b < batch; ++b) {
+    for (size_t h = 0; h < n_heads; ++h) {
+      size_t kv_h = h / gqa_factor;
+      for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+        gqa_backward_query_token(
+            b, h, kv_h, s_q, seq_len, head_dim, scale, q4, k4, v4,
+            grad_attn_output, grad_q4, grad_k4, grad_v4);
+      }
+    }
+  }
+
+  // 6. Backpropagate RoPE
+  rope.backward(grad_q4, grad_k4);
+
+  // 7. Reshape gradients back to 3D
+  Tensor grad_q_proj = reshape_to_3d(grad_q4);
+  Tensor grad_k_proj = reshape_to_3d(grad_k4);
+  Tensor grad_v_proj = reshape_to_3d(grad_v4);
+
+  // 8. Accumulate projection weights gradients (Wq, Wk, Wv)
+  grad_Wq.fill(0.0f);
+  grad_Wk.fill(0.0f);
+  grad_Wv.fill(0.0f);
+
+  for (size_t b = 0; b < batch; ++b) {
+    for (size_t s = 0; s < seq_len; ++s) {
+      for (size_t d = 0; d < hidden_dim; ++d) {
+        float x_val = x_norm(b, s, d);
+        // Wq accumulation
+        for (size_t o = 0; o < n_heads * head_dim; ++o) {
+          grad_Wq(d, o) += x_val * grad_q_proj(b, s, o);
+        }
+        // Wk accumulation
+        for (size_t o = 0; o < n_kv_heads * head_dim; ++o) {
+          grad_Wk(d, o) += x_val * grad_k_proj(b, s, o);
+        }
+        // Wv accumulation
+        for (size_t o = 0; o < n_kv_heads * head_dim; ++o) {
+          grad_Wv(d, o) += x_val * grad_v_proj(b, s, o);
+        }
+      }
+    }
+  }
+
+  // 9. Compute gradient w.r.t normalized input
+  Tensor grad_x_norm = grad_q_proj.matmul(transpose_2d(Wq_));
+  grad_x_norm.add_(grad_k_proj.matmul(transpose_2d(Wk_)));
+  grad_x_norm.add_(grad_v_proj.matmul(transpose_2d(Wv_)));
+
+  // 10. Backpropagate through RMSNorm to get gradient w.r.t raw input x
+  Tensor grad_weight_dummy({hidden_dim}, 0.0f);
+  Tensor grad_x = rms_norm.backward(grad_x_norm, x, grad_weight_dummy);
+
+  return grad_x;
 }

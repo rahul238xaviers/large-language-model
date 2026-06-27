@@ -30,6 +30,9 @@ public:
   const std::vector<std::vector<float>> &sin_table() const {
     return sin_table_;
   }
+  // Applies inverse rotary position embeddings to Query and Key gradients
+  // in-place
+  void backward(Tensor &grad_q, Tensor &grad_k) const;
 
 private:
   size_t head_dim_;
