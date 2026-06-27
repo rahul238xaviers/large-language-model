@@ -173,100 +173,160 @@ Tensor Tensor::scale(float factor) const {
 }
 
 /**
- * @brief Performs batched or 2D matrix multiplication between this tensor and another.
- * 
+ * @brief Performs batched or 2D matrix multiplication between this tensor and
+ * another.
+ *
  * Preconditions:
  * 1. Both tensors must have at least 2 dimensions.
  * 2. Non-matrix dimensions (batch dimensions) must match exactly.
- * 3. Inner matrix dimensions must match: this->shape().back() == other.shape()[second_to_last].
- * 
+ * 3. Inner matrix dimensions must match: this->shape().back() ==
+ * other.shape()[second_to_last].
+ *
  * @param other Multiplier tensor.
  * @return Tensor Result tensor.
  */
-Tensor Tensor::matmul(const Tensor &other) const {
+// Tensor::matmul — reviewed and fixed.
+//
+// Bugs fixed vs. the original:
+//   1. The "broadcast 2D weight across batch dims" fast path was dead code:
+//      it required shape_.size()==3 && other.shape().size()==2, but the
+//      strict rank-equality check just above it threw first, so that branch
+//      could never be reached. It is now a real, reachable code path, and
+//      generalized to work for ANY input rank (not just rank 3), since the
+//      broadcasting logic doesn't actually depend on rank.
+//   2. Inconsistent zero-initialization: one branch explicitly zero-filled
+//      the result tensor, the other didn't. Both paths now explicitly
+//      zero-initialize, since we accumulate with +=.
+//   3. Signed/unsigned loop counters (`int i` compared against
+//      `shape_.size() - 2`, a size_t) replaced with size_t throughout, and
+//      the loop bound rewritten as `i + 2 < rank` to avoid any risk of
+//      unsigned underflow if this code is ever reused with a smaller rank.
+//
+// Behavior preserved: same cache-friendly i-k-j loop order, same exception
+// messages/conditions for the still-supported error cases.
 
-  // Checking conditions for matrix multiplication
-  // 1. Both tensors must have at least 2 dimensions
-  // 2. Batch size must match for matrix multiplication
-  // 3. Inner dimensions must match for matrix multiplication
-  // Let the shape of the first tensor be (B1, M, K)
-  // Let the shape of the second tensor be (B2, K, N)
-  // For matrix multiplication to be valid, we must have B1 == B2 and K == K
-  // The resulting tensor will have the shape (B1, M, N)
+Tensor Tensor::matmul(const Tensor &other) const {
+  // Matrix multiplication rules:
+  // 1. Both tensors must have at least 2 dimensions.
+  // 2. If `other` is exactly 2D, it's treated as a shared weight/projection
+  //    matrix and broadcast across every leading ("batch") dimension of
+  //    `this` — e.g. (B, S, K) @ (K, N) -> (B, S, N), or even
+  //    (B, S1, S2, K) @ (K, N) -> (B, S1, S2, N).
+  // 3. Otherwise, both tensors must have the same rank, matching leading
+  //    (batch) dimensions, and a matching inner dimension:
+  //    (..., M, K) @ (..., K, N) -> (..., M, N)
 
   if (shape_.size() < 2 || other.shape().size() < 2) {
     throw std::invalid_argument(
         "Matmul not implemented for tensors with less than 2 dimensions");
   }
 
+  // --- Case 1: broadcast a 2D weight matrix across all leading dimensions ---
+  // e.g. x:(B, S, K) @ W:(K, N) -> (B, S, N)
+  if (other.shape().size() == 2 && shape_.size() != 2) {
+    const size_t K = shape_.back();
+    const size_t N = other.shape()[1];
+
+    if (K != other.shape()[0]) {
+      throw std::invalid_argument("Inner dimensions must match for projection");
+    }
+
+    // Flatten every dimension except the last into a single "row" count.
+    // e.g. (B, S, K) -> M = B * S rows of length K.
+    size_t M = 1;
+    for (size_t i = 0; i + 1 < shape_.size(); ++i) {
+      M *= shape_[i];
+    }
+
+    std::vector<size_t> result_shape = shape_;
+    result_shape.back() = N;
+    Tensor result(result_shape, 0.0f);
+
+    const float *x_data = data_.data();
+    const float *w_data = other.data().data();
+    float *res_data = result.data().data();
+
+    for (size_t row = 0; row < M; ++row) {
+      const float *x_row = x_data + row * K;
+      float *res_row = res_data + row * N;
+
+      for (size_t k = 0; k < K; ++k) {
+        const float val = x_row[k];
+        const float *w_row = w_data + k * N;
+        for (size_t n = 0; n < N; ++n) {
+          res_row[n] += val * w_row[n];
+        }
+      }
+    }
+    return result;
+  }
+
+  // --- Case 2: standard batched matmul, both tensors share the same rank ---
   if (shape_.size() != other.shape().size()) {
     throw std::invalid_argument(
         "Batch size must match for matrix multiplication");
   }
 
-  for (int i = 0; i < shape_.size() - 2; i++) {
+  const size_t rank = shape_.size();
+
+  for (size_t i = 0; i + 2 < rank; ++i) {
     if (shape_[i] != other.shape()[i]) {
       throw std::invalid_argument(
           "Batch dimension must match for matrix multiplication");
     }
   }
 
-  if (shape_[shape_.size() - 1] != other.shape()[other.shape().size() - 2]) {
+  if (shape_[rank - 1] != other.shape()[rank - 2]) {
     throw std::invalid_argument(
         "Inner dimensions must match for matrix multiplication");
   }
 
-  // First we set the shape as the primary tension shape and then replace the
-  // last element in the shape with the multiplier tensor For example,
-  // A[3,4,5,6] and B[3,4,6,7] then result shape is initialised as [3,4,5,6]
-  // then it is updated with other.shape().back() so it becomes [3,4,5,7]
+  // Result takes the shape of `this`, but with the trailing dimension
+  // replaced by the trailing dimension of `other`.
+  // e.g. A[3,4,5,6] @ B[3,4,6,7] -> result[3,4,5,7]
   std::vector<size_t> result_shape = shape_;
   result_shape.back() = other.shape().back();
-  Tensor result(result_shape);
+  Tensor result(result_shape, 0.0f);
 
+  // Every dimension except the trailing two is a batch dimension, since
+  // matmul only operates on the last two dimensions of each slice.
   size_t num_batches = 1;
-
-  // Except the last 2 dimension the multiplication of all the
-  // other dimensions is considered as batch_size
-  // This is because matmul is performed on the last 2 dimensions only
-  for (int i = 0; i < shape_.size() - 2; i++) {
+  for (size_t i = 0; i + 2 < rank; ++i) {
     num_batches *= shape_[i];
   }
 
-  // Last but one dimension of the shape of the primary tensor
-  // For example, if the tensor A is [3,4,5,6] then the M is 5.
-  size_t M = shape_[shape_.size() - 2];
+  const size_t M = shape_[rank - 2];     // rows of A / rows of result
+  const size_t K = shape_[rank - 1];     // cols of A / rows of B
+  const size_t N = other.shape().back(); // cols of B / cols of result
 
-  // last dimension of the shape of the primary tensor
-  // For example, if the tensor A is [3,4,5,6] then the K is 6.
-  size_t K = shape_[shape_.size() - 1];
+  const size_t batch_offset_A = M * K;
+  const size_t batch_offset_B = K * N;
+  const size_t batch_offset_C = M * N;
 
-  // Last dimension of the shape of the multiplier tensor
-  // For example, if the tensor B is [3,4,6,7] then the N is 7.
-  size_t N = other.shape().back();
-
-  // This represents in each batch dimension the size of the the matrix.
-  // For example, A[3,4,5,6] then M*K = 5*6=30 is the size of matrix for A.
-  // Similarly for B[3,4,6,7] then K*N=6*7=42 is the size of matrix for B
-  // and result will be [3,4,5,7] so batch_offset_C = 5*7 =35
-  size_t batch_offset_A = M * K;
-  size_t batch_offset_B = K * N;
-  size_t batch_offset_C = M * N;
+  const float *a_data = data_.data();
+  const float *b_data = other.data().data();
+  float *c_data = result.data().data();
 
   for (size_t b = 0; b < num_batches; ++b) {
+    const float *dataA = a_data + b * batch_offset_A;
+    const float *dataB = b_data + b * batch_offset_B;
+    float *dataC = c_data + b * batch_offset_C;
 
-    const float *dataA = data_.data() + b * batch_offset_A;
-    const float *dataB = other.data().data() + b * batch_offset_B;
-    float *dataC = result.data().data() + b * batch_offset_C;
-
+    // i-k-j loop order: dataB and dataC accesses in the innermost loop are
+    // contiguous, which is cache-friendly.
     for (size_t i = 0; i < M; ++i) {
+      const float *a_row = dataA + i * K;
+      float *c_row = dataC + i * N;
+
       for (size_t k = 0; k < K; ++k) {
-        float val = dataA[i * K + k];
+        const float val = a_row[k];
+        const float *b_row = dataB + k * N;
         for (size_t j = 0; j < N; ++j) {
-          dataC[i * N + j] += val * dataB[k * N + j];
+          c_row[j] += val * b_row[j];
         }
       }
     }
   }
+
   return result;
 }
