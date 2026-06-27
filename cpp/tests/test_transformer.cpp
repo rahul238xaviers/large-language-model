@@ -636,6 +636,115 @@ int main() {
                    pass ? "Accumulated" : "Overwritten", pass);
   }
 
+  std::cout << std::endl;
+  std::cout << "================================================================================"
+            << std::endl;
+  std::cout << "SECTION 2: PERFORMANCE PROFILING & BENCHMARKS" << std::endl;
+  std::cout << "================================================================================"
+            << std::endl;
+
+  {
+    size_t bench_batch = 2;
+    size_t bench_seq_len = 32;
+    size_t bench_hidden_dim = 512;
+    size_t bench_intermediate_dim = 1384;
+    size_t bench_n_heads = 8;
+    size_t bench_n_kv_heads = 4;
+    size_t bench_head_dim = 64;
+
+    std::cout << "Transformer Layer Benchmark (Forward & Backward Passes):" << std::endl;
+    std::cout << "  Input Dimensions:     [" << bench_batch << ", " << bench_seq_len << ", " << bench_hidden_dim << "]" << std::endl;
+    std::cout << "  FFN Intermediate:     " << bench_intermediate_dim << std::endl;
+    std::cout << "  Attention Heads:      " << bench_n_heads << " (dim=" << bench_head_dim << ")" << std::endl;
+
+    ModelConfig bench_config;
+    bench_config.hidden_dim = bench_hidden_dim;
+    bench_config.intermediate_dim = bench_intermediate_dim;
+    bench_config.n_heads = bench_n_heads;
+    bench_config.n_kv_heads = bench_n_kv_heads;
+    bench_config.head_dim = bench_head_dim;
+    bench_config.max_seq_len = 128;
+    bench_config.rope_base = 10000.0f;
+    bench_config.rms_norm_eps = 1e-5f;
+
+    TransformerLayer bench_layer(bench_config);
+    RoPE bench_rope(bench_head_dim, 128, 10000.0f);
+
+    bench_layer.w_gate.fill(0.01f);
+    bench_layer.w_up.fill(0.01f);
+    bench_layer.w_down.fill(0.01f);
+    bench_layer.attn.Wq().fill(0.01f);
+    bench_layer.attn.Wk().fill(0.01f);
+    bench_layer.attn.Wv().fill(0.01f);
+    bench_layer.attn.Wo().fill(0.01f);
+
+    Tensor x({bench_batch, bench_seq_len, bench_hidden_dim}, 0.1f);
+    Tensor grad_output({bench_batch, bench_seq_len, bench_hidden_dim}, 0.05f);
+
+    Tensor grad_w_gate(bench_layer.w_gate.shape(), 0.0f);
+    Tensor grad_w_up(bench_layer.w_up.shape(), 0.0f);
+    Tensor grad_w_down(bench_layer.w_down.shape(), 0.0f);
+    Tensor grad_Wq(bench_layer.attn.Wq().shape(), 0.0f);
+    Tensor grad_Wk(bench_layer.attn.Wk().shape(), 0.0f);
+    Tensor grad_Wv(bench_layer.attn.Wv().shape(), 0.0f);
+    Tensor grad_Wo(bench_layer.attn.Wo().shape(), 0.0f);
+
+    // Warm-up pass
+    Tensor attn_in = bench_layer.attn_norm.forward(x);
+    Tensor attn_out = bench_layer.attn.forward(attn_in, bench_rope);
+    Tensor h_mid = x.add(attn_out);
+    Tensor ffn_in = bench_layer.ffn_norm.forward(h_mid);
+    Tensor gate_proj = ffn_in.matmul(bench_layer.w_gate);
+    Tensor up_proj = ffn_in.matmul(bench_layer.w_up);
+    Tensor activated = activatations::swiglu(gate_proj, up_proj);
+    Tensor ffn_out = activated.matmul(bench_layer.w_down);
+    Tensor h_out = h_mid.add(ffn_out);
+
+    Tensor dx = bench_layer.backward(grad_output, x, grad_w_gate, grad_w_up, grad_w_down,
+                                     grad_Wq, grad_Wk, grad_Wv, grad_Wo, bench_rope);
+
+    const int runs = 5;
+    
+    // Forward pass timing
+    std::cout << "  [INFO] Running Forward Pass benchmark..." << std::endl;
+    std::vector<double> fwd_latencies;
+    for (int r = 0; r < runs; ++r) {
+      auto start = std::chrono::high_resolution_clock::now();
+      Tensor attn_in_loop = bench_layer.attn_norm.forward(x);
+      Tensor attn_out_loop = bench_layer.attn.forward(attn_in_loop, bench_rope);
+      Tensor h_mid_loop = x.add(attn_out_loop);
+      Tensor ffn_in_loop = bench_layer.ffn_norm.forward(h_mid_loop);
+      Tensor gate_proj_loop = ffn_in_loop.matmul(bench_layer.w_gate);
+      Tensor up_proj_loop = ffn_in_loop.matmul(bench_layer.w_up);
+      Tensor activated_loop = activatations::swiglu(gate_proj_loop, up_proj_loop);
+      Tensor ffn_out_loop = activated_loop.matmul(bench_layer.w_down);
+      Tensor h_out_loop = h_mid_loop.add(ffn_out_loop);
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      fwd_latencies.push_back(ms);
+      std::cout << "    Run " << (r + 1) << ": " << ms << " ms" << std::endl;
+    }
+    double fwd_avg_ms = std::accumulate(fwd_latencies.begin(), fwd_latencies.end(), 0.0) / runs;
+
+    // Backward pass timing
+    std::cout << "  [INFO] Running Backward Pass benchmark..." << std::endl;
+    std::vector<double> bwd_latencies;
+    for (int r = 0; r < runs; ++r) {
+      auto start = std::chrono::high_resolution_clock::now();
+      Tensor dy = bench_layer.backward(grad_output, x, grad_w_gate, grad_w_up, grad_w_down,
+                                       grad_Wq, grad_Wk, grad_Wv, grad_Wo, bench_rope);
+      auto end = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      bwd_latencies.push_back(ms);
+      std::cout << "    Run " << (r + 1) << ": " << ms << " ms" << std::endl;
+    }
+    double bwd_avg_ms = std::accumulate(bwd_latencies.begin(), bwd_latencies.end(), 0.0) / runs;
+
+    std::cout << std::endl;
+    std::cout << "  Forward Average Latency:  " << fwd_avg_ms << " ms" << std::endl;
+    std::cout << "  Backward Average Latency: " << bwd_avg_ms << " ms" << std::endl;
+  }
+
   std::cout << "================================================================================"
             << std::endl;
   std::cout << "TEST EXECUTION SUMMARY" << std::endl;
