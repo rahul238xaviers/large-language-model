@@ -6,8 +6,9 @@
  *                             PIPELINE FLOW & PURPOSE
  * ============================================================================
  * RMSNorm is a normalization layer used in modern transformer architectures.
- * It scales input activations along the hidden dimension by their Root Mean Square
- * value, ensuring stable gradient flow and preventing exploding/vanishing gradients.
+ * It scales input activations along the hidden dimension by their Root Mean
+ * Square value, ensuring stable gradient flow and preventing
+ * exploding/vanishing gradients.
  */
 
 #pragma once
@@ -23,6 +24,11 @@ public:
 
   // Forward pass: normalizes the input tensor along its last dimension
   Tensor forward(const Tensor &x) const;
+
+  // Backward pass: computes gradients w.r.t input and accumulates gradients
+  // w.r.t weights
+  Tensor backward(const Tensor &grad_output, const Tensor &input,
+                  Tensor &grad_weight) const;
 
   // Accessors
   const Tensor &weight() const { return weight_; }
