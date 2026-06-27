@@ -61,5 +61,26 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
       }
     }
   }
-  return h;
+  for (const auto &layer : layers_) {
+    // 1. Attention Block with Residual
+    Tensor attn_in = layer.attn_norm.forward(h);
+    Tensor attn_out = layer.attn.forward(attn_in, rope_, cache);
+    h.add_(attn_out);
+
+    // 2. FFN Block (SwiGLU) with Residual
+    Tensor ffn_in = layer.ffn_norm.forward(h);
+    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
+    Tensor up_proj = ffn_in.matmul(layer.w_up);
+    Tensor activated = activatations::swiglu(gate_proj, up_proj);
+    Tensor ffn_out = activated.matmul(layer.w_down);
+    h.add_(ffn_out);
+  }
+
+  // Final RMSNorm
+  Tensor final_h = final_norm_.forward(h);
+
+  // Project to vocabulary logits
+  Tensor logits = final_h.matmul(output_projection_);
+
+  return logits;
 }

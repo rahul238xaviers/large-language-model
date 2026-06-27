@@ -32,6 +32,7 @@ add_library(data_ingestion
     cpp/src/Positional.cpp
     cpp/src/Attention.cpp
     cpp/src/Transformer.cpp
+    cpp/src/Loss.cpp
 )
 
 # Set include directories
@@ -98,6 +99,24 @@ add_executable(test_attention
 )
 # Link it against our library
 target_link_libraries(test_attention PUBLIC
+    data_ingestion
+)
+
+# Define our Transformer test executable
+add_executable(test_transformer
+    cpp/tests/test_transformer.cpp
+)
+# Link it against our library
+target_link_libraries(test_transformer PUBLIC
+    data_ingestion
+)
+
+# Define our Loss test executable
+add_executable(test_loss
+    cpp/tests/test_loss.cpp
+)
+# Link it against our library
+target_link_libraries(test_loss PUBLIC
     data_ingestion
 )
 
