@@ -1,3 +1,17 @@
+/**
+ * @file RMSNorm.cpp
+ * @brief Implementation of Root Mean Square Normalization (RMSNorm)
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * This file implements the mathematical formulas for RMSNorm. For each row:
+ * 1. Calculate the mean of the squared elements along the hidden dimension.
+ * 2. Add an epsilon for numerical stability.
+ * 3. Take the square root to find the Root Mean Square (RMS).
+ * 4. Divide each element by the RMS and scale by the learnable weight vector.
+ */
+
 #include "RMSNorm.hpp"
 #include <cmath>
 #include <cstddef>
@@ -5,13 +19,27 @@
 #include <stdexcept>
 #include <vector>
 
+/**
+ * @brief Construct a new RMSNorm object
+ * 
+ * @param dims Dimension size to normalize over (typically the hidden dimension).
+ * @param eps Small epsilon to prevent division by zero (defaults to 1e-5f).
+ */
 RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f), eps_(eps) {}
 
-// This function squares each row of the Tensor sum it up. Then add the epsilon
-// Then takes the square root of it. Once the square root is calculated then
-// that value is used to divide the input tensor. Finally the result is
-// multiplied with the weight vector.
-
+/**
+ * @brief Performs RMSNorm normalization on the input tensor in the forward pass.
+ * 
+ * Each row (representing the features of a single token) is normalized
+ * independently along its last dimension.
+ * 
+ * Mathematical Formula:
+ *   y = (x / RMS(x)) * weight
+ *   where RMS(x) = sqrt(1/d * sum(x_i^2) + eps)
+ * 
+ * @param x Input tensor of shape (batch, seq_len, hidden_dim) or (seq_len, hidden_dim).
+ * @return Tensor Normalized tensor of the same shape as input x.
+ */
 Tensor RMSNorm::forward(const Tensor &x) const {
 
   const std::vector<size_t> &x_shape = x.shape();

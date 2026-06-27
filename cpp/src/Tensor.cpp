@@ -1,3 +1,14 @@
+/**
+ * @file Tensor.cpp
+ * @brief Implementation of the multidimensional Tensor structure
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * Implements index-flattening calculations (strides) and arithmetic
+ * methods (add, mul, scale, matmul) for the Tensor class.
+ */
+
 #include "Tensor.hpp"
 #include <algorithm>
 #include <functional>
@@ -161,6 +172,17 @@ Tensor Tensor::scale(float factor) const {
   return result;
 }
 
+/**
+ * @brief Performs batched or 2D matrix multiplication between this tensor and another.
+ * 
+ * Preconditions:
+ * 1. Both tensors must have at least 2 dimensions.
+ * 2. Non-matrix dimensions (batch dimensions) must match exactly.
+ * 3. Inner matrix dimensions must match: this->shape().back() == other.shape()[second_to_last].
+ * 
+ * @param other Multiplier tensor.
+ * @return Tensor Result tensor.
+ */
 Tensor Tensor::matmul(const Tensor &other) const {
 
   // Checking conditions for matrix multiplication

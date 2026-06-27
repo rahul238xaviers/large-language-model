@@ -1,3 +1,14 @@
+/**
+ * @file TransformerConfig.hpp
+ * @brief Configuration structures for the Transformer model and KV cache
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * Defines ModelConfig (holding hyperparameters like dimensions, layers, and heads)
+ * and KVCache structures used during autoregressive generation.
+ */
+
 #pragma once
 #include "Tensor.hpp"
 #include <cstddef>
@@ -12,6 +23,7 @@ struct ModelConfig {
   size_t head_dim;
   size_t max_seq_len;
   float rope_base;
+  float rms_norm_eps;
 
   static ModelConfig make_default() {
     ModelConfig model_config;
@@ -24,6 +36,7 @@ struct ModelConfig {
     model_config.head_dim = 128;
     model_config.max_seq_len = 2048;
     model_config.rope_base = 10000.0f;
+    model_config.rms_norm_eps = 1e-5f;
     return model_config;
   }
 
@@ -38,6 +51,7 @@ struct ModelConfig {
     model_toy.head_dim = 4;
     model_toy.max_seq_len = 128;
     model_toy.rope_base = 10000.0f;
+    model_toy.rms_norm_eps = 1e-5f;
     return model_toy;
   }
 };

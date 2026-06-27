@@ -1,8 +1,31 @@
+/**
+ * @file Positional.cpp
+ * @brief Implementation of Rotary Position Embeddings (RoPE)
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * This file implements precomputation of trigonometric rotation tables (sine and cosine)
+ * and the rotation application logic to input Query and Key tensors.
+ *
+ * By grouping adjacent coordinates into pairs (x0, x1) and rotating them,
+ * we embed relative distance information directly into the dot-product attention scores.
+ */
+
 #include "Positional.hpp"
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
 
+/**
+ * @brief Construct a new RoPE object.
+ * 
+ * Verifies head dimension properties and triggers table precomputation.
+ * 
+ * @param head_dim Size of individual attention heads (must be even).
+ * @param max_seq_len Maximum sequence length supported by precomputed tables.
+ * @param base Base constant for frequency computations (e.g. 10000.0f).
+ */
 RoPE::RoPE(size_t head_dim, size_t max_seq_len, float base)
     : head_dim_(head_dim), max_seq_len_(max_seq_len), base_(base) {
 
@@ -13,6 +36,12 @@ RoPE::RoPE(size_t head_dim, size_t max_seq_len, float base)
   precompute_tables();
 }
 
+/**
+ * @brief Precomputes the rotation matrices (sine and cosine tables)
+ * 
+ * Sets up frequency values (theta) based on the dimensions and base constant,
+ * then evaluates cos(pos * theta) and sin(pos * theta) for all positions.
+ */
 void RoPE::precompute_tables() {
 
   size_t half_dim = head_dim_ / 2;
@@ -35,6 +64,15 @@ void RoPE::precompute_tables() {
   }
 }
 
+/**
+ * @brief Applies the precomputed rotary positional embeddings to Q and K.
+ * 
+ * Both tensors must be 4D shape: [batch, heads, seq_len, head_dim].
+ * Rotation is applied to coordinate pairs in-place.
+ * 
+ * @param q Query tensor to rotate in-place.
+ * @param k Key tensor to rotate in-place.
+ */
 void RoPE::forward(Tensor &q, Tensor &k) const {
 
   if (q.shape().size() != 4 || k.shape().size() != 4) {

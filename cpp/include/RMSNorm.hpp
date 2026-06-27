@@ -1,3 +1,15 @@
+/**
+ * @file RMSNorm.hpp
+ * @brief Root Mean Square Normalization (RMSNorm) layer declaration
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * RMSNorm is a normalization layer used in modern transformer architectures.
+ * It scales input activations along the hidden dimension by their Root Mean Square
+ * value, ensuring stable gradient flow and preventing exploding/vanishing gradients.
+ */
+
 #pragma once
 
 #include "Tensor.hpp"

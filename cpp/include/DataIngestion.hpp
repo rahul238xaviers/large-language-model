@@ -1,3 +1,14 @@
+/**
+ * @file DataIngestion.hpp
+ * @brief Data Ingestion pipeline declaration
+ *
+ * ============================================================================
+ *                             PIPELINE FLOW & PURPOSE
+ * ============================================================================
+ * Declares the DataIngestion class which manages loading raw files, tokenization,
+ * and streaming batch preparation for training.
+ */
+
 #pragma once
 
 #include <arrow/api.h>
