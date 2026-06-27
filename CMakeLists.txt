@@ -33,6 +33,8 @@ add_library(data_ingestion
     cpp/src/Attention.cpp
     cpp/src/Transformer.cpp
     cpp/src/Loss.cpp
+    cpp/src/Optimizer.cpp
+    cpp/src/Trainer.cpp
 )
 
 # Set include directories
@@ -119,5 +121,25 @@ add_executable(test_loss
 target_link_libraries(test_loss PUBLIC
     data_ingestion
 )
+
+# Define our complete backprop test executable
+add_executable(test_backward
+    cpp/tests/test_backward.cpp
+)
+# Link it against our library
+target_link_libraries(test_backward PUBLIC
+    data_ingestion
+)
+
+# Define our Trainer test executable
+add_executable(test_trainer
+    cpp/tests/test_trainer.cpp
+)
+# Link it against our library
+target_link_libraries(test_trainer PUBLIC
+    data_ingestion
+)
+
+
 
 

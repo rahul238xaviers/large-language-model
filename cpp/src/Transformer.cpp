@@ -283,6 +283,74 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   return grad_h_in;
 }
 
+// Static helper to run a cached forward pass storing intermediate hidden states for layer-by-layer backprop
+static std::vector<Tensor> run_forward_cache(
+    const Transformer &model, const Tensor &tokens, const RoPE &rope, size_t hidden_dim) {
+  size_t batch_size = tokens.shape()[0];
+  size_t seq_len = tokens.shape()[1];
+  
+  std::vector<Tensor> h_states;
+  Tensor h({batch_size, seq_len, hidden_dim});
+  
+  for (size_t b = 0; b < batch_size; b++) {
+    for (size_t s = 0; s < seq_len; s++) {
+      size_t id = static_cast<size_t>(tokens(b, s));
+      for (size_t d = 0; d < hidden_dim; d++) {
+        h(b, s, d) = model.token_embeddings()(id, d);
+      }
+    }
+  }
+  
+  h_states.push_back(h);
+  for (const auto &layer : model.layers()) {
+    Tensor attn_in = layer.attn_norm.forward(h);
+    Tensor attn_out = layer.attn.forward(attn_in, rope);
+    h.add_(attn_out);
+    
+    Tensor ffn_in = layer.ffn_norm.forward(h);
+    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
+    Tensor up_proj = ffn_in.matmul(layer.w_up);
+    Tensor activated = activatations::swiglu(gate_proj, up_proj);
+    Tensor ffn_out = activated.matmul(layer.w_down);
+    h.add_(ffn_out);
+    
+    h_states.push_back(h);
+  }
+  return h_states;
+}
+
+// Static helper to accumulate parameter gradients for the output projection layer
+static void accumulate_output_projection_grads(
+    size_t batch_size, size_t seq_len, size_t hidden_dim, size_t vocab_size,
+    const Tensor &final_h, const Tensor &grad_logits, Tensor &grad_output_projection) {
+  grad_output_projection.fill(0.0f);
+  for (size_t b = 0; b < batch_size; ++b) {
+    for (size_t s = 0; s < seq_len; ++s) {
+      for (size_t d = 0; d < hidden_dim; ++d) {
+        float h_val = final_h(b, s, d);
+        for (size_t v = 0; v < vocab_size; ++v) {
+          grad_output_projection(d, v) += h_val * grad_logits(b, s, v);
+        }
+      }
+    }
+  }
+}
+
+// Static helper to accumulate gradients w.r.t token embeddings
+static void accumulate_embedding_grads(
+    size_t batch_size, size_t seq_len, size_t hidden_dim,
+    const Tensor &tokens, const Tensor &grad_h, Tensor &grad_embeddings) {
+  grad_embeddings.fill(0.0f);
+  for (size_t b = 0; b < batch_size; ++b) {
+    for (size_t s = 0; s < seq_len; ++s) {
+      size_t id = static_cast<size_t>(tokens(b, s));
+      for (size_t d = 0; d < hidden_dim; ++d) {
+        grad_embeddings(id, d) += grad_h(b, s, d);
+      }
+    }
+  }
+}
+
 /**
  * @brief Performs the backward pass of the entire Transformer model.
  *
@@ -336,50 +404,11 @@ Tensor Transformer::backward(
   };
 
   // --- 1. Forward Pass to cache intermediate hidden states ---
-  std::vector<Tensor> h_states;
-  Tensor h({batch_size, seq_len, hidden_dim});
-
-  for (size_t b = 0; b < batch_size; b++) {
-    for (size_t s = 0; s < seq_len; s++) {
-      size_t id = static_cast<size_t>(tokens(b, s));
-      for (size_t d = 0; d < hidden_dim; d++) {
-        h(b, s, d) = token_embeddings_(id, d);
-      }
-    }
-  }
-
-  h_states.push_back(h); // Input to Layer 0
-
-  for (const auto &layer : layers_) {
-    // Mimic forward pass to compute layer output
-    Tensor attn_in = layer.attn_norm.forward(h);
-    Tensor attn_out = layer.attn.forward(attn_in, rope);
-    h.add_(attn_out);
-
-    Tensor ffn_in = layer.ffn_norm.forward(h);
-    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
-    Tensor up_proj = ffn_in.matmul(layer.w_up);
-    Tensor activated = activatations::swiglu(gate_proj, up_proj);
-    Tensor ffn_out = activated.matmul(layer.w_down);
-    h.add_(ffn_out);
-
-    h_states.push_back(h); // Input to next layer
-  }
-
-  Tensor final_h = final_norm_.forward(h);
+  std::vector<Tensor> h_states = run_forward_cache(*this, tokens, rope, hidden_dim);
+  Tensor final_h = final_norm_.forward(h_states.back());
 
   // --- 2. Output Projection Backward ---
-  grad_output_projection.fill(0.0f);
-  for (size_t b = 0; b < batch_size; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      for (size_t d = 0; d < hidden_dim; ++d) {
-        float h_val = final_h(b, s, d);
-        for (size_t v = 0; v < vocab_size; ++v) {
-          grad_output_projection(d, v) += h_val * grad_logits(b, s, v);
-        }
-      }
-    }
-  }
+  accumulate_output_projection_grads(batch_size, seq_len, hidden_dim, vocab_size, final_h, grad_logits, grad_output_projection);
 
   Tensor grad_final_h = grad_logits.matmul(transpose_w(output_projection_));
 
@@ -396,15 +425,7 @@ Tensor Transformer::backward(
   }
 
   // --- 5. Embedding Lookup Backward ---
-  grad_embeddings.fill(0.0f);
-  for (size_t b = 0; b < batch_size; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      size_t id = static_cast<size_t>(tokens(b, s));
-      for (size_t d = 0; d < hidden_dim; ++d) {
-        grad_embeddings(id, d) += grad_h(b, s, d);
-      }
-    }
-  }
+  accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h, grad_embeddings);
 
   return grad_h;
 }

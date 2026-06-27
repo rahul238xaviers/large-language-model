@@ -1,0 +1,147 @@
+/**
+ * @file Trainer.cpp
+ * @brief Implementation of the Trainer class orchestrating model pre-training
+ */
+
+#include "Trainer.hpp"
+#include "Loss.hpp"
+#include <cmath>
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+
+Trainer::Trainer(const TrainerConfig &config, Transformer &model, Optimizer &optimizer,
+                 DataIngestion &data_loader, const RoPE &rope)
+    : config_(config), model_(model), optimizer_(optimizer),
+      data_loader_(data_loader), rope_(rope) {}
+
+float Trainer::get_scheduled_lr(size_t step) const {
+  if (step < config_.warmup_steps) {
+    return config_.lr_max * static_cast<float>(step) / static_cast<float>(config_.warmup_steps);
+  }
+  if (step >= config_.max_steps) {
+    return config_.lr_min;
+  }
+  float ratio = static_cast<float>(step - config_.warmup_steps) /
+                static_cast<float>(config_.max_steps - config_.warmup_steps);
+  float cos_decay = 0.5f * (1.0f + std::cos(3.1415926535f * ratio));
+  return config_.lr_min + cos_decay * (config_.lr_max - config_.lr_min);
+}
+
+/**
+ * @brief Maps BPE data loader lists into parallel token and target prediction matrices.
+ */
+static void prepare_batch_tensors(
+    const std::vector<std::vector<int>> &batch, size_t batch_size, size_t seq_len,
+    Tensor &tokens, Tensor &targets) {
+  for (size_t b = 0; b < batch_size; ++b) {
+    for (size_t s = 0; s < seq_len - 1; ++s) {
+      tokens(b, s) = static_cast<float>(batch[b][s]);
+      targets(b, s) = static_cast<float>(batch[b][s + 1]);
+    }
+  }
+}
+
+/**
+ * @brief Performs forward, loss, backward, and parameter optimization updates for one step.
+ */
+static void run_training_step(
+    Transformer &model, Optimizer &optimizer, const RoPE &rope,
+    const Tensor &tokens, const Tensor &targets, float lr,
+    std::vector<Tensor> &grad_w_gate, std::vector<Tensor> &grad_w_up,
+    std::vector<Tensor> &grad_w_down, std::vector<Tensor> &grad_Wq,
+    std::vector<Tensor> &grad_Wk, std::vector<Tensor> &grad_Wv,
+    std::vector<Tensor> &grad_Wo, Tensor &grad_embeddings,
+    Tensor &grad_output_projection, float &loss_out) {
+  Tensor logits = model.forward(tokens);
+  CrossEntropyLoss loss_fn;
+  loss_out = loss_fn.forward(logits, targets);
+  Tensor grad_logits = loss_fn.backward(targets);
+
+  grad_embeddings.fill(0.0f);
+  grad_output_projection.fill(0.0f);
+  for (size_t l = 0; l < model.layers().size(); ++l) {
+    grad_w_gate[l].fill(0.0f);
+    grad_w_up[l].fill(0.0f);
+    grad_w_down[l].fill(0.0f);
+    grad_Wq[l].fill(0.0f);
+    grad_Wk[l].fill(0.0f);
+    grad_Wv[l].fill(0.0f);
+    grad_Wo[l].fill(0.0f);
+  }
+
+  model.backward(grad_logits, tokens, grad_w_gate, grad_w_up, grad_w_down,
+                 grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                 grad_output_projection, rope);
+  optimizer.step(lr);
+}
+
+void Trainer::train() {
+  size_t batch_size = model_.token_embeddings().shape()[1]; // Toy batch default placeholder
+  // We can look up batch size from data_loader or set configuration
+  // Let's assume standard training settings
+  
+  std::vector<Tensor> grad_w_gate, grad_w_up, grad_w_down, grad_Wq, grad_Wk, grad_Wv, grad_Wo;
+  for (const auto &layer : model_.layers()) {
+    grad_w_gate.push_back(Tensor(layer.w_gate.shape(), 0.0f));
+    grad_w_up.push_back(Tensor(layer.w_up.shape(), 0.0f));
+    grad_w_down.push_back(Tensor(layer.w_down.shape(), 0.0f));
+    grad_Wq.push_back(Tensor(layer.attn.Wq().shape(), 0.0f));
+    grad_Wk.push_back(Tensor(layer.attn.Wk().shape(), 0.0f));
+    grad_Wv.push_back(Tensor(layer.attn.Wv().shape(), 0.0f));
+    grad_Wo.push_back(Tensor(layer.attn.Wo().shape(), 0.0f));
+  }
+  Tensor grad_embeddings(model_.token_embeddings().shape(), 0.0f);
+  Tensor grad_output_projection(model_.output_projection().shape(), 0.0f);
+
+  // Register parameters inside optimizer
+  optimizer_.register_parameter(&model_.token_embeddings(), &grad_embeddings);
+  optimizer_.register_parameter(&model_.output_projection(), &grad_output_projection);
+  for (size_t l = 0; l < model_.layers().size(); ++l) {
+    optimizer_.register_parameter(&model_.layers()[l].w_gate, &grad_w_gate[l]);
+    optimizer_.register_parameter(&model_.layers()[l].w_up, &grad_w_up[l]);
+    optimizer_.register_parameter(&model_.layers()[l].w_down, &grad_w_down[l]);
+    optimizer_.register_parameter(&model_.layers()[l].attn.Wq(), &grad_Wq[l]);
+    optimizer_.register_parameter(&model_.layers()[l].attn.Wk(), &grad_Wk[l]);
+    optimizer_.register_parameter(&model_.layers()[l].attn.Wv(), &grad_Wv[l]);
+    optimizer_.register_parameter(&model_.layers()[l].attn.Wo(), &grad_Wo[l]);
+  }
+
+  std::cout << "[INFO] Commencing pre-training loop..." << std::endl;
+
+  for (size_t step = 0; step < config_.max_steps; ++step) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    std::vector<std::vector<int>> batch = data_loader_.get_batch();
+    if (batch.empty()) {
+      std::cout << "[INFO] End of token stream reached. Stopping training." << std::endl;
+      break;
+    }
+
+    size_t active_batch_size = batch.size();
+    size_t seq_len = batch[0].size();
+    
+    Tensor tokens({active_batch_size, seq_len - 1});
+    Tensor targets({active_batch_size, seq_len - 1});
+    prepare_batch_tensors(batch, active_batch_size, seq_len, tokens, targets);
+
+    float lr = get_scheduled_lr(step);
+    float loss = 0.0f;
+
+    run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
+                      grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
+                      grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                      grad_output_projection, loss);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;
+
+    if (step % config_.log_interval == 0 || step == config_.max_steps - 1) {
+      std::cout << "  Step " << std::setw(4) << step 
+                << " | Loss: " << std::fixed << std::setprecision(5) << loss
+                << " | LR: " << std::scientific << std::setprecision(4) << lr
+                << " | Step Latency: " << std::fixed << std::setprecision(2) << step_ms << " ms"
+                << std::endl;
+    }
+  }
+}
