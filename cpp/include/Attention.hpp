@@ -14,7 +14,6 @@
 #include "Positional.hpp"
 #include "Tensor.hpp"
 #include "TransformerConfig.hpp"
-#include <vector>
 
 class Attention {
 
@@ -30,6 +29,11 @@ public:
   Tensor &Wv() { return Wv_; }
   const Tensor &Wo() const { return Wo_; }
   Tensor &Wo() { return Wo_; }
+
+  Tensor backward(const Tensor &grad_output, const Tensor &x, const RoPE &rope,
+                  Tensor &grad_Wq, Tensor &grad_Wk, Tensor &grad_Wv,
+                  Tensor &grad_Wo, KVCache *cache = nullptr,
+                  size_t pos_offset = 0) const;
 
 private:
   ModelConfig config_;
