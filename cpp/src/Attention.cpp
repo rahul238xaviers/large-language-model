@@ -32,7 +32,15 @@ Attention::Attention(const ModelConfig &config)
       Wq_({config.hidden_dim, config.n_heads * config.head_dim}),
       Wk_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
       Wv_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
-      Wo_({config.n_heads * config.head_dim, config.hidden_dim}) {};
+      Wo_({config.n_heads * config.head_dim, config.hidden_dim}) {
+  
+  if (config.n_kv_heads > config.n_heads) {
+    throw std::invalid_argument("n_kv_heads cannot be greater than n_heads");
+  }
+  if (config.n_heads % config.n_kv_heads != 0) {
+    throw std::invalid_argument("n_heads must be a multiple of n_kv_heads");
+  }
+}
 /**
  * @brief Reshapes a 3D tensor of shape [batch, seq_len, n_heads * head_dim]
  *        into a 4D tensor of shape [batch, n_heads, seq_len, head_dim].
@@ -303,6 +311,21 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
                            const RoPE &rope, Tensor &grad_Wq, Tensor &grad_Wk,
                            Tensor &grad_Wv, Tensor &grad_Wo, KVCache *cache,
                            size_t pos_offset) const {
+  if (grad_output.shape() != x.shape()) {
+    throw std::invalid_argument("grad_output shape must match input x shape");
+  }
+  if (grad_Wq.shape() != Wq_.shape()) {
+    throw std::invalid_argument("grad_Wq shape must match Wq_ shape");
+  }
+  if (grad_Wk.shape() != Wk_.shape()) {
+    throw std::invalid_argument("grad_Wk shape must match Wk_ shape");
+  }
+  if (grad_Wv.shape() != Wv_.shape()) {
+    throw std::invalid_argument("grad_Wv shape must match Wv_ shape");
+  }
+  if (grad_Wo.shape() != Wo_.shape()) {
+    throw std::invalid_argument("grad_Wo shape must match Wo_ shape");
+  }
   size_t batch = x.shape()[0];
   size_t seq_len = x.shape()[1];
   size_t hidden_dim = x.shape()[2];
