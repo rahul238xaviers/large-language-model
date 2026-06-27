@@ -32,6 +32,12 @@ struct TransformerLayer {
   Tensor w_down;
 
   TransformerLayer(const ModelConfig &config);
+  // Single layer backward pass
+  Tensor backward(const Tensor &grad_output, const Tensor &h_in,
+                  Tensor &grad_w_gate, Tensor &grad_w_up, Tensor &grad_w_down,
+                  Tensor &grad_Wq, Tensor &grad_Wk, Tensor &grad_Wv,
+                  Tensor &grad_Wo, const RoPE &rope,
+                  KVCache *cache = nullptr) const;
 };
 
 /**
@@ -56,6 +62,15 @@ public:
    * @return Tensor Logits tensor of shape [batch_size, seq_len, vocab_size].
    */
   Tensor forward(const Tensor &tokens, KVCache *cache = nullptr) const;
+  // Entire model backward pass
+  Tensor backward(const Tensor &grad_logits, const Tensor &tokens,
+                  std::vector<Tensor> &grad_w_gate,
+                  std::vector<Tensor> &grad_w_up,
+                  std::vector<Tensor> &grad_w_down,
+                  std::vector<Tensor> &grad_Wq, std::vector<Tensor> &grad_Wk,
+                  std::vector<Tensor> &grad_Wv, std::vector<Tensor> &grad_Wo,
+                  Tensor &grad_embeddings, Tensor &grad_output_projection,
+                  const RoPE &rope) const;
 
   // Accessors
   const Tensor &token_embeddings() const { return token_embeddings_; }

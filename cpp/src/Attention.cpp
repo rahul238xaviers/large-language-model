@@ -1,12 +1,12 @@
 /**
  * @file Attention.cpp
- * @brief Implementation of the GQA (Grouped Query Attention) layer
+ * @brief Implementation of the GQA (Grouped Query Attention) layer forward & backward passes
  *
  * ============================================================================
  *                             PIPELINE FLOW & PURPOSE
  * ============================================================================
- * This file implements the projections, reshaping, and self-attention
- * operations for Grouped Query Attention (GQA).
+ * This file implements the projections, reshaping, GQA forward operations, and
+ * analytical backpropagation for Grouped Query Attention (GQA).
  */
 
 #include "Attention.hpp"

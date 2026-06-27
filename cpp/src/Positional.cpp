@@ -1,13 +1,13 @@
 /**
  * @file Positional.cpp
- * @brief Implementation of Rotary Position Embeddings (RoPE)
+ * @brief Implementation of Rotary Position Embeddings (RoPE) forward & backward passes
  *
  * ============================================================================
  *                             PIPELINE FLOW & PURPOSE
  * ============================================================================
- * This file implements precomputation of trigonometric rotation tables (sine
- * and cosine) and the rotation application logic to input Query and Key
- * tensors.
+ * This file implements precomputation of trigonometric rotation tables,
+ * forward rotation application to Query and Key tensors, and inverse rotation
+ * gradient backpropagation.
  *
  * By grouping adjacent coordinates into pairs (x0, x1) and rotating them,
  * we embed relative distance information directly into the dot-product
