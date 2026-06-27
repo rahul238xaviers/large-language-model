@@ -1,13 +1,15 @@
 /**
  * @file Loss.cpp
- * @brief Implementation of the Cross-Entropy Loss function and its analytical gradients
+ * @brief Implementation of the Cross-Entropy Loss function and its analytical
+ * gradients
  *
  * ============================================================================
  *                             PIPELINE FLOW & PURPOSE
  * ============================================================================
  * Implements CrossEntropyLoss forward and backward pass operations:
  * 1. Computes the average token-wise cross-entropy loss over a batch.
- * 2. Uses the log-softmax subtraction trick for numerical stability (preventing float overflow).
+ * 2. Uses the log-softmax subtraction trick for numerical stability (preventing
+ * float overflow).
  * 3. Computes the analytical gradient of loss with respect to input logits:
  *    dLoss / dlogit_i = (1 / N) * (probs_i - indicator(i == target))
  */
@@ -16,7 +18,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <stdexcept>
 
 /**
  * @brief Computes the forward pass of the Cross-Entropy Loss function.
@@ -46,8 +47,9 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
 
   for (size_t b = 0; b < batch; b++) {
     for (size_t s = 0; s < seq_len; s++) {
-      
-      // Step 1: Find the maximum logit value for numerical stability (softmax subtraction trick)
+
+      // Step 1: Find the maximum logit value for numerical stability (softmax
+      // subtraction trick)
       float max_val = -std::numeric_limits<float>::infinity();
       for (size_t v = 0; v < vocab_size; v++) {
         if (logits(b, s, v) > max_val) {
@@ -69,7 +71,8 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
       // Step 4: Accumulate loss for the target token ID
       size_t target_id = static_cast<size_t>(targets(b, s));
       float target_prob = probs_(b, s, target_id);
-      total_loss += -std::log(std::max(target_prob, 1e-15f)); // Floor probability to prevent log(0)
+      total_loss += -std::log(
+          std::max(target_prob, 1e-15f)); // Floor probability to prevent log(0)
     }
   }
   return total_loss / (batch * seq_len);
@@ -97,7 +100,8 @@ Tensor CrossEntropyLoss::backward(const Tensor &targets) const {
     for (size_t s = 0; s < seq_len; ++s) {
       size_t target_id = static_cast<size_t>(targets(b, s));
       for (size_t v = 0; v < vocab_size; ++v) {
-        // Apply target-class indicator subtraction and batch normalization scaling
+        // Apply target-class indicator subtraction and batch normalization
+        // scaling
         if (v == target_id) {
           grad_logits(b, s, v) = (probs_(b, s, v) - 1.0f) * scale;
         } else {
