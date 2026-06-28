@@ -47,6 +47,8 @@ target_link_libraries(data_ingestion PUBLIC
     arrow_shared
     parquet_shared
     tokenizers_cpp
+    "-framework Accelerate"
+
 )
 
 # Define our test executable

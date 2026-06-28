@@ -13,7 +13,8 @@
 #include "Transformer.hpp"
 #include "Activations.hpp"
 #include "Tensor.hpp"
-#include <cmath>
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
 #include <cstddef>
 #include <stdexcept>
 #include <vector>
@@ -106,16 +107,15 @@ static void
 accumulate_ffn_down_grads(size_t batch, size_t seq_len, size_t intermediate_dim,
                           size_t hidden_dim, const Tensor &activated,
                           const Tensor &grad_output, Tensor &grad_w_down) {
-  for (size_t b = 0; b < batch; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      for (size_t i = 0; i < intermediate_dim; ++i) {
-        float act_val = activated(b, s, i);
-        for (size_t o = 0; o < hidden_dim; ++o) {
-          grad_w_down(i, o) += act_val * grad_output(b, s, o);
-        }
-      }
-    }
-  }
+  // grad_w_down [I, H] += activated[B*S, I].T @ grad_output[B*S, H]
+  // Replace 4-nested scalar loop with BLAS transposed matrix multiply
+  size_t BS = batch * seq_len;
+  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+              static_cast<int>(intermediate_dim), static_cast<int>(hidden_dim),
+              static_cast<int>(BS), 1.0f, activated.data().data(),
+              static_cast<int>(intermediate_dim), grad_output.data().data(),
+              static_cast<int>(hidden_dim), 1.0f, grad_w_down.data().data(),
+              static_cast<int>(hidden_dim));
 }
 
 /**
@@ -141,17 +141,21 @@ accumulate_ffn_gate_up_grads(size_t batch, size_t seq_len, size_t hidden_dim,
                              size_t intermediate_dim, const Tensor &ffn_in,
                              const Tensor &grad_gate, const Tensor &grad_up,
                              Tensor &grad_w_gate, Tensor &grad_w_up) {
-  for (size_t b = 0; b < batch; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      for (size_t i = 0; i < hidden_dim; ++i) {
-        float f_val = ffn_in(b, s, i);
-        for (size_t o = 0; o < intermediate_dim; ++o) {
-          grad_w_gate(i, o) += f_val * grad_gate(b, s, o);
-          grad_w_up(i, o) += f_val * grad_up(b, s, o);
-        }
-      }
-    }
-  }
+  // grad_w_gate [H, I] += ffn_in[B*S, H].T @ grad_gate[B*S, I]
+  // grad_w_up   [H, I] += ffn_in[B*S, H].T @ grad_up[B*S, I]
+  size_t BS = batch * seq_len;
+  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+              static_cast<int>(hidden_dim), static_cast<int>(intermediate_dim),
+              static_cast<int>(BS), 1.0f, ffn_in.data().data(),
+              static_cast<int>(hidden_dim), grad_gate.data().data(),
+              static_cast<int>(intermediate_dim), 1.0f,
+              grad_w_gate.data().data(), static_cast<int>(intermediate_dim));
+  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+              static_cast<int>(hidden_dim), static_cast<int>(intermediate_dim),
+              static_cast<int>(BS), 1.0f, ffn_in.data().data(),
+              static_cast<int>(hidden_dim), grad_up.data().data(),
+              static_cast<int>(intermediate_dim), 1.0f, grad_w_up.data().data(),
+              static_cast<int>(intermediate_dim));
 }
 
 /**
@@ -234,16 +238,14 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   Tensor up_proj = ffn_in.matmul(w_up);
   Tensor activated = activatations::swiglu(gate_proj, up_proj);
 
-  // Helper to transpose 2D weight matrices
+  // Helper to transpose 2D weight matrices using Apple vDSP SIMD vectorized
+  // transpose
   auto transpose_w = [](const Tensor &w) {
     size_t rows = w.shape()[0];
     size_t cols = w.shape()[1];
     Tensor transposed({cols, rows}, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-      for (size_t c = 0; c < cols; ++c) {
-        transposed(c, r) = w(r, c);
-      }
-    }
+    vDSP_mtrans(w.data().data(), 1, transposed.data().data(), 1,
+                static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
     return transposed;
   };
 
@@ -283,15 +285,18 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   return grad_h_in;
 }
 
-// Static helper to run a cached forward pass storing intermediate hidden states for layer-by-layer backprop
-static std::vector<Tensor> run_forward_cache(
-    const Transformer &model, const Tensor &tokens, const RoPE &rope, size_t hidden_dim) {
+// Static helper to run a cached forward pass storing intermediate hidden states
+// for layer-by-layer backprop
+static std::vector<Tensor> run_forward_cache(const Transformer &model,
+                                             const Tensor &tokens,
+                                             const RoPE &rope,
+                                             size_t hidden_dim) {
   size_t batch_size = tokens.shape()[0];
   size_t seq_len = tokens.shape()[1];
-  
+
   std::vector<Tensor> h_states;
   Tensor h({batch_size, seq_len, hidden_dim});
-  
+
   for (size_t b = 0; b < batch_size; b++) {
     for (size_t s = 0; s < seq_len; s++) {
       size_t id = static_cast<size_t>(tokens(b, s));
@@ -300,46 +305,47 @@ static std::vector<Tensor> run_forward_cache(
       }
     }
   }
-  
+
   h_states.push_back(h);
   for (const auto &layer : model.layers()) {
     Tensor attn_in = layer.attn_norm.forward(h);
     Tensor attn_out = layer.attn.forward(attn_in, rope);
     h.add_(attn_out);
-    
+
     Tensor ffn_in = layer.ffn_norm.forward(h);
     Tensor gate_proj = ffn_in.matmul(layer.w_gate);
     Tensor up_proj = ffn_in.matmul(layer.w_up);
     Tensor activated = activatations::swiglu(gate_proj, up_proj);
     Tensor ffn_out = activated.matmul(layer.w_down);
     h.add_(ffn_out);
-    
+
     h_states.push_back(h);
   }
   return h_states;
 }
 
-// Static helper to accumulate parameter gradients for the output projection layer
+// Static helper to accumulate parameter gradients for the output projection
+// layer
 static void accumulate_output_projection_grads(
     size_t batch_size, size_t seq_len, size_t hidden_dim, size_t vocab_size,
-    const Tensor &final_h, const Tensor &grad_logits, Tensor &grad_output_projection) {
-  grad_output_projection.fill(0.0f);
-  for (size_t b = 0; b < batch_size; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      for (size_t d = 0; d < hidden_dim; ++d) {
-        float h_val = final_h(b, s, d);
-        for (size_t v = 0; v < vocab_size; ++v) {
-          grad_output_projection(d, v) += h_val * grad_logits(b, s, v);
-        }
-      }
-    }
-  }
+    const Tensor &final_h, const Tensor &grad_logits,
+    Tensor &grad_output_projection) {
+  // grad_output_projection [H, V] = final_h[B*S, H].T @ grad_logits[B*S, V]
+  // Replace 4-nested scalar loop with BLAS transposed matrix multiply
+  size_t BS = batch_size * seq_len;
+  cblas_sgemm(
+      CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
+      static_cast<int>(vocab_size), static_cast<int>(BS), 1.0f,
+      final_h.data().data(), static_cast<int>(hidden_dim),
+      grad_logits.data().data(), static_cast<int>(vocab_size), 0.0f,
+      grad_output_projection.data().data(), static_cast<int>(vocab_size));
 }
 
 // Static helper to accumulate gradients w.r.t token embeddings
-static void accumulate_embedding_grads(
-    size_t batch_size, size_t seq_len, size_t hidden_dim,
-    const Tensor &tokens, const Tensor &grad_h, Tensor &grad_embeddings) {
+static void accumulate_embedding_grads(size_t batch_size, size_t seq_len,
+                                       size_t hidden_dim, const Tensor &tokens,
+                                       const Tensor &grad_h,
+                                       Tensor &grad_embeddings) {
   grad_embeddings.fill(0.0f);
   for (size_t b = 0; b < batch_size; ++b) {
     for (size_t s = 0; s < seq_len; ++s) {
@@ -360,10 +366,12 @@ static void accumulate_embedding_grads(
  * 3. Stack of Transformer layer blocks (in reverse sequence).
  * 4. Token embeddings table.
  *
- * It runs a single cached forward pass at the beginning to store intermediate hidden state outputs
- * for each layer, eliminating the memory and computation overhead of N layer re-evaluations.
+ * It runs a single cached forward pass at the beginning to store intermediate
+ * hidden state outputs for each layer, eliminating the memory and computation
+ * overhead of N layer re-evaluations.
  *
- * @param grad_logits Gradients w.r.t the logits output tensor of shape [batch_size, seq_len, vocab_size].
+ * @param grad_logits Gradients w.r.t the logits output tensor of shape
+ * [batch_size, seq_len, vocab_size].
  * @param tokens Input token IDs tensor of shape [batch_size, seq_len].
  * @param grad_w_gate Vector of gate projection weight gradients per layer.
  * @param grad_w_up Vector of up projection weight gradients per layer.
@@ -372,10 +380,13 @@ static void accumulate_embedding_grads(
  * @param grad_Wk Vector of Key projection weight gradients per layer.
  * @param grad_Wv Vector of Value projection weight gradients per layer.
  * @param grad_Wo Vector of Output projection weight gradients per layer.
- * @param grad_embeddings Parameter gradient accumulator for the token embedding lookup matrix.
- * @param grad_output_projection Parameter gradient accumulator for the output vocabulary projection weights.
+ * @param grad_embeddings Parameter gradient accumulator for the token embedding
+ * lookup matrix.
+ * @param grad_output_projection Parameter gradient accumulator for the output
+ * vocabulary projection weights.
  * @param rope Rotary Position Embedding helper.
- * @return Tensor Input embedding gradients of shape [batch_size, seq_len, hidden_dim].
+ * @return Tensor Input embedding gradients of shape [batch_size, seq_len,
+ * hidden_dim].
  */
 
 Tensor Transformer::backward(
@@ -390,25 +401,26 @@ Tensor Transformer::backward(
   size_t hidden_dim = config_.hidden_dim;
   size_t vocab_size = config_.vocab_size;
 
-  // Helper to transpose 2D weight matrices
+  // Helper to transpose 2D weight matrices using Apple vDSP SIMD vectorized
+  // transpose
   auto transpose_w = [](const Tensor &w) {
     size_t rows = w.shape()[0];
     size_t cols = w.shape()[1];
     Tensor transposed({cols, rows}, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-      for (size_t c = 0; c < cols; ++c) {
-        transposed(c, r) = w(r, c);
-      }
-    }
+    vDSP_mtrans(w.data().data(), 1, transposed.data().data(), 1,
+                static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
     return transposed;
   };
 
   // --- 1. Forward Pass to cache intermediate hidden states ---
-  std::vector<Tensor> h_states = run_forward_cache(*this, tokens, rope, hidden_dim);
+  std::vector<Tensor> h_states =
+      run_forward_cache(*this, tokens, rope, hidden_dim);
   Tensor final_h = final_norm_.forward(h_states.back());
 
   // --- 2. Output Projection Backward ---
-  accumulate_output_projection_grads(batch_size, seq_len, hidden_dim, vocab_size, final_h, grad_logits, grad_output_projection);
+  accumulate_output_projection_grads(batch_size, seq_len, hidden_dim,
+                                     vocab_size, final_h, grad_logits,
+                                     grad_output_projection);
 
   Tensor grad_final_h = grad_logits.matmul(transpose_w(output_projection_));
 
@@ -425,7 +437,8 @@ Tensor Transformer::backward(
   }
 
   // --- 5. Embedding Lookup Backward ---
-  accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h, grad_embeddings);
+  accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h,
+                             grad_embeddings);
 
   return grad_h;
 }

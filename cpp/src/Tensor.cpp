@@ -10,6 +10,8 @@
  */
 
 #include "Tensor.hpp"
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -138,20 +140,23 @@ void Tensor::add_(const Tensor &other) {
   if (shape_ != other.shape_) {
     throw std::invalid_argument("Shape mismatch for in-place addition");
   }
-  std::transform(data_.begin(), data_.end(), other.data_.begin(), data_.begin(),
-                 std::plus<float>());
+  // vDSP_vadd: NEON-vectorized element-wise addition
+  vDSP_vadd(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
+             static_cast<vDSP_Length>(data_.size()));
 }
 void Tensor::mul_(const Tensor &other) {
   if (shape_ != other.shape_) {
     throw std::invalid_argument("Shape mismatch for in-place multiplication");
   }
-  std::transform(data_.begin(), data_.end(), other.data_.begin(), data_.begin(),
-                 std::multiplies<float>());
+  // vDSP_vmul: NEON-vectorized element-wise multiply
+  vDSP_vmul(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
+             static_cast<vDSP_Length>(data_.size()));
 }
 
 void Tensor::scale_(float factor) {
-  std::transform(data_.begin(), data_.end(), data_.begin(),
-                 [factor](float const &val) { return val * factor; });
+  // vDSP_vsmul: NEON-vectorized scalar multiply
+  vDSP_vsmul(data_.data(), 1, &factor, data_.data(), 1,
+              static_cast<vDSP_Length>(data_.size()));
 }
 
 Tensor Tensor::add(const Tensor &other) const {
@@ -246,18 +251,11 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *w_data = other.data().data();
     float *res_data = result.data().data();
 
-    for (size_t row = 0; row < M; ++row) {
-      const float *x_row = x_data + row * K;
-      float *res_row = res_data + row * N;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
+                static_cast<int>(N), static_cast<int>(K), 1.0f, x_data,
+                static_cast<int>(K), w_data, static_cast<int>(N), 0.0f,
+                res_data, static_cast<int>(N));
 
-      for (size_t k = 0; k < K; ++k) {
-        const float val = x_row[k];
-        const float *w_row = w_data + k * N;
-        for (size_t n = 0; n < N; ++n) {
-          res_row[n] += val * w_row[n];
-        }
-      }
-    }
     return result;
   }
 
@@ -312,20 +310,14 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *dataB = b_data + b * batch_offset_B;
     float *dataC = c_data + b * batch_offset_C;
 
-    // i-k-j loop order: dataB and dataC accesses in the innermost loop are
-    // contiguous, which is cache-friendly.
-    for (size_t i = 0; i < M; ++i) {
-      const float *a_row = dataA + i * K;
-      float *c_row = dataC + i * N;
-
-      for (size_t k = 0; k < K; ++k) {
-        const float val = a_row[k];
-        const float *b_row = dataB + k * N;
-        for (size_t j = 0; j < N; ++j) {
-          c_row[j] += val * b_row[j];
-        }
-      }
-    }
+    // Use Apple Accelerate BLAS for SIMD-vectorized matrix multiplication
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0f,
+                dataA, static_cast<int>(K),
+                dataB, static_cast<int>(N),
+                0.0f,
+                dataC, static_cast<int>(N));
   }
 
   return result;
