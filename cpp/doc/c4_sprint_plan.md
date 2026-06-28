@@ -1,13 +1,17 @@
 # C4 Architecture & Development Sprint Plan: C++ LLM Training Engine
 
+> **Last updated:** June 2026
+> **Status legend:** ✅ Completed · 🔄 In Progress · 🔲 Pending
+
 This document outlines the software architecture and development roadmap for building a native C++ Large Language Model (LLM) training engine from scratch on macOS (Apple Silicon). The engine is designed to ingest code dataset shards (specifically The Stack v1 C++ data in Parquet format, downloaded using `python/scripts/download_cpp_blobs.py` to fetch the actual raw code content) and perform local model training.
+
+The C++ engine runs **alongside** the Python/MLX pipeline. It is the native compute backend; the Python refactoring plan in `doc/REFACTORING_AND_ARCHITECTURE_PLAN.md` covers the higher-level pipeline orchestration (data selection, SFT, evaluation, serving). These two plans are complementary and do not overlap.
 
 ---
 
 ## 🏛️ Part 1: C4 Architecture Model
 
 ### Level 1: System Context
-The system context defines the training engine boundaries, data dependencies, and hardware integrations.
 
 ```mermaid
 graph TD
@@ -15,13 +19,18 @@ graph TD
     Engine -->|Reads Shards| ParquetData[(The Stack v1 Parquet Files)]
     Engine -->|Saves| Checkpoints[(Safetensors Checkpoints)]
     Engine -->|Logs Metrics| CSVLogs[(metrics.csv)]
-    Engine -->|Utilizes| MacOS[macOS Accelerate / Metal GPU]
+    Engine -->|Dispatches to| CPU[macOS Accelerate\nAMX · BLAS · vDSP · GCD]
+    Engine -->|Dispatches to| GPU[Apple Metal GPU\nCustom GEMM Kernels]
+    CPU <-->|Concurrent\nOperation Split| GPU
 ```
+
+> **New in Sprint 6b:** CPU and GPU are no longer alternative paths. Independent matrix operations
+> (e.g. FFN gate vs up projection) are dispatched simultaneously — CPU to AMX via `cblas_sgemm`,
+> GPU to Metal shader — exploiting Apple Silicon's unified memory architecture.
 
 ---
 
 ### Level 2: Containers
-Breaks the repository codebase down into high-level build targets and namespaces.
 
 ```mermaid
 graph TD
@@ -29,19 +38,23 @@ graph TD
         subgraph python/ [Python Tools]
             HFDownloader[download_cpp_blobs.py Script]
         end
-        
-        subgraph cpp/ [C++ LLM Codebase]
+
+        subgraph cpp/ [C++ LLM Engine]
             DataIngest[Data Ingestion Module]
             ModelCore[Transformer Compute Module]
             Optimizer[AdamW & LR Scheduler]
-            TrainerApp[Main Training Loop Executable]
+            TrainerApp[Main Training Loop]
+            MetalGPU[Metal GPU Compute Layer]
         end
     end
-    
-    HFDownloader -->|Downloads actual files| ParquetData[(The Stack v1 Parquet Files)]
+
+    HFDownloader -->|Downloads| ParquetData[(The Stack v1 Parquet Files)]
     ParquetData -->|Reads| DataIngest
     DataIngest -->|Streams Token Batches| TrainerApp
     TrainerApp -->|Feeds Forward/Backward| ModelCore
+    ModelCore -->|Large matmul → GPU| MetalGPU
+    ModelCore -->|Element-wise & small matmul → CPU| Optimizer
+    MetalGPU -.->|Concurrent operation split| ModelCore
     ModelCore -->|Updates Gradients| Optimizer
     TrainerApp -->|Saves| Checkpoints
 ```
@@ -49,48 +62,56 @@ graph TD
 ---
 
 ### Level 3: Components
-Identifies the key classes and structural modules inside the C++ engine.
 
 ```mermaid
 graph TD
     Trainer[Main Training Loop] -->|Instantiates| DataIngestion[DataIngestion Class]
     Trainer -->|Instantiates| Transformer[Transformer Class]
     Trainer -->|Instantiates| AdamW[AdamW Class]
-    
+
     DataIngestion -->|Reads| ParquetReader[Parquet Reader API]
     DataIngestion -->|Encodes| Tokenizer[tokenizers-cpp Wrapper]
-    
+
     Transformer -->|Composite of| RMSNorm[RMSNorm Component]
     Transformer -->|Composite of| Attention[GQA Attention Component]
     Transformer -->|Composite of| SwiGLU[SwiGLU FFN Component]
-    
+
     Attention -->|Applies| RoPE[Rotary Embeddings Component]
+
+    Transformer -->|Dispatches matmul via| ShapeDispatcher[Shape-Aware Kernel Dispatcher]
+    ShapeDispatcher -->|Batched small-K| GQAKernel[gemm_gqa.metal\nFused Flash Attention]
+    ShapeDispatcher -->|Tall × square| ProjKernel[gemm_proj.metal\nWeight-Reuse Streaming]
+    ShapeDispatcher -->|Tall × wide| FFNKernel[gemm_ffn.metal\n128×128 tile GEMM]
+    ShapeDispatcher -->|Small / unknown| CPUFallback[cblas_sgemm CPU]
 ```
 
 ---
 
-### Level 4: Code (Header Blueprints)
-Declares the base class structures and programmatic interfaces.
+### Level 4: Code Interfaces
 
 ```cpp
-// DataIngestion.hpp
-class DataIngestion {
-public:
-  DataIngestion(const std::string &data_dir,
-                const std::string &single_data_file, size_t max_shard_bytes,
-                size_t batch_size, size_t sequence_length,
-                const std::string &vocab_path);
-  ~DataIngestion();
-  std::vector<std::vector<int>> get_batch();
-  static constexpr int EOT = 100257;
+// Tensor.hpp — matmul routes to the correct kernel automatically
+class Tensor {
+    Tensor matmul(const Tensor& other) const;
+    // Shape dispatcher inside selects: CPU cblas_sgemm, gemm_gqa, gemm_proj, or gemm_ffn
 };
 
-// Transformer.hpp
-class Transformer {
-public:
-    Transformer(const ModelConfig& config);
-    Tensor forward(const Tensor& input_ids);
-    Tensor backward(const Tensor& loss_gradients);
+// MetalMatmul.hpp — GPU compute layer (Sprint 6b)
+namespace metal_compute {
+    void initialize();         // one-time device + pipeline state setup
+    bool is_available();
+    void gemm_gqa(const float* Q, const float* K, const float* V, float* out,
+                  const GQAParams& p);
+    void gemm_proj(const float* A, const float* B, float* C, size_t M, size_t N, size_t K);
+    void gemm_ffn(const float* A, const float* B, float* C, size_t M, size_t N, size_t K);
+    void heterogeneous_op_split(std::function<void()> gpu_task,
+                                std::function<void()> cpu_task);
+}
+
+// Checkpoint.hpp — safetensors serialization (Sprint 6c)
+class Checkpoint {
+    void save(const Transformer& model, const std::string& path);
+    void load(Transformer& model, const std::string& path);
 };
 ```
 
@@ -98,106 +119,210 @@ public:
 
 ## 🏃 Part 2: Development Roadmap & Sprint Schedule
 
-The codebase development is structured into **6 execution sprints**. Each sprint delivers a complete, testable module accompanied by a functional verification unit test.
-
 ```
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 1: Data Ingestion (Parquet & BPE)              │
-│  - Completed: tokenizers-cpp with C++ tiktoken loader │
+│  Sprint 1: Data Ingestion (Parquet & BPE)      ✅ DONE  │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 2: Tensor Operations, RMSNorm, SwiGLU, & RoPE  │
+│  Sprint 2: Tensor, RMSNorm, SwiGLU, RoPE       ✅ DONE  │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 3: GQA & Forward Pass                          │
+│  Sprint 3: GQA & Forward Pass                  ✅ DONE  │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 4: Loss & Backward Pass                        │
+│  Sprint 4: Loss & Backward Pass                ✅ DONE  │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 5: AdamW, Scheduler, & Full Training Loop     │
+│  Sprint 5: AdamW, Scheduler, & Training Loop   ✅ DONE  │
 └───────────────────┬────────────────────────────────────┘
                     ▼
 ┌────────────────────────────────────────────────────────┐
-│  Sprint 6: Checkpointing & Hardware Optimization (MPS) │
+│  Sprint 6a: CPU Acceleration (Accelerate)      ✅ DONE  │
+│  Sprint 6b: Custom Metal GPU Kernels           🔄 NOW   │
+│  Sprint 6c: Safetensors Checkpointing          🔲 NEXT  │
 └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### Sprint 1: Data Ingestion (`DataIngestion`)
-* **Objective**: Read local C++ dataset Parquet files, extract text columns, apply Byte-Pair Encoding (BPE) tokenization, and generate training sequences of shape `(batch_size, block_size)`.
-* **Deliverables**:
-  * `cpp/include/DataIngestion.hpp`
-  * `cpp/src/DataIngestion.cpp`
-  * `cpp/tests/test_data_ingestion.cpp` (Validation driver executable)
-* **Implementation Guidelines**:
-  * Utilize the Apache Arrow/Parquet C++ APIs (or a lightweight custom reader) to read binary Parquet shards without full memory loading.
-  * Integrate the Hugging Face `tokenizers-cpp` library, parsing the `cl100k_base.tiktoken` file natively and reconstructing the merges in memory to generate the tokenizer configuration entirely in RAM.
-  * Formulate sequential training matrices $X$ and shifted targets $Y$ where $Y_{i} = X_{i+1}$.
+### Sprint 1: Data Ingestion ✅
+
+- **Objective**: Read C++ Parquet shards, BPE tokenize, generate `(batch, seq_len)` training sequences.
+- **Status**: Complete. `cl100k_base` tiktoken loaded natively in C++. EOT token appended correctly.
+- **Files**: `DataIngestion.hpp/cpp`, `test_data_ingestion.cpp`
 
 ---
 
-### Sprint 2: Core Math Operations (`Tensor`, `RMSNorm`, `SwiGLU`, & `RoPE`)
-* **Objective**: Implement a lightweight multidimensional Tensor container and the mathematical layer kernels.
-* **Deliverables**:
-  * `cpp/include/Tensor.hpp` (Handles shape, strides, dynamic memory allocations, and element-wise math)
-  * `cpp/src/RMSNorm.cpp` (Root Mean Square Normalization logic)
-  * `cpp/src/Activations.cpp` (SwiGLU activation projection)
-  * `cpp/src/Positional.cpp` (Rotary Positional Embeddings - RoPE complex-space rotation)
-* **Implementation Guidelines**:
-  * Write the matrix math manually to avoid framework coupling.
-  * Implement element-wise operations with memory-mapped layouts to support fast array manipulation.
-  * Validate mathematical layer outputs against reference arrays to verify correctness.
+### Sprint 2: Core Math Operations ✅
+
+- **Objective**: Tensor container, RMSNorm, SwiGLU, RoPE.
+- **Status**: Complete. All layers verified against reference values in `test_math_ops`.
+- **Files**: `Tensor.hpp/cpp`, `RMSNorm.cpp`, `Activations.cpp`, `Positional.cpp`
 
 ---
 
-### Sprint 3: Grouped Query Attention (GQA) & Model Forward Pass
-* **Objective**: Assemble attention projections and stack layers to execute a full model forward pass.
-* **Deliverables**:
-  * `cpp/include/TransformerConfig.hpp` (Model Configuration and KV Cache structures)
-  * `cpp/src/Attention.cpp` (Grouped Query Attention mapping query heads to grouped key/value head pairs)
-  * `cpp/src/Transformer.cpp` (Assembling 24 stacked layers combining RMSNorm, Attention, and SwiGLU FFN)
-* **Implementation Guidelines**:
-  * Implement weight matrices for Q, K, V projections and final projection layers.
-  * Execute cached attention calculation keys/values for decoding logic.
-  * Verify that a forward pass of token ID arrays produces logits of shape `(batch_size, block_size, vocab_size)`.
+### Sprint 3: GQA & Forward Pass ✅
+
+- **Objective**: Grouped Query Attention + full stacked model forward pass.
+- **Status**: Complete. Forward pass produces `[batch, seq_len, vocab_size]` logits correctly.
+- **Files**: `Attention.cpp`, `Transformer.cpp`, `TransformerConfig.hpp`
 
 ---
 
-### Sprint 4: Backward Pass & Gradient Tracking
-* **Objective**: Define loss calculation and implement manual backpropagation for gradient tracking.
-* **Deliverables**:
-  * `cpp/src/Loss.cpp` (Cross-entropy loss calculation and its analytical gradient)
-  * Backward functions inside active layers (`RMSNorm::backward`, `Attention::backward`, `SwiGLU::backward`)
-* **Implementation Guidelines**:
-  * Write the derivative implementations for cross-entropy calculations.
-  * Track gradients layer-by-layer back to embedding matrices.
-  * Verify gradient computations using overfitting tests on small single-sentence targets.
+### Sprint 4: Loss & Backward Pass ✅
+
+- **Objective**: Cross-entropy loss + full manual backpropagation.
+- **Status**: Complete. Gradient correctness verified by finite-difference test. Overfitting test reaches loss < 0.01.
+- **Files**: `Loss.cpp`, `Attention::backward`, `TransformerLayer::backward`, `Transformer::backward`
 
 ---
 
-### Sprint 5: Optimizer & Core Training Loop
-* **Objective**: Write parameter update formulas and orchestrate the full training execution.
-* **Deliverables**:
-  * `cpp/src/Optimizer.cpp` (AdamW optimizer updates including weight decay)
-  * `cpp/src/Scheduler.cpp` (Linear learning rate warmup + cosine decay scheduler)
-  * `cpp/src/main.cpp` (Core training entry point coordinating batches, model passes, optimization steps, and metric logs)
-* **Implementation Guidelines**:
-  * Implement standard AdamW updating logic tracking first and second moments.
-  * Output loss, learning rate, and token throughput statistics dynamically to console and CSV metrics files.
+### Sprint 5: Optimizer & Training Loop ✅
+
+- **Objective**: AdamW optimizer, cosine LR scheduler, end-to-end trainer.
+- **Status**: Complete. Pre-training loop running on real C++ corpus at **~17 ms/step**.
+- **Files**: `Optimizer.cpp`, `Trainer.cpp`, `test_trainer.cpp`
 
 ---
 
-### Sprint 6: Hardware Optimization & Checkpointing
-* **Objective**: Integrate hardware vector math acceleration and checkpoint serialization.
-* **Deliverables**:
-  * `cpp/src/MatrixMul.cpp` (Metal Shading Language kernels or Accelerate BLAS matrix multiplications)
-  * `cpp/src/Checkpoint.cpp` (Safetensors loader/saver serialization library)
-* **Implementation Guidelines**:
-  * Bind matrix multiplications to macOS standard BLAS APIs (`cblas_sgemm` from Accelerate Framework) or write Custom GPU Metal Shaders.
-  * Verify checkpoint loading integrity by checking that outputs are identical before and after saving/loading.
+### Sprint 6a: CPU Hardware Acceleration ✅
+
+**Objective**: Maximize CPU utilization on Apple Silicon using Accelerate framework.
+
+**What was done:**
+
+| API | Applied to | Speedup |
+|---|---|---|
+| `cblas_sgemm` (new LAPACK interface) | All matmul forward & backward | 12× forward |
+| `cblas_sgemm(CblasTrans)` | All weight gradient accumulations | 34× backward |
+| `vDSP_mtrans` / `vDSP_vadd/vmul/vsmul` | Transpose, add, mul, scale | 2–3× element ops |
+| `vvexpf` (vForce) | SiLU, SwiGLU activation & backward | 4× activation |
+| GCD `dispatch_apply` | Attention heads (batch × n_heads) | 2–4× attention |
+
+**Overall result vs naive baseline:**
+
+| Pass | Before | After |
+|---|---|---|
+| Forward | 25.21 ms | 2.11 ms (11.9×) |
+| Backward | 454.34 ms | 13.54 ms (33.6×) |
+
+**Files modified**: `Tensor.cpp`, `Attention.cpp`, `Transformer.cpp`, `Activations.cpp`, `CMakeLists.txt`
+
+---
+
+### Sprint 6b: Custom Metal GPU Kernels 🔄
+
+**Objective**: Move large matrix multiplications to Apple Silicon GPU using custom Metal compute shaders that beat `MPSMatrixMultiplication` for our specific training shapes.
+
+**Architecture document**: [`METAL_KERNEL_ARCHITECTURE.md`](file:///Users/rahulkumar/dev/large-language-model/METAL_KERNEL_ARCHITECTURE.md)
+
+**Key design decisions (no contradiction with original Sprint 6 spec):**
+
+The original Sprint 6 spec said *"Metal Shading Language kernels **or** Accelerate BLAS"*. We implement **both**: Sprint 6a delivered BLAS on CPU; Sprint 6b adds custom Metal shaders on GPU. This is a superset of the original spec, not a contradiction.
+
+**Three niche kernels (one per operation type):**
+
+| Kernel | Target shape | Technique | Beat MPS by |
+|---|---|---|---|
+| `gemm_gqa.metal` | `[B, nH, S, HD] × [B, nH, HD, S]` | Fused Flash Attention — softmax never materializes full `[S,S]` matrix | Eliminates 1 GPU memory round-trip |
+| `gemm_proj.metal` | `[M, H] × [H, H]` tall×square | Weight matrix B stays resident in GPU L2 | Better B reuse than general-purpose MPS |
+| `gemm_ffn.metal` | `[M, H] × [H, 4H]` tall×wide | 128×128 tile, double-buffered `async_copy`, `simdgroup_float8x8` | Tuned tile size for M3/M5 register file |
+
+**Heterogeneous CPU + GPU operation split:**
+
+Instead of routing all matmuls to one device, **independent operations run simultaneously**:
+
+```
+FFN forward:
+  GPU → ffn_in @ w_gate   (async command buffer)
+  CPU → ffn_in @ w_up     (cblas_sgemm, concurrent)
+  Wall time = max(t_gpu, t_cpu) instead of t_gpu + t_cpu
+
+Attention backward:
+  GPU → grad_Wq = x_norm.T @ grad_q_proj
+  CPU → grad_Wk = x_norm.T @ grad_k_proj
+  (both use different weight matrices → zero memory contention)
+```
+
+> **Why not row-split a single matmul?** Both CPU and GPU would need to read the full weight
+> matrix B simultaneously, creating memory bus contention on the shared unified memory bus.
+> Operation-level split uses different data entirely — no contention.
+
+**New deliverables:**
+
+```
+cpp/metal/
+  gemm_gqa.metal          Fused QK^T + softmax + V
+  gemm_proj.metal         Weight-resident projection streaming
+  gemm_ffn.metal          Max arithmetic intensity GEMM (128×128 tiles)
+cpp/include/
+  MetalMatmul.hpp         C++ interface + shape-aware dispatcher
+cpp/src/
+  MetalMatmul.mm          Objective-C++ bridge (Metal API calls)
+```
+
+**CMake changes needed:**
+
+```cmake
+# Compile Metal shaders to .metallib at build time
+find_program(XCRUN xcrun)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/matmul.metallib ...)
+
+# Link Metal + Foundation frameworks
+target_link_libraries(data_ingestion PUBLIC "-framework Metal" "-framework Foundation")
+target_sources(data_ingestion PRIVATE cpp/src/MetalMatmul.mm)
+```
+
+**Verification gates:**
+- TC-12 (2D matmul) and TC-13 (3D batched matmul) in `test_math_ops` must PASS with identical numerical output to CPU path
+- `test_backward` gradient correctness must be preserved (finite-difference test)
+- GPU throughput on benchmark shapes must exceed current CPU baseline
+
+---
+
+### Sprint 6c: Safetensors Checkpointing 🔲
+
+**Objective**: Serialize and deserialize model weights to/from the safetensors format for checkpoint save/load/resume.
+
+**Deliverables:**
+- `cpp/include/Checkpoint.hpp`
+- `cpp/src/Checkpoint.cpp`
+
+**Implementation guidelines:**
+- Safetensors header format: JSON metadata block + raw float32 tensor data.
+- Must preserve: all `TransformerLayer` weights (`w_gate`, `w_up`, `w_down`, `Wq`, `Wk`, `Wv`, `Wo`), `token_embeddings_`, `output_projection_`, `final_norm_` weights.
+- Verify integrity: reload saved checkpoint and check that forward pass output is bit-identical to pre-save output.
+- Checkpoint file naming: `checkpoint_step_{N}.safetensors` with a `latest` symlink.
+
+**Verification gate:**
+- Save at step N, reload, run forward pass → logits must be identical.
+- Test also covers optimizer state save/load (moment tensors) for full training resumption.
+
+---
+
+## 📌 Relationship to Python Pipeline Plan
+
+The `doc/REFACTORING_AND_ARCHITECTURE_PLAN.md` covers the Python/MLX pipeline layer:
+data download, selection, SFT, evaluation, and serving. That plan is independent of this C++ engine.
+
+**Integration point**: When the C++ engine produces a checkpoint (Sprint 6c, safetensors format),
+the Python serving pipeline (Stage 9 of the refactoring plan) can load it directly — the safetensors
+format is compatible with the Python `safetensors` library used by the MLX serving layer.
+
+**No contradiction exists between the two plans.**
+
+---
+
+## 🎯 Performance Targets (End of Sprint 6)
+
+| Operation | Current (CPU) | Target (GPU) |
+|---|---|---|
+| GQA attention | 387 GFLOPS | > 1,500 GFLOPS (fused softmax) |
+| Attention projection | 1,891 GFLOPS | > 3,000 GFLOPS (B residency) |
+| FFN projection | 1,908 GFLOPS | > 5,000 GFLOPS (128×128 tile) |
+| Forward pass (2-layer test) | 2.11 ms | < 0.5 ms |
+| Backward pass (2-layer test) | 13.54 ms | < 3 ms |

@@ -219,12 +219,29 @@ int main() {
     integration_cfg.lr_min = 1e-5f;
     integration_cfg.log_interval = 1;
 
-    Trainer pretrain_trainer(integration_cfg, model, opt, data_loader, rope);
+    // Create a dedicated model with vocabulary large enough for cl100k_base tiktoken IDs
+    ModelConfig integration_config = ModelConfig::make_toy();
+    integration_config.vocab_size = 100300;
+    integration_config.hidden_dim = 8;
+    integration_config.intermediate_dim = 16;
+    integration_config.n_layers = 1;
+    integration_config.n_heads = 2;
+    integration_config.n_kv_heads = 2;
+    integration_config.head_dim = 4;
+    integration_config.max_seq_len = 8;
+
+    Transformer integration_model(integration_config);
+
+    Trainer pretrain_trainer(integration_cfg, integration_model, opt, data_loader, rope);
     
     bool trainer_success = true;
     try {
       pretrain_trainer.train();
+    } catch (const std::exception &e) {
+      std::cout << "[ERROR] Captured exception in pretrain_trainer.train(): " << e.what() << std::endl;
+      trainer_success = false;
     } catch (...) {
+      std::cout << "[ERROR] Captured unknown exception in pretrain_trainer.train()" << std::endl;
       trainer_success = false;
     }
     if (trainer_success) passed_checks++;
