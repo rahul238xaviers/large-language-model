@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <thread>
 
 /**
  * @brief Computes the forward pass of the Cross-Entropy Loss function.
@@ -43,38 +44,64 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
   // Initialize probs_ container to save activations for backward pass
   probs_ = Tensor({batch, seq_len, vocab_size}, 0.0f);
 
-  float total_loss = 0.0f;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
 
-  for (size_t b = 0; b < batch; b++) {
-    for (size_t s = 0; s < seq_len; s++) {
+  std::vector<std::thread> workers;
+  std::vector<float> thread_loss(num_threads, 0.0f);
+  size_t total_tokens = batch * seq_len;
+  size_t tokens_per_thread = (total_tokens + num_threads - 1) / num_threads;
 
-      // Step 1: Find the maximum logit value for numerical stability (softmax
-      // subtraction trick)
-      float max_val = -std::numeric_limits<float>::infinity();
-      for (size_t v = 0; v < vocab_size; v++) {
-        if (logits(b, s, v) > max_val) {
-          max_val = logits(b, s, v);
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t start_tok = t * tokens_per_thread;
+    size_t end_tok = std::min(start_tok + tokens_per_thread, total_tokens);
+
+    if (start_tok >= end_tok) continue;
+
+    workers.emplace_back([this, start_tok, end_tok, vocab_size, seq_len, &logits, &targets, &thread_loss, t]() {
+      float local_loss = 0.0f;
+      for (size_t tok = start_tok; tok < end_tok; ++tok) {
+        size_t b = tok / seq_len;
+        size_t s = tok % seq_len;
+
+        // Step 1: Find the maximum logit value for numerical stability (softmax subtraction trick)
+        float max_val = -std::numeric_limits<float>::infinity();
+        for (size_t v = 0; v < vocab_size; v++) {
+          float val = logits(b, s, v);
+          if (val > max_val) {
+            max_val = val;
+          }
         }
-      }
 
-      // Step 2: Compute the sum of exponentials (denominator of softmax)
-      float sum_exp = 0.0f;
-      for (size_t v = 0; v < vocab_size; v++) {
-        sum_exp += std::exp(logits(b, s, v) - max_val);
-      }
+        // Step 2: Compute the sum of exponentials (denominator of softmax)
+        float sum_exp = 0.0f;
+        for (size_t v = 0; v < vocab_size; v++) {
+          sum_exp += std::exp(logits(b, s, v) - max_val);
+        }
 
-      // Step 3: Compute and store token-wise softmax probabilities
-      for (size_t v = 0; v < vocab_size; v++) {
-        probs_(b, s, v) = std::exp(logits(b, s, v) - max_val) / sum_exp;
-      }
+        // Step 3: Compute and store token-wise softmax probabilities
+        for (size_t v = 0; v < vocab_size; v++) {
+          probs_(b, s, v) = std::exp(logits(b, s, v) - max_val) / sum_exp;
+        }
 
-      // Step 4: Accumulate loss for the target token ID
-      size_t target_id = static_cast<size_t>(targets(b, s));
-      float target_prob = probs_(b, s, target_id);
-      total_loss += -std::log(
-          std::max(target_prob, 1e-15f)); // Floor probability to prevent log(0)
-    }
+        // Step 4: Accumulate loss for the target token ID
+        size_t target_id = static_cast<size_t>(targets(b, s));
+        float target_prob = probs_(b, s, target_id);
+        local_loss += -std::log(std::max(target_prob, 1e-15f));
+      }
+      thread_loss[t] = local_loss;
+    });
   }
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  float total_loss = 0.0f;
+  for (float loss : thread_loss) {
+    total_loss += loss;
+  }
+
   return total_loss / (batch * seq_len);
 }
 
@@ -96,19 +123,39 @@ Tensor CrossEntropyLoss::backward(const Tensor &targets) const {
   Tensor grad_logits({batch, seq_len, vocab_size}, 0.0f);
   float scale = 1.0f / (batch * seq_len);
 
-  for (size_t b = 0; b < batch; ++b) {
-    for (size_t s = 0; s < seq_len; ++s) {
-      size_t target_id = static_cast<size_t>(targets(b, s));
-      for (size_t v = 0; v < vocab_size; ++v) {
-        // Apply target-class indicator subtraction and batch normalization
-        // scaling
-        if (v == target_id) {
-          grad_logits(b, s, v) = (probs_(b, s, v) - 1.0f) * scale;
-        } else {
-          grad_logits(b, s, v) = probs_(b, s, v) * scale;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
+
+  std::vector<std::thread> workers;
+  size_t total_tokens = batch * seq_len;
+  size_t tokens_per_thread = (total_tokens + num_threads - 1) / num_threads;
+
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t start_tok = t * tokens_per_thread;
+    size_t end_tok = std::min(start_tok + tokens_per_thread, total_tokens);
+
+    if (start_tok >= end_tok) continue;
+
+    workers.emplace_back([this, start_tok, end_tok, vocab_size, seq_len, scale, &targets, &grad_logits]() {
+      for (size_t tok = start_tok; tok < end_tok; ++tok) {
+        size_t b = tok / seq_len;
+        size_t s = tok % seq_len;
+
+        size_t target_id = static_cast<size_t>(targets(b, s));
+        for (size_t v = 0; v < vocab_size; ++v) {
+          if (v == target_id) {
+            grad_logits(b, s, v) = (probs_(b, s, v) - 1.0f) * scale;
+          } else {
+            grad_logits(b, s, v) = probs_(b, s, v) * scale;
+          }
         }
       }
-    }
+    });
   }
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
   return grad_logits;
 }

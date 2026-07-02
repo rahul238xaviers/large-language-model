@@ -18,6 +18,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <vector>
+#include <thread>
 
 /**
  * @brief Construct a new RMSNorm object
@@ -44,10 +45,8 @@ RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f), eps_(eps) {}
  * @return Tensor Normalized tensor of the same shape as input x.
  */
 Tensor RMSNorm::forward(const Tensor &x) const {
-
   const std::vector<size_t> &x_shape = x.shape();
   if (x.shape().size() < 2) {
-
     throw std::invalid_argument("Input tensor must have at least 2 dimensions");
   }
 
@@ -61,27 +60,45 @@ Tensor RMSNorm::forward(const Tensor &x) const {
   size_t total_elements = x.size();
   size_t num_rows = total_elements / dims;
 
-  const float *x_data = x.data().data();
-  const float *w_data = weight_.data().data();
-  float *res_data = result.data().data();
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
 
-  for (size_t r = 0; r < num_rows; r++) {
+  std::vector<std::thread> workers;
+  size_t rows_per_thread = (num_rows + num_threads - 1) / num_threads;
 
-    size_t offset = r * dims;
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t start_row = t * rows_per_thread;
+    size_t end_row = std::min(start_row + rows_per_thread, num_rows);
 
-    float sum_sq = std::inner_product(
-        x_data + offset,        // Start of the row
-        x_data + offset + dims, // End of the row
-        x_data + offset,        // Start of the row (multiplied against itself)
-        0.0f                    // Initial sum value
-    );
+    if (start_row >= end_row) continue;
 
-    float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
+    workers.emplace_back([this, start_row, end_row, dims, &x, &result]() {
+      const float *x_data = x.data().data();
+      const float *w_data = weight_.data().data();
+      float *res_data = result.data().data();
 
-    for (size_t col_idx = 0; col_idx < dims; col_idx++) {
-      res_data[offset + col_idx] =
-          (x_data[offset + col_idx] / rms) * w_data[col_idx];
-    }
+      for (size_t r = start_row; r < end_row; ++r) {
+        size_t offset = r * dims;
+
+        float sum_sq = std::inner_product(
+            x_data + offset,
+            x_data + offset + dims,
+            x_data + offset,
+            0.0f
+        );
+
+        float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
+
+        for (size_t col_idx = 0; col_idx < dims; col_idx++) {
+          res_data[offset + col_idx] =
+              (x_data[offset + col_idx] / rms) * w_data[col_idx];
+        }
+      }
+    });
+  }
+
+  for (auto &worker : workers) {
+    worker.join();
   }
 
   return result;
@@ -89,7 +106,6 @@ Tensor RMSNorm::forward(const Tensor &x) const {
 
 Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
                          Tensor &grad_weight) const {
-
   if (grad_output.shape() != input.shape()) {
     throw std::invalid_argument(
         "grad_output and input shapes must match in RMSNorm::backward");
@@ -105,42 +121,71 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   size_t total_elements = input.size();
   size_t num_rows = total_elements / dims;
 
-  const float *x_data = input.data().data();
-  const float *g_data = grad_output.data().data();
-  const float *w_data = weight_.data().data();
-  float *dx_data = grad_input.data().data();
   float *dw_data = grad_weight.data().data();
 
-  for (size_t r = 0; r < num_rows; ++r) {
-    size_t offset = r * dims;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
 
-    // 1. Calculate sum of squares for this row to compute RMS
-    float sum_sq = 0.0f;
+  std::vector<std::thread> workers;
+  std::vector<std::vector<float>> thread_dw(num_threads, std::vector<float>(dims, 0.0f));
+  size_t rows_per_thread = (num_rows + num_threads - 1) / num_threads;
+
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t start_row = t * rows_per_thread;
+    size_t end_row = std::min(start_row + rows_per_thread, num_rows);
+
+    if (start_row >= end_row) continue;
+
+    workers.emplace_back([this, start_row, end_row, dims, &input, &grad_output, &grad_input, &thread_dw, t]() {
+      const float *x_data = input.data().data();
+      const float *g_data = grad_output.data().data();
+      const float *w_data = weight_.data().data();
+      float *dx_data = grad_input.data().data();
+      float *dw_local = thread_dw[t].data();
+
+      for (size_t r = start_row; r < end_row; ++r) {
+        size_t offset = r * dims;
+
+        // 1. Calculate sum of squares for this row to compute RMS
+        float sum_sq = 0.0f;
+        for (size_t col = 0; col < dims; ++col) {
+          float val = x_data[offset + col];
+          sum_sq += val * val;
+        }
+        float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
+
+        // 2. Compute inner sum_term: mean(g * w * xhat)
+        float sum_g_w_xhat = 0.0f;
+        for (size_t col = 0; col < dims; ++col) {
+          float xhat = x_data[offset + col] / rms;
+          sum_g_w_xhat += g_data[offset + col] * w_data[col] * xhat;
+        }
+        sum_g_w_xhat /= static_cast<float>(dims);
+
+        // 3. Compute gradients w.r.t input and accumulate weights gradients locally
+        for (size_t col = 0; col < dims; ++col) {
+          float xhat = x_data[offset + col] / rms;
+
+          // grad_input calculation
+          dx_data[offset + col] =
+              (1.0f / rms) *
+              (g_data[offset + col] * w_data[col] - xhat * sum_g_w_xhat);
+
+          // Accumulate weight gradient locally
+          dw_local[col] += g_data[offset + col] * xhat;
+        }
+      }
+    });
+  }
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  // Sum up thread-local gradients into global grad_weight
+  for (unsigned int t = 0; t < num_threads; ++t) {
     for (size_t col = 0; col < dims; ++col) {
-      float val = x_data[offset + col];
-      sum_sq += val * val;
-    }
-    float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
-
-    // 2. Compute inner sum_term: mean(g * w * xhat)
-    float sum_g_w_xhat = 0.0f;
-    for (size_t col = 0; col < dims; ++col) {
-      float xhat = x_data[offset + col] / rms;
-      sum_g_w_xhat += g_data[offset + col] * w_data[col] * xhat;
-    }
-    sum_g_w_xhat /= static_cast<float>(dims);
-
-    // 3. Compute gradients w.r.t input and accumulate weights gradients
-    for (size_t col = 0; col < dims; ++col) {
-      float xhat = x_data[offset + col] / rms;
-
-      // grad_input calculation
-      dx_data[offset + col] =
-          (1.0f / rms) *
-          (g_data[offset + col] * w_data[col] - xhat * sum_g_w_xhat);
-
-      // Accumulate weight gradient
-      dw_data[col] += g_data[offset + col] * xhat;
+      dw_data[col] += thread_dw[t][col];
     }
   }
 

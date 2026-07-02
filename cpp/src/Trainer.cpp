@@ -5,16 +5,32 @@
 
 #include "Trainer.hpp"
 #include "Loss.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <cmath>
 #include <iostream>
 #include <chrono>
 #include <iomanip>
 
+/**
+ * @brief Construct a new Trainer object.
+ *
+ * @param config TrainerConfig parameters.
+ * @param model Transformer model to train.
+ * @param optimizer Optimizer to update parameters.
+ * @param data_loader DataIngestion loader.
+ * @param rope Rotary position embedding helper.
+ */
 Trainer::Trainer(const TrainerConfig &config, Transformer &model, Optimizer &optimizer,
                  DataIngestion &data_loader, const RoPE &rope)
     : config_(config), model_(model), optimizer_(optimizer),
       data_loader_(data_loader), rope_(rope) {}
 
+/**
+ * @brief Computes learning rate based on linear warmup and cosine decay.
+ *
+ * @param step Active training step.
+ * @return float Learning rate.
+ */
 float Trainer::get_scheduled_lr(size_t step) const {
   if (step < config_.warmup_steps) {
     return config_.lr_max * static_cast<float>(step) / static_cast<float>(config_.warmup_steps);
@@ -76,6 +92,12 @@ static void run_training_step(
   optimizer.step(lr);
 }
 
+/**
+ * @brief Executes the pre-training loop for the configured number of steps.
+ *
+ * Each step gets a token batch from data loader, computes learning rate,
+ * runs the training step (forward, loss, backward), and logs stats.
+ */
 void Trainer::train() {
   size_t batch_size = model_.token_embeddings().shape()[1]; // Toy batch default placeholder
   // We can look up batch size from data_loader or set configuration
@@ -141,7 +163,10 @@ void Trainer::train() {
                 << " | Loss: " << std::fixed << std::setprecision(5) << loss
                 << " | LR: " << std::scientific << std::setprecision(4) << lr
                 << " | Step Latency: " << std::fixed << std::setprecision(2) << step_ms << " ms"
+                << " [Profile] GPU GEMM: " << metal_bridge::count_gpu_calls << " calls (" << metal_bridge::accum_gpu_time_ms << " ms) | "
+                << "CPU GEMM: " << metal_bridge::count_cpu_calls << " calls (" << metal_bridge::accum_cpu_time_ms << " ms)"
                 << std::endl;
+      metal_bridge::reset_profile_stats();
     }
   }
 }
