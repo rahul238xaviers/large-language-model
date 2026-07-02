@@ -9,6 +9,18 @@ project(LLM_Pipeline LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Enable Release build type by default if not set
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+# Set optimization flags for high performance CPU execution
+if(MSVC)
+  add_compile_options(/O2 /Gy)
+else()
+  add_compile_options(-O3)
+endif()
+
 # Export compile_commands.json for Clangd/IDE LSP support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -35,6 +47,7 @@ add_library(data_ingestion
     cpp/src/Loss.cpp
     cpp/src/Optimizer.cpp
     cpp/src/Trainer.cpp
+    cpp/src/gpu_kernel/MetalBridge.mm
 )
 
 # Set include directories
@@ -48,7 +61,9 @@ target_link_libraries(data_ingestion PUBLIC
     parquet_shared
     tokenizers_cpp
     "-framework Accelerate"
-
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework Foundation"
 )
 
 # Define our test executable
@@ -142,6 +157,37 @@ target_link_libraries(test_trainer PUBLIC
     data_ingestion
 )
 
+add_executable(test_gpu_vector_add
+    cpp/tests/test_gpu_vector_add.cpp
+)
+target_link_libraries(test_gpu_vector_add PUBLIC
+    data_ingestion
+    "-framework Metal"
+    "-framework Foundation"
+    "-framework Cocoa"
+)
 
+# 1. Find the xcrun tool on macOS
+find_program(XCRUN xcrun)
+
+# 2. Add custom commands to compile our shaders
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/vector_add.metal
+            -o ${CMAKE_BINARY_DIR}/vector_add.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_ffn.air
+    COMMAND ${XCRUN} -sdk macosx metallib
+            ${CMAKE_BINARY_DIR}/vector_add.air
+            ${CMAKE_BINARY_DIR}/gemm_ffn.air
+            -o ${CMAKE_BINARY_DIR}/default.metallib
+    DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/vector_add.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
+)
+# 3. Add default.metallib to the target files so CMake knows it must build it
+add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)
+add_dependencies(test_gpu_vector_add compile_shaders)
 
 

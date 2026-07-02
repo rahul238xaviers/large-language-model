@@ -57,6 +57,7 @@
 #include <cstdlib>
 #include <tokenizers_cpp.h>
 #include <unordered_map>
+#include <thread>
 
 namespace {
 
@@ -243,6 +244,18 @@ std::string build_tokenizer_json(const std::string &vocab_json,
 #include <string>
 #include <vector>
 
+/**
+ * @brief Construct a new DataIngestion object.
+ *
+ * Scans directories for Parquet shards and loads/sorts the tiktoken vocabulary directly in C++.
+ *
+ * @param data_dir Path to the directory containing Parquet shards.
+ * @param single_data_file Optional path to a single Parquet file to ingest.
+ * @param max_shard_bytes Maximum memory size threshold of a single Parquet shard.
+ * @param batch_size Number of sequences per training batch.
+ * @param sequence_length Sequence token length for target predictions.
+ * @param vocab_path Path to the tiktoken vocabulary file.
+ */
 DataIngestion::DataIngestion(const std::string &data_dir,
                              const std::string &single_data_file,
                              size_t max_shard_bytes, size_t batch_size,
@@ -381,11 +394,18 @@ DataIngestion::DataIngestion(const std::string &data_dir,
   }
 }
 
+/**
+ * @brief Destroys the DataIngestion object.
+ */
 DataIngestion::~DataIngestion() = default;
 
-// Uses the macro functions available in the arrow C++ library
+/**
+ * @brief Loads a single Parquet shard file into Arrow memory.
+ *
+ * @param file_path Absolute path to the Parquet shard file.
+ * @return arrow::Status Success or failure status.
+ */
 arrow::Status DataIngestion::load_parquet_shard(const std::string &file_path) {
-
   std::cout << "Loading shard: " << file_path << std::endl;
 
   // This would check if the file can be opened for reading or not
@@ -406,9 +426,15 @@ arrow::Status DataIngestion::load_parquet_shard(const std::string &file_path) {
   return arrow::Status::OK();
 }
 
+/**
+ * @brief Tokenizes the specified text column of an Arrow table across all CPU cores.
+ *
+ * @param table Pointer to Arrow Table.
+ * @param col Name of the text column to tokenize.
+ */
 void DataIngestion::tokenize_cpp_corpus(std::shared_ptr<arrow::Table> table,
                                         const std::string col) {
-  std::cout << "Tokenizing C++ corpus..." << std::endl;
+  std::cout << "Gathering documents for tokenization..." << std::endl;
   std::shared_ptr<arrow::ChunkedArray> chunked_array =
       table->GetColumnByName(col);
 
@@ -417,21 +443,56 @@ void DataIngestion::tokenize_cpp_corpus(std::shared_ptr<arrow::Table> table,
     return;
   }
 
+  std::vector<std::string> documents;
   for (int i = 0; i < chunked_array->num_chunks(); i++) {
     std::shared_ptr<arrow::Array> chunk = chunked_array->chunk(i);
-
     auto string_array = std::static_pointer_cast<arrow::StringArray>(chunk);
 
     for (int64_t j = 0; j < string_array->length(); ++j) {
       if (string_array->IsValid(j)) {
-        std::string text = string_array->GetString(j);
-        // The raw tokens are sent for tokenisation.
-        bpe_encode(text, flat_tokens_);
-        flat_tokens_.push_back(EOT);
+        documents.push_back(string_array->GetString(j));
       }
     }
   }
+
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
+  std::cout << "Tokenizing C++ corpus (" << documents.size() << " docs) using " 
+            << num_threads << " CPU threads..." << std::endl;
+
+  std::vector<std::vector<int>> doc_tokens(documents.size());
+  std::vector<std::thread> workers;
+  
+  size_t docs_per_thread = (documents.size() + num_threads - 1) / num_threads;
+
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t start_idx = t * docs_per_thread;
+    size_t end_idx = std::min(start_idx + docs_per_thread, documents.size());
+
+    if (start_idx >= end_idx) continue;
+
+    workers.emplace_back([this, start_idx, end_idx, &documents, &doc_tokens]() {
+      for (size_t k = start_idx; k < end_idx; ++k) {
+        std::vector<int> tokens;
+        bpe_encode(documents[k], tokens);
+        tokens.push_back(EOT);
+        doc_tokens[k] = std::move(tokens);
+      }
+    });
+  }
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  std::cout << "Flattening tokens..." << std::endl;
+  for (auto &tokens : doc_tokens) {
+    flat_tokens_.insert(flat_tokens_.end(), tokens.begin(), tokens.end());
+  }
 }
+/**
+ * @brief Cuts the flat token stream into sequential chunks of sequence_length + 1.
+ */
 void DataIngestion::generate_training_sequences() {
   std::cout << "Generating training sequences..." << std::endl;
 
@@ -452,6 +513,12 @@ void DataIngestion::generate_training_sequences() {
   }
 }
 
+/**
+ * @brief Encodes raw text into token IDs using BPE.
+ *
+ * @param text Input raw string.
+ * @param tokens Vector to insert encoded token IDs into.
+ */
 void DataIngestion::bpe_encode(const std::string &text,
                                std::vector<int> &tokens) {
   if (text.empty())
@@ -461,6 +528,11 @@ void DataIngestion::bpe_encode(const std::string &text,
   tokens.insert(tokens.end(), encoded.begin(), encoded.end());
 }
 
+/**
+ * @brief Retrieves the next batch of training sequences, loading new shards as needed.
+ *
+ * @return std::vector<std::vector<int>> A batch of token lists.
+ */
 std::vector<std::vector<int>> DataIngestion::get_batch() {
   // std::cout << "Getting batch..." << std::endl;
 

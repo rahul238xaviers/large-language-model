@@ -16,6 +16,7 @@
 #include <Accelerate/Accelerate.h>
 
 #include <vector>
+#include <thread>
 
 namespace activatations {
 
@@ -114,8 +115,27 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
             static_cast<vDSP_Length>(n));
 
   // dsilu = sigmoid * (1 + gate * (1 - sigmoid))
-  for (int i = 0; i < n; ++i) {
-    dsilu[i] = sig[i] * (1.0f + g_ptr[i] * (1.0f - sig[i]));
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) num_threads = 4;
+
+  std::vector<std::thread> workers;
+  int items_per_thread = (n + num_threads - 1) / num_threads;
+
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    int start_idx = t * items_per_thread;
+    int end_idx = std::min(start_idx + items_per_thread, n);
+
+    if (start_idx >= end_idx) continue;
+
+    workers.emplace_back([start_idx, end_idx, &dsilu, &sig, g_ptr]() {
+      for (int i = start_idx; i < end_idx; ++i) {
+        dsilu[i] = sig[i] * (1.0f + g_ptr[i] * (1.0f - sig[i]));
+      }
+    });
+  }
+
+  for (auto &worker : workers) {
+    worker.join();
   }
 
   // grad_up = dy * silu_val

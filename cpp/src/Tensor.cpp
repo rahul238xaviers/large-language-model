@@ -17,9 +17,18 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <chrono>
+#include <cstdlib>
+#include "gpu_kernel/MetalBridge.hpp"
 
+/**
+ * @brief Construct a new empty Tensor object.
+ */
 Tensor::Tensor() : shape_({}), strides_({}), data_({}) {}
 
+/**
+ * @brief Helper to calculate the total flat size of a given shape.
+ */
 static size_t get_total_size(const std::vector<size_t> &shape) {
   if (shape.empty()) {
     return 1;
@@ -27,16 +36,31 @@ static size_t get_total_size(const std::vector<size_t> &shape) {
   return std::accumulate(shape.begin(), shape.end(), 1ULL,
                          std::multiplies<size_t>());
 }
+
+/**
+ * @brief Construct a new Tensor object with shape, zero-initialized.
+ *
+ * @param shape Vector containing dimension sizes.
+ */
 Tensor::Tensor(const std::vector<size_t> &shape)
     : shape_(shape), data_(get_total_size(shape), 0.0f) {
   compute_strides();
 }
 
+/**
+ * @brief Construct a new Tensor object with shape, initialized to a scalar value.
+ *
+ * @param shape Vector containing dimension sizes.
+ * @param val Scalar value to fill the tensor with.
+ */
 Tensor::Tensor(const std::vector<size_t> &shape, float val)
     : shape_(shape), data_(get_total_size(shape), val) {
   compute_strides();
 }
 
+/**
+ * @brief Precomputes the row-major index offset multiplier (stride) for each dimension.
+ */
 void Tensor::compute_strides() {
   strides_.resize(shape_.size(), 1);
   if (shape_.empty())
@@ -48,8 +72,13 @@ void Tensor::compute_strides() {
   }
 }
 
+/**
+ * @brief Flattens multi-dimensional indices into a single row-major 1D index offset.
+ *
+ * @param indices Vector of indices per dimension.
+ * @return size_t Flat index offset.
+ */
 size_t Tensor::get_index(const std::vector<size_t> &indices) const {
-
   if (indices.size() != shape_.size()) {
     throw std::invalid_argument("Dimensionality mismatch");
   }
@@ -58,48 +87,83 @@ size_t Tensor::get_index(const std::vector<size_t> &indices) const {
     if (indices[i] >= shape_[i]) {
       throw std::out_of_range("Index out of bounds");
     }
-
     idx += indices[i] * strides_[i];
   }
   return idx;
 }
 
+/**
+ * @brief Access element at multi-dimensional coordinate vector (mutable).
+ */
 float &Tensor::operator()(const std::vector<size_t> &indices) {
   return data_[get_index(indices)];
 }
 
+/**
+ * @brief Access element at multi-dimensional coordinate vector (read-only).
+ */
 const float &Tensor::operator()(const std::vector<size_t> &indices) const {
   return data_[get_index(indices)];
 }
 
+/**
+ * @brief Access element at flat index (mutable).
+ */
 float &Tensor::operator()(size_t i) { return data_[i]; }
 
+/**
+ * @brief Access element at flat index (read-only).
+ */
 const float &Tensor::operator()(size_t i) const { return data_[i]; }
 
+/**
+ * @brief Access element at 2D coordinates (mutable).
+ */
 float &Tensor::operator()(size_t i, size_t j) {
   return data_[i * strides_[0] + j];
 }
 
+/**
+ * @brief Access element at 2D coordinates (read-only).
+ */
 const float &Tensor::operator()(size_t i, size_t j) const {
   return data_[i * strides_[0] + j];
 }
 
+/**
+ * @brief Access element at 3D coordinates (mutable).
+ */
 float &Tensor::operator()(size_t i, size_t j, size_t k) {
   return data_[i * strides_[0] + j * strides_[1] + k];
 }
 
+/**
+ * @brief Access element at 3D coordinates (read-only).
+ */
 const float &Tensor::operator()(size_t i, size_t j, size_t k) const {
   return data_[i * strides_[0] + j * strides_[1] + k];
 }
 
+/**
+ * @brief Access element at 4D coordinates (mutable).
+ */
 float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) {
   return data_[i * strides_[0] + j * strides_[1] + k * strides_[2] + l];
 }
 
+/**
+ * @brief Access element at 4D coordinates (read-only).
+ */
 const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const {
   return data_[i * strides_[0] + j * strides_[1] + k * strides_[2] + l];
 }
 
+/**
+ * @brief Construct a new Tensor object from an existing flat data vector.
+ *
+ * @param shape Shape of the new tensor.
+ * @param data Flat vector of data values.
+ */
 Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data)
     : shape_(shape), data_(data) {
   compute_strides();
@@ -107,9 +171,21 @@ Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data)
     throw std::invalid_argument("Data size does not match shape dimensions");
   }
 }
+
+/**
+ * @brief Fills the tensor elements with a single scalar value.
+ *
+ * @param val Scalar value.
+ */
 void Tensor::fill(const float val) {
   std::fill(data_.begin(), data_.end(), val);
 }
+
+/**
+ * @brief Prints the shape and metadata values of the tensor to stdout.
+ *
+ * @param name Optional label to print before the shape.
+ */
 void Tensor::print(const std::string &name) const {
   if (!name.empty()) {
     std::cout << name << " ";
@@ -136,6 +212,13 @@ void Tensor::print(const std::string &name) const {
   std::cout << "\n";
 }
 
+/**
+ * @brief Adds another tensor to this tensor in-place.
+ *
+ * Uses Apple vDSP for vectorized SIMD element-wise addition.
+ *
+ * @param other Tensor to add (must have matching shape).
+ */
 void Tensor::add_(const Tensor &other) {
   if (shape_ != other.shape_) {
     throw std::invalid_argument("Shape mismatch for in-place addition");
@@ -144,6 +227,14 @@ void Tensor::add_(const Tensor &other) {
   vDSP_vadd(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
              static_cast<vDSP_Length>(data_.size()));
 }
+
+/**
+ * @brief Multiplies another tensor with this tensor element-wise in-place.
+ *
+ * Uses Apple vDSP for vectorized SIMD element-wise multiplication.
+ *
+ * @param other Tensor to multiply (must have matching shape).
+ */
 void Tensor::mul_(const Tensor &other) {
   if (shape_ != other.shape_) {
     throw std::invalid_argument("Shape mismatch for in-place multiplication");
@@ -153,24 +244,49 @@ void Tensor::mul_(const Tensor &other) {
              static_cast<vDSP_Length>(data_.size()));
 }
 
+/**
+ * @brief Scales this tensor's elements by a scalar factor in-place.
+ *
+ * Uses Apple vDSP for vectorized SIMD scalar multiplication.
+ *
+ * @param factor Scalar scaling factor.
+ */
 void Tensor::scale_(float factor) {
   // vDSP_vsmul: NEON-vectorized scalar multiply
   vDSP_vsmul(data_.data(), 1, &factor, data_.data(), 1,
-              static_cast<vDSP_Length>(data_.size()));
+               static_cast<vDSP_Length>(data_.size()));
 }
 
+/**
+ * @brief Returns the element-wise sum of this tensor and another tensor.
+ *
+ * @param other Tensor to add.
+ * @return Tensor New sum tensor.
+ */
 Tensor Tensor::add(const Tensor &other) const {
   Tensor result = *this;
   result.add_(other);
   return result;
 }
 
+/**
+ * @brief Returns the element-wise product of this tensor and another tensor.
+ *
+ * @param other Tensor to multiply.
+ * @return Tensor New product tensor.
+ */
 Tensor Tensor::mul(const Tensor &other) const {
   Tensor result = *this;
   result.mul_(other);
   return result;
 }
 
+/**
+ * @brief Returns a scaled copy of this tensor.
+ *
+ * @param factor Scalar scaling factor.
+ * @return Tensor New scaled tensor.
+ */
 Tensor Tensor::scale(float factor) const {
   Tensor result = *this;
   result.scale_(factor);
@@ -251,10 +367,31 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *w_data = other.data().data();
     float *res_data = result.data().data();
 
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
-                static_cast<int>(N), static_cast<int>(K), 1.0f, x_data,
-                static_cast<int>(K), w_data, static_cast<int>(N), 0.0f,
-                res_data, static_cast<int>(N));
+    const char* gpu_enabled_env = std::getenv("GPU_ENABLED");
+    bool use_gpu = false;
+    if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+      metal_bridge::initialize();
+      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
+        use_gpu = true;
+      }
+    }
+
+    if (use_gpu) {
+      auto start = std::chrono::high_resolution_clock::now();
+      metal_bridge::gemm_ffn(x_data, w_data, res_data, M, N, K);
+      auto end = std::chrono::high_resolution_clock::now();
+      metal_bridge::accum_gpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      metal_bridge::count_gpu_calls++;
+    } else {
+      auto start = std::chrono::high_resolution_clock::now();
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
+                  static_cast<int>(N), static_cast<int>(K), 1.0f, x_data,
+                  static_cast<int>(K), w_data, static_cast<int>(N), 0.0f,
+                  res_data, static_cast<int>(N));
+      auto end = std::chrono::high_resolution_clock::now();
+      metal_bridge::accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      metal_bridge::count_cpu_calls++;
+    }
 
     return result;
   }
@@ -311,6 +448,7 @@ Tensor Tensor::matmul(const Tensor &other) const {
     float *dataC = c_data + b * batch_offset_C;
 
     // Use Apple Accelerate BLAS for SIMD-vectorized matrix multiplication
+    auto start = std::chrono::high_resolution_clock::now();
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                 1.0f,
@@ -318,6 +456,9 @@ Tensor Tensor::matmul(const Tensor &other) const {
                 dataB, static_cast<int>(N),
                 0.0f,
                 dataC, static_cast<int>(N));
+    auto end = std::chrono::high_resolution_clock::now();
+    metal_bridge::accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+    metal_bridge::count_cpu_calls++;
   }
 
   return result;
