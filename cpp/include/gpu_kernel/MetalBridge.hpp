@@ -11,15 +11,7 @@ namespace metal_bridge {
  */
 void initialize();
 
-/**
- * @brief Add two vectors using Metal GPU acceleration
- *
- * @param a Input vector A (size elements)
- * @param b Input vector B (size elements)
- * @param c Output vector C (size elements)
- * @param size Number of elements in each vector
- */
-void vector_add(const float *a, const float *b, float *c, size_t size);
+
 
 /**
  * @brief Multiply matrices A [M x K] and B [K x N] to produce C [M x N] on GPU

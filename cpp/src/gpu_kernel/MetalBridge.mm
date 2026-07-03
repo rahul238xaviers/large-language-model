@@ -28,10 +28,7 @@ static id<MTLDevice> device = nil;
 // buffers) from CPU to GPU.
 static id<MTLCommandQueue> commandQueue = nil;
 
-// pipelineState (MTLComputePipelineState): The compiled microcode for our GPU
-// kernel. This contains the actual GPU machine instructions for the vector_add
-// function.
-static id<MTLComputePipelineState> pipelineState = nil;
+
 
 // pipelineStateFFN (MTLComputePipelineState): The compiled microcode for our tiled FFN GEMM.
 static id<MTLComputePipelineState> pipelineStateFFN = nil;
@@ -131,38 +128,7 @@ void initialize() {
     return;
   }
 
-  // 5. [defaultLibrary newFunctionWithName:@"vector_add"]
-  // WHAT: Parses the loaded binary library file, finds the function named
-  // "vector_add",
-  //       and extracts its entry-point information.
-  // WHY: A library is a collection of many different GPU functions. We must
-  // specify
-  //      exactly which function we want to select before we can compile it.
-  id<MTLFunction> kernelFunction =
-      [defaultLibrary newFunctionWithName:@"vector_add"];
-  if (!kernelFunction) {
-    std::cerr << "Failed to find kernel function 'vector_add' in library!"
-              << std::endl;
-    return;
-  }
 
-  // 6. [device newComputePipelineStateWithFunction:error:]
-  // WHAT: The critical compilation step. Takes the intermediate shader code
-  // (from the library)
-  //       and compiles it into the exact machine instructions (binary) for your
-  //       specific M5 GPU cores.
-  // WHY: A GPU cannot run source code or generic intermediate representations.
-  // It must compile
-  //      them into microcode for its specific execution units.
-  pipelineState = [device newComputePipelineStateWithFunction:kernelFunction
-                                                        error:&error];
-  if (!pipelineState) {
-    std::cerr << "Failed to compile pipeline state! Error: " <<
-        [[error localizedDescription] UTF8String] << std::endl;
-    return;
-  }
-  std::cout << "Metal Pipeline State compiled successfully for 'vector_add'!"
-            << std::endl;
 
   // 7. [defaultLibrary newFunctionWithName:@"gemm_ffn"]
   // WHAT: Finds the FFN GEMM kernel in our compiled shader library.
@@ -187,169 +153,7 @@ void initialize() {
   initialized = true;
 }
 
-void vector_add(const float *a, const float *b, float *c, size_t size) {
-  // WHAT: A safety guard checking if the vector size is equal to zero.
-  // WHY: If size is 0, the byte count is 0, which causes
-  // newBufferWithBytesNoCopy to crash because Metal cannot map an empty block.
-  //      It also prevents us from trying to launch 0 threads on the GPU.
-  if (size == 0)
-    return;
 
-  // WHAT: Calculates the total memory size of our float arrays in bytes (size *
-  // 4 bytes). WHY: Metal's memory allocation and mapping APIs operate at the
-  // hardware level in raw bytes,
-  //      so we must calculate the exact memory footprint of our float arrays.
-  size_t bytes = size * sizeof(float);
-
-  // WHAT: Creates an id<MTLBuffer> (GPU buffer object) called bufferA pointing
-  // to the CPU memory address (void*)a. WHY: By using newBufferWithBytesNoCopy,
-  // we exploit Apple Silicon's Unified Memory. The GPU can read our C++ array
-  // 'a'
-  //      directly over the memory bus. This is completely zero-copy: no
-  //      allocation of new memory blocks and no data copying happens.
-  // PARAMETERS:
-  // - (void*)a: The CPU memory address where our float array starts in RAM.
-  // - length:bytes: The boundary of the memory block in bytes.
-  // - options:MTLResourceStorageModeShared: Tells the hardware that both the
-  // CPU and GPU can read/write this memory concurrently.
-  // - deallocator:nil: Tells Metal that C++ owns this memory, so do not try to
-  // free/delete it when this buffer object is destroyed. C++ Translation:
-  // MTLBuffer* bufferA = device->newBufferWithBytesNoCopy(a, bytes,
-  // MTLResourceStorageModeShared, nil);
-  id<MTLBuffer> bufferA =
-      [device newBufferWithBytesNoCopy:(void *)a
-                                length:bytes
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-
-  // WHAT: Creates a GPU buffer object called bufferB pointing to CPU address
-  // (void*)b. WHY: To give the GPU direct, zero-copy access to read the C++
-  // array 'b' over the memory bus without copying a single byte. C++
-  // Translation: MTLBuffer* bufferB = device->newBufferWithBytesNoCopy(b,
-  // bytes, MTLResourceStorageModeShared, nil);
-  id<MTLBuffer> bufferB =
-      [device newBufferWithBytesNoCopy:(void *)b
-                                length:bytes
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-
-  // WHAT: Creates a GPU buffer object called bufferC pointing to CPU address
-  // (void*)c. WHY: To give the GPU direct, zero-copy access to write results
-  // into the C++ array 'c' memory directly over the memory bus. C++
-  // Translation: MTLBuffer* bufferC = device->newBufferWithBytesNoCopy(c,
-  // bytes, MTLResourceStorageModeShared, nil);
-  id<MTLBuffer> bufferC =
-      [device newBufferWithBytesNoCopy:(void *)c
-                                length:bytes
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-
-  // WHAT: Checks if any of the three buffer pointers returned are nil (null).
-  // WHY: If virtual memory mapping fails, these methods return nil. We must
-  // exit immediately to prevent the CPU
-  //      from executing commands on null references, which would cause a GPU
-  //      crash.
-  if (!bufferA || !bufferB || !bufferC) {
-    std::cerr << "Failed to allocate Metal buffers!" << std::endl;
-    return;
-  }
-
-  // WHAT: Requests a new empty MTLCommandBuffer object (cmdBuffer) from our
-  // commandQueue. WHY: Because communicating with the GPU has high latency, we
-  // cannot send instructions one-by-one.
-  //      We must write all instructions onto this command buffer (our
-  //      instruction sheet) and send it as a single job package.
-  // C++ Translation: MTLCommandBuffer* cmdBuffer =
-  // commandQueue->commandBuffer();
-  id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
-
-  // WHAT: Creates a MTLComputeCommandEncoder object (computeEncoder) bound to
-  // write into 'cmdBuffer'. WHY: The command buffer is a raw binary container.
-  // We cannot write instructions to it directly.
-  //      The encoder provides the API (the pen) to write structured GPU
-  //      commands.
-  // C++ Translation: MTLComputeCommandEncoder* computeEncoder =
-  // cmdBuffer->computeCommandEncoder();
-  id<MTLComputeCommandEncoder> computeEncoder =
-      [cmdBuffer computeCommandEncoder];
-
-  // WHAT: Writes the instruction: "The GPU should load our compiled
-  // 'vector_add' shader program." WHY: The GPU cores can run many different
-  // shaders. We must tell the encoder which specific set of
-  //      microcode instructions to load before we start binding data or
-  //      launching threads.
-  // C++ Translation: computeEncoder->setComputePipelineState(pipelineState);
-  [computeEncoder setComputePipelineState:pipelineState];
-
-  // WHAT: Writes the instruction: "Link 'bufferA' to shader parameter slot 0."
-  // WHY: Connects our C++ memory address to the [[buffer(0)]] annotation in our
-  // shader (vector_add.metal).
-  //      The offset:0 tells the GPU to start reading from the very beginning of
-  //      the buffer.
-  // C++ Translation: computeEncoder->setBuffer(bufferA, 0, 0);
-  [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
-
-  // WHAT: Writes the instruction: "Link 'bufferB' to shader parameter slot 1."
-  // WHY: Connects our C++ memory address to the [[buffer(1)]] annotation in our
-  // shader. C++ Translation: computeEncoder->setBuffer(bufferB, 0, 1);
-  [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
-
-  // WHAT: Writes the instruction: "Link 'bufferC' to shader parameter slot 2."
-  // WHY: Connects our C++ memory address to the [[buffer(2)]] annotation in our
-  // shader. C++ Translation: computeEncoder->setBuffer(bufferC, 0, 2);
-  [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
-
-  // WHAT: Casts our C++ size (64-bit size_t) to a 32-bit unsigned integer
-  // (uint).
-  // WHY: To match the 32-bit 'uint' type expected by our Metal shader parameter
-  // [[buffer(3)]].
-  uint sz = static_cast<uint>(size);
-
-  // WHAT: Writes the value of 'sz' directly into the command buffer at index 3.
-  // WHY: Connects the size value to the '[[buffer(3)]]' parameter in the shader
-  // without allocating a buffer. C++ Translation: computeEncoder->setBytes(&sz,
-  // sizeof(uint), 3);
-  [computeEncoder setBytes:&sz length:sizeof(uint) atIndex:3];
-
-  // WHAT: Creates a 3D size structure (MTLSize) defining the width of our
-  // thread block (Threadgroup). WHY: We query 'maxTotalThreadsPerThreadgroup'
-  // from the compiled pipeline. This asks the GPU:
-  //      "What is the maximum number of threads a single core can execute for
-  //      this program?" (usually 1024). We set the width to this maximum to
-  //      maximize GPU core ALU occupancy for this specific program. Since our
-  //      vector is 1-dimensional, height and depth are set to 1.
-  MTLSize threadGroupSize =
-      MTLSizeMake(pipelineState.maxTotalThreadsPerThreadgroup, 1, 1);
-
-  // WHAT: Creates a 3D size structure (MTLSize) representing the total threads
-  // to run (equal to size).
-  // WHY: To tell the GPU the total number of elements that must be calculated
-  // in parallel. C++ Translation: MTLSize gridSize = MTLSizeMake(size, 1, 1);
-  MTLSize gridSize = MTLSizeMake(size, 1, 1);
-
-  // WHAT: Writes the instruction: "Launch gridSize threads, partitioned into
-  // threadGroupSize blocks." WHY: Triggers the GPU hardware scheduling block to
-  // map our 2,048 threads onto the GPU cores. C++ Translation:
-  // computeEncoder->dispatchThreads(gridSize, threadGroupSize);
-  [computeEncoder dispatchThreads:gridSize
-            threadsPerThreadgroup:threadGroupSize];
-
-  // WHAT: Closes the encoder (the pen) writing session.
-  // WHY: Metal requires us to explicitly close the encoder before we can submit
-  // the command buffer. C++ Translation: computeEncoder->endEncoding();
-  [computeEncoder endEncoding];
-
-  // WHAT: Submits the completed command buffer packet to the conveyor belt
-  // (commandQueue). WHY: This triggers the GPU hardware scheduler to pick up
-  // the packet and start executing. C++ Translation: cmdBuffer->commit();
-  [cmdBuffer commit];
-
-  // WHAT: Puts the C++ thread to sleep until the GPU signals that the execution
-  // has finished. WHY: To ensure the GPU has written all computed values back
-  // to RAM before our C++ code reads them. C++ Translation:
-  // cmdBuffer->waitUntilCompleted();
-  [cmdBuffer waitUntilCompleted];
-}
 
 void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N, size_t K) {
   // WHAT: Safety guard checking if any dimension is zero.

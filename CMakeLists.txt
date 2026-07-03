@@ -157,16 +157,6 @@ target_link_libraries(test_trainer PUBLIC
     data_ingestion
 )
 
-add_executable(test_gpu_vector_add
-    cpp/tests/test_gpu_vector_add.cpp
-)
-target_link_libraries(test_gpu_vector_add PUBLIC
-    data_ingestion
-    "-framework Metal"
-    "-framework Foundation"
-    "-framework Cocoa"
-)
-
 # 1. Find the xcrun tool on macOS
 find_program(XCRUN xcrun)
 
@@ -174,20 +164,15 @@ find_program(XCRUN xcrun)
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
     COMMAND ${XCRUN} -sdk macosx metal -c
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/vector_add.metal
-            -o ${CMAKE_BINARY_DIR}/vector_add.air
-    COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             -o ${CMAKE_BINARY_DIR}/gemm_ffn.air
     COMMAND ${XCRUN} -sdk macosx metallib
-            ${CMAKE_BINARY_DIR}/vector_add.air
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
-    DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/vector_add.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
+    DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)
-add_dependencies(test_gpu_vector_add compile_shaders)
+add_dependencies(data_ingestion compile_shaders)
 
 
