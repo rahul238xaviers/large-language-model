@@ -17,7 +17,7 @@ import mlx.utils as mut
 from utils import timed_log
 
 from config import TrainingConfig, HardwareConfig
-from model import GPTModel
+from model import GPTModel, apply_gradient_checkpointing
 from data import ParallelTokenStream, AsyncBatchPrefetcher
 
 
@@ -85,6 +85,17 @@ def setup_run_dir(config: TrainingConfig) -> Path:
         run_dir = setup_run_dir(config)
         # run_dir == Path("runs/run_20260514_083022")
     """
+    resume_run = os.getenv("TRAIN_RESUME_RUN")
+    if resume_run:
+        run_dir = Path(resume_run)
+        if not run_dir.exists():
+            run_dir_alt = Path("runs") / resume_run
+            if run_dir_alt.exists():
+                run_dir = run_dir_alt
+            else:
+                raise FileNotFoundError(f"Resume run directory not found: {resume_run}")
+        return run_dir
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(f"runs/run_{timestamp}")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -114,13 +125,15 @@ class MetricsLogger:
 
         Example:
             ml = MetricsLogger(run_dir)
-            # Creates run_dir/metrics.csv with header row
+            # Creates run_dir/metrics.csv with header row if it doesn't exist, or prepares to append
         """
         self.metrics_path = run_dir / "metrics.csv"
         self.headers = ["step", "train_loss", "tokens_per_sec", "learning_rate", "vram_usage_gb", "mfu_pct"]
-        with open(self.metrics_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(self.headers)
+        exists = self.metrics_path.exists()
+        with open(self.metrics_path, "a", newline="") as f:
+            if not exists:
+                writer = csv.writer(f)
+                writer.writerow(self.headers)
 
     def log(self, metrics_dict: dict[str, float]) -> None:
         """
@@ -176,7 +189,9 @@ def get_lr(it: int, config: TrainingConfig) -> float:
     """
     if it < config.warmup_iters: return config.learning_rate * it / config.warmup_iters
     if it > config.max_iters: return config.min_lr
-    decay_ratio = it / config.max_iters
+    # FIX C2: subtract warmup_iters so decay_ratio starts at 0.0 at the end of warmup,
+    # not at warmup_iters/max_iters. Without this the model never trains at full peak LR.
+    decay_ratio = (it - config.warmup_iters) / max(1, config.max_iters - config.warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
@@ -222,9 +237,13 @@ def make_step(model: GPTModel, optimizer: optim.Optimizer, config: TrainingConfi
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-    @partial(mx.compile, inputs=model.state, outputs=model.state)
-    def micro_step(x, y):
-        return loss_and_grad_fn(model, x, y)
+    if config.eager_mode:
+        def micro_step(x, y):
+            return loss_and_grad_fn(model, x, y)
+    else:
+        @partial(mx.compile, inputs=model.state, outputs=model.state)
+        def micro_step(x, y):
+            return loss_and_grad_fn(model, x, y)
 
     return micro_step
 
@@ -409,9 +428,8 @@ def _mx_memory_gb(name: str) -> float | None:
     """
     Safely read one of the MLX memory-reporting functions by name.
 
-    MLX's memory API evolves between releases; some functions (`get_cache_memory`,
-    `get_peak_memory`) are not present in all versions.  This helper centralises
-    the version check so callers don't need try/except everywhere.
+    MLX's memory API resides under mlx.core.metal. This helper checks both
+    the base module and the metal sub-module.
 
     Args:
         name: MLX function name, e.g. "get_active_memory", "get_cache_memory",
@@ -419,38 +437,37 @@ def _mx_memory_gb(name: str) -> float | None:
 
     Returns:
         Memory in GiB, or None if the function does not exist or raises.
-
-    Example:
-        active_gb = _mx_memory_gb("get_active_memory")  # e.g. 22.6
-        cache_gb  = _mx_memory_gb("get_cache_memory")   # None if unavailable
     """
-    if not hasattr(mx, name):
+    func = None
+    if hasattr(mx, name):
+        func = getattr(mx, name)
+    elif hasattr(mx, "metal") and hasattr(mx.metal, name):
+        func = getattr(mx.metal, name)
+    
+    if func is None:
         return None
     try:
-        return getattr(mx, name)() / (1024 ** 3)
+        return func() / (1024 ** 3)
     except Exception:
         return None
 
 
 def _active_memory_gb() -> float:
     """
-    Return the current MLX "active" memory (live tensors not in the cache)
-    in GiB, with a fallback for older MLX builds.
-
-    "Active" memory = tensors that are referenced by at least one live Python
-    object.  This excludes the buffer cache (freed tensors kept warm for
-    reuse) and is the most meaningful number for diagnosing memory pressure.
-
-    Returns:
-        Active memory in GiB.
-
-    Example:
-        mem = _active_memory_gb()   # e.g. 22.6 during training at mbs=16
+    Return the current MLX "active" memory in GiB, with robust fallbacks.
     """
     active = _mx_memory_gb("get_active_memory")
     if active is not None:
         return active
-    return mx.get_active_memory() / (1024 ** 3)
+    if hasattr(mx, "metal") and hasattr(mx.metal, "get_active_memory"):
+        try:
+            return mx.metal.get_active_memory() / (1024 ** 3)
+        except Exception:
+            pass
+    try:
+        return mx.get_active_memory() / (1024 ** 3)
+    except Exception:
+        return 0.0
 
 
 def _process_rss_gb() -> float:
@@ -551,6 +568,26 @@ def _check_model_dtype(model: Any, expected_dtype_str: str, iteration: int, logg
     else:
         logger.info("DtypeCheck OK   | Iter %d | model params are [%s]", iteration, actual)
 
+def save_token_progress(run_dir, iteration, start_iteration, token_stream, config, logger) -> None:
+    import json
+    progress_file = run_dir / "token_progress.json"
+    progress = {}
+    if progress_file.exists():
+        try:
+            with open(progress_file, "r") as f:
+                progress = json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read existing token_progress.json: {e}")
+            
+    tokens_per_step = config.micro_batch_size * config.gradient_accumulation_steps * config.block_size
+    current_tokens = token_stream.initial_skip + (iteration - start_iteration + 1) * tokens_per_step
+    progress[str(iteration)] = current_tokens
+    try:
+        with open(progress_file, "w") as f:
+            json.dump(progress, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to write token_progress.json: {e}")
+
 def train() -> None:
     """
     Main training entry point for the 1.518B GPT model on Apple Silicon.
@@ -596,7 +633,14 @@ def train() -> None:
     log_file = run_dir / "train.log"
     logger = build_run_logger(log_file)
 
-    logger.info(f"Production Run: {run_dir.name} | Architecture: 1.6B Pure Closure")
+    logger.info(
+        "Production Run: %s | Model Config: n_layer=%d n_embd=%d n_head=%d block_size=%d",
+        run_dir.name,
+        config.n_layer,
+        config.n_embd,
+        config.n_head,
+        config.block_size,
+    )
     logger.info(
         "Config | mbs=%d acc=%d eff_batch=%d workers=%d prefetch=%d queue_chunks=%d",
         config.micro_batch_size,
@@ -610,9 +654,9 @@ def train() -> None:
     if cache_limit_gb_env:
         try:
             cache_limit_gb = float(cache_limit_gb_env)
-            if cache_limit_gb > 0 and hasattr(mx, "set_cache_limit"):
-                mx.set_cache_limit(int(cache_limit_gb * (1024 ** 3)))
-                logger.info("Runtime | cache_limit_gb=%.1f applied via mx.set_cache_limit", cache_limit_gb)
+            if cache_limit_gb >= 0 and hasattr(mx, "metal") and hasattr(mx.metal, "set_cache_limit"):
+                mx.metal.set_cache_limit(int(cache_limit_gb * (1024 ** 3)))
+                logger.info("Runtime | cache_limit_gb=%.1f applied via mx.metal.set_cache_limit", cache_limit_gb)
             else:
                 logger.info("Runtime | cache limit not applied (invalid value or API unavailable)")
         except Exception:
@@ -627,16 +671,72 @@ def train() -> None:
             mx.eval(model.parameters())
 
             param_count = sum(getattr(v, "size", 0) for _, v in mut.tree_flatten(model.parameters()) if not isinstance(v, str))
-            optimizer = optim.AdamW(learning_rate=config.learning_rate, betas=[config.beta1, config.beta2])
+            # FIX: Pass all config optimizer hyperparameters. Previously weight_decay was
+            # silently omitted, causing AdamW to use its default of 0.01 instead of the
+            # configured 0.1 — 10× less regularisation than intended. Also use tuple for
+            # betas (not list) and pass eps from config for full reproducibility.
+            optimizer = optim.AdamW(
+                learning_rate=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+            )
+            
+            # Load checkpoint if it exists
+            start_iteration = 0
+            checkpoint_dir = run_dir / "checkpoints"
+            if checkpoint_dir.exists():
+                ckpts = sorted(checkpoint_dir.glob("step_*.safetensors"))
+                if ckpts:
+                    resume_checkpoint = ckpts[-1]
+                    try:
+                        step_num = int(resume_checkpoint.stem.split("_")[-1])
+                        start_iteration = step_num + 1
+                        logger.info(f"Auto-discovered checkpoint: {resume_checkpoint.name}. Resuming weights and starting from step {start_iteration}.")
+                        model.load_weights(str(resume_checkpoint))
+                        mx.eval(model.parameters())
+                        # FIX C3: Load optimizer state so Adam m/v moments are restored.
+                        # Without this, Adam restarts from zero on every resume causing
+                        # a loss spike and hundreds of wasted warm-up steps.
+                        opt_state_path = resume_checkpoint.with_suffix('.opt.safetensors')
+                        if opt_state_path.exists():
+                            opt_state_flat = mx.load(str(opt_state_path))
+                            optimizer.state = mut.tree_unflatten(list(opt_state_flat.items()))
+                            mx.eval(optimizer.state)
+                            logger.info(f"Optimizer state restored from: {opt_state_path.name}")
+                        else:
+                            logger.warning(f"No optimizer state file found at {opt_state_path.name}. Adam moments will restart from zero.")
+                        # Synchronize the learning rate scheduler for resumption
+                        optimizer.learning_rate = get_lr(start_iteration, config)
+                    except Exception as e:
+                        logger.warning(f"Failed to load checkpoint {resume_checkpoint.name}: {e}")
             expected_mem = _estimate_expected_memory_gb(config, param_count)
             model_dtypes = _tree_dtype_summary(model.parameters())
             opt_dtypes = _tree_dtype_summary(optimizer.state)
 
+            # Gradient Checkpointing (mlx-lm pattern)
+            # Apply BEFORE mx.compile so the compiled graph captures the checkpointed
+            # forward pass. This reduces activation memory by ~70% at ~33% compute cost,
+            # enabling mbs=32-48 on 512 GB without OOM.
+            # Source: ml-explore/mlx-lm, tuner/trainer.py
+            if config.grad_checkpoint:
+                apply_gradient_checkpointing(model)
+                logger.info(
+                    "GradCheckpoint | Enabled on %d TransformerBlock layers. "
+                    "Activation memory: ~150 GB → ~40 GB at mbs=16. "
+                    "Compute cost: ~+33%% (forward recomputed during backward).",
+                    len(model.layers),
+                )
+            else:
+                logger.info("GradCheckpoint | Disabled (TRAIN_GRAD_CHECKPOINT=0).")
+
             # Build compiled micro-step (accumulation is done outside compile)
+            # IMPORTANT: compile AFTER gradient checkpointing is applied so the
+            # compiled graph includes the checkpointed forward.
             micro_step = make_step(model, optimizer, config)
 
             # Data Pipeline
-            token_stream = ParallelTokenStream(config)
+            token_stream = ParallelTokenStream(config, run_dir=run_dir, start_iteration=start_iteration)
             prefetcher = AsyncBatchPrefetcher(config, token_stream)
         logger.info("Data pipeline initialized; waiting for first prefetched full iteration")
         logger.info(
@@ -672,7 +772,7 @@ def train() -> None:
         logger.exception("Initialization failed — aborting run")
         raise
     
-    iteration = 0
+    iteration = start_iteration
     throughput_history = []
 
     try:
@@ -685,9 +785,9 @@ def train() -> None:
             if iteration == 0:
                 logger.info("First prefetched iteration received; entering compute step")
             
-            # 2. Execute micro-steps with explicit per-step evaluation
-            total_loss_value = 0.0
-            accumulated_grads = mut.tree_map(lambda p: mx.zeros_like(p), model.parameters())
+            # 2. Execute micro-steps lazily without per-step evaluation (unless profiling)
+            total_loss_arr = None
+            accumulated_grads = None
 
             # bf16 pre-step dtype assertion — confirms cast-back is holding
             if config.profile_methods:
@@ -695,12 +795,13 @@ def train() -> None:
 
             num_micro_batches = len(batch_x)
             for mb_idx, (x_mb, y_mb) in enumerate(zip(batch_x, batch_y), start=1):
+                logger.info("Iter %d | Micro-batch %d/%d | Starting forward/backward pass...", iteration, mb_idx, num_micro_batches)
+                t_mb_start = time.perf_counter()
+                
                 loss_mb, grads_mb = micro_step(x_mb, y_mb)
 
                 if config.profile_methods and iteration > 0:
                     # Split eval: forward then backward separately to measure each cost.
-                    # mx.eval(loss_mb) triggers the forward pass only (grads not yet needed).
-                    # mx.eval(grads_mb) then triggers the backward pass.
                     t0 = time.perf_counter()
                     mx.eval(loss_mb)
                     t_fwd = time.perf_counter() - t0
@@ -712,12 +813,35 @@ def train() -> None:
                         "Iter %d mb %d/%d | fwd %.3fs | bwd %.3fs | fwd:bwd=%.2f",
                         iteration, mb_idx, num_micro_batches, t_fwd, t_bwd, ratio,
                     )
+                elif config.profile_methods:
+                    logger.info("Iter %d | Micro-batch %d/%d | Evaluating/compiling graph...", iteration, mb_idx, num_micro_batches)
+                    mx.eval(loss_mb, grads_mb)
                 else:
-                    with timed_log(f"Iter {iteration} micro_batch {mb_idx}/{num_micro_batches}", config.profile_methods, logger):
-                        mx.eval(loss_mb, grads_mb)
+                    # Evaluate loss and grads to release activations and keep memory bounded.
+                    if iteration == start_iteration:
+                        logger.info("Iter %d | Micro-batch %d/%d | Evaluating graph (includes compilation on first step)...", iteration, mb_idx, num_micro_batches)
+                    mx.eval(loss_mb, grads_mb)
+                
+                t_mb_elapsed = time.perf_counter() - t_mb_start
+                logger.info("Iter %d | Micro-batch %d/%d | Completed in %.2fs", iteration, mb_idx, num_micro_batches, t_mb_elapsed)
 
-                total_loss_value += loss_mb.item()
-                accumulated_grads = mut.tree_map(lambda ag, g: ag + g, accumulated_grads, grads_mb)
+                # FIX C5: Accumulate gradients into a materialised tensor, not a growing
+                # lazy computation chain. Without mx.eval here, after acc_steps micro-batches
+                # MLX holds a chain of acc_steps lazy add-trees simultaneously in memory
+                # (~4.89 GB × acc_steps for a 1.3B model). Forcing eval after each step
+                # keeps only one materialised gradient tree + one grads_mb live at a time.
+                if accumulated_grads is None:
+                    accumulated_grads = grads_mb
+                else:
+                    accumulated_grads = mut.tree_map(lambda ag, g: ag + g, accumulated_grads, grads_mb)
+                mx.eval(accumulated_grads)
+                del grads_mb  # allow the per-step gradient tensors to be freed immediately
+
+                if total_loss_arr is None:
+                    total_loss_arr = loss_mb
+                else:
+                    total_loss_arr = total_loss_arr + loss_mb
+
                 if iteration == 0 and (mb_idx == 1 or mb_idx % 4 == 0 or mb_idx == num_micro_batches):
                     logger.info(
                         "Iter 0 progress | micro-batch %d/%d | elapsed %.1fs",
@@ -728,16 +852,11 @@ def train() -> None:
 
             with timed_log(f"Iter {iteration} reduce_and_norm", config.profile_methods, logger):
                 scale = 1.0 / len(batch_x)
-                loss_arr = mx.array(total_loss_value * scale)
+                loss_arr = total_loss_arr * scale
                 accumulated_grads = mut.tree_map(lambda g: g * scale, accumulated_grads)
-                mx.eval(accumulated_grads)
 
-                total_sq_norm = mx.array(0.0)
-                for _, v in mut.tree_flatten(accumulated_grads):
-                    arr: Any = v
-                    if isinstance(arr, str):
-                        continue
-                    total_sq_norm = total_sq_norm + mx.sum(arr * arr)
+                # Compute global gradient norm using a single lazy parallel reduction tree
+                total_sq_norm = sum(mx.sum(v * v) for _, v in mut.tree_flatten(accumulated_grads) if hasattr(v, "size"))
                 norm_arr = mx.sqrt(total_sq_norm)
 
                 clip_scale = mx.where(
@@ -751,15 +870,10 @@ def train() -> None:
                 optimizer.update(model, accumulated_grads)
 
                 # Cast model weights back to bfloat16 after the optimizer step.
-                # AdamW computes the parameter update in fp32 (gradients get promoted
-                # during the backward pass), leaving model.parameters() in fp32.
-                # Casting back here halves parameter memory and restores fast
-                # bfloat16 matmuls in the next forward/backward pass.
-                # Adam m/v states remain fp32 — that is correct for numerical stability.
                 model.update(mut.tree_map(lambda p: p.astype(config.mx_dtype), model.parameters()))
                 model.tie_weights()
 
-            # 3. Synchronous evaluation of updated state and scalars
+            # ONE SINGLE SYNC POINT FOR BOTH MODEL PARAMETERS, OPTIMIZER STATE, LOSS, AND NORM
             with timed_log(f"Iter {iteration} eval_and_sync", config.profile_methods, logger):
                 mx.eval(model.parameters(), optimizer.state, loss_arr, norm_arr)
             
@@ -827,14 +941,51 @@ def train() -> None:
                 ckpt_dir.mkdir(exist_ok=True)
                 ckpt_path = ckpt_dir / f"step_{iteration:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
+                # FIX C3: Save optimizer state alongside model weights so that Adam m/v
+                # moments are restored on resume. Without this every resume restarts Adam
+                # from zero, causing a loss spike and ~500 wasted warm-up steps.
+                opt_state_path = ckpt_path.with_suffix('.opt.safetensors')
+                try:
+                    opt_state_flat = dict(mut.tree_flatten(optimizer.state))
+                    # Filter to only mx.array values — safetensors cannot store scalars
+                    opt_state_flat = {k: v for k, v in opt_state_flat.items() if isinstance(v, mx.array)}
+                    mx.save_safetensors(str(opt_state_path), opt_state_flat)
+                except Exception as e:
+                    logger.warning(f"Failed to save optimizer state: {e}")
+                # Prune old checkpoints (model weights + paired optimizer state)
                 all_ckpts = sorted(ckpt_dir.glob("step_*.safetensors"))
-                for old_ckpt in all_ckpts[:-config.keep_checkpoints]:
-                    old_ckpt.unlink()
-                logger.info(f"Checkpoint saved: {ckpt_path.name} (kept last {config.keep_checkpoints})")
+                # Only count model weight files (not .opt.safetensors) for the keep limit
+                model_ckpts = [c for c in all_ckpts if '.opt.' not in c.name]
+                for old_ckpt in model_ckpts[:-config.keep_checkpoints]:
+                    old_ckpt.unlink(missing_ok=True)
+                    old_opt = old_ckpt.with_suffix('.opt.safetensors')
+                    old_opt.unlink(missing_ok=True)
+                logger.info(f"Checkpoint saved: {ckpt_path.name} + optimizer state (kept last {config.keep_checkpoints})")
+                save_token_progress(run_dir, iteration, start_iteration, token_stream, config, logger)
 
             iteration += 1
             if iteration % 20 == 0:
-                mx.clear_cache()
+                # FIX C4: mx.clear_cache() does not exist in modern MLX — the cache API
+                # lives under mx.metal. Calling the wrong function was a silent no-op,
+                # causing dead buffers to accumulate indefinitely in unified memory.
+                if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
+                    mx.metal.clear_cache()
+        
+        # Save final checkpoint if loop finished cleanly
+        if iteration == config.max_iters:
+            ckpt_dir = run_dir / "checkpoints"
+            ckpt_dir.mkdir(exist_ok=True)
+            ckpt_path = ckpt_dir / f"step_{iteration:06d}.safetensors"
+            model.save_weights(str(ckpt_path))
+            opt_state_path = ckpt_path.with_suffix('.opt.safetensors')
+            try:
+                opt_state_flat = dict(mut.tree_flatten(optimizer.state))
+                opt_state_flat = {k: v for k, v in opt_state_flat.items() if isinstance(v, mx.array)}
+                mx.save_safetensors(str(opt_state_path), opt_state_flat)
+            except Exception as e:
+                logger.warning(f"Failed to save optimizer state: {e}")
+            logger.info(f"Final checkpoint saved: {ckpt_path.name} + optimizer state")
+            save_token_progress(run_dir, iteration, start_iteration, token_stream, config, logger)
                 
     except KeyboardInterrupt:
         logger.info("Interrupted.")

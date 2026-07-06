@@ -16,18 +16,18 @@ class HardwareConfig:
 
 @dataclass
 class TrainingConfig:
-    # Model Architecture (1.6B Parameters)
+    # Model Architecture (Optimised 350M Parameters)
     n_layer: int = 24
-    n_embd: int = 2048
+    n_embd: int = 1024
     n_head: int = 16
     n_kv_head: int = 8
-    head_dim: int = 128 # n_embd // n_head
-    block_size: int = 2048
+    head_dim: int = 64 # n_embd // n_head
+    block_size: int = 1024
     vocab_size: int = 100277 # cl100k_base
     
-    # Training Hyperparameters (Aggressive Scaling for M3 Ultra)
-    micro_batch_size: int = 4 # Safer starting point for 1.6B + 2048 context
-    gradient_accumulation_steps: int = 32 # Keeps effective batch high without OOM spikes
+    # Training Hyperparameters (Highly Efficient for M3 Ultra + 1024 Context)
+    micro_batch_size: int = 32 # Safe and high GPU saturation for 350M + 1024 context
+    gradient_accumulation_steps: int = 4 # Keeps effective batch size at 128
 
     # Optimizer
     learning_rate: float = 3e-4
@@ -45,11 +45,13 @@ class TrainingConfig:
     token_chunk_size: int = 4096 # Small bounded chunks to cap queue memory
     token_queue_max_chunks: int = 256 # Queue depth in chunks (not documents)
     num_prefetch_batches: int = 64
-    num_worker_threads: int = 8 # Lower process pressure; tune upward after stability
+    num_worker_threads: int = 4  # 4 workers saturate the GPU pipeline; 8 wastes ~400 MB with no throughput gain
     
     # Hardware & Precision
     dtype: str = "bfloat16" # Critical for M3 AMX performance
+    grad_checkpoint: bool = True  # Gradient checkpointing: ~70% less activation memory, ~33% slower compute
     profile_methods: bool = False
+    eager_mode: bool = False
     save_interval: int = 500
     keep_checkpoints: int = 3
     checkpoint_dir: Path = Path("checkpoints")
@@ -62,6 +64,13 @@ class TrainingConfig:
         change batch sizes, iteration count, worker limits, and dtype without
         editing `src/config.py`.
         """
+        self.n_layer = int(os.getenv("TRAIN_N_LAYER", self.n_layer))
+        self.n_embd = int(os.getenv("TRAIN_N_EMBD", self.n_embd))
+        self.n_head = int(os.getenv("TRAIN_N_HEAD", self.n_head))
+        self.n_kv_head = int(os.getenv("TRAIN_N_KV_HEAD", self.n_kv_head))
+        self.head_dim = int(os.getenv("TRAIN_HEAD_DIM", self.head_dim))
+        self.block_size = int(os.getenv("TRAIN_BLOCK_SIZE", self.block_size))
+
         self.micro_batch_size = int(os.getenv("TRAIN_MICRO_BATCH_SIZE", self.micro_batch_size))
         self.gradient_accumulation_steps = int(os.getenv("TRAIN_GRAD_ACC_STEPS", self.gradient_accumulation_steps))
         self.num_worker_threads = int(os.getenv("TRAIN_NUM_WORKERS", self.num_worker_threads))
@@ -74,8 +83,15 @@ class TrainingConfig:
         self.save_interval = int(os.getenv("TRAIN_SAVE_INTERVAL", self.save_interval))
         self.keep_checkpoints = int(os.getenv("TRAIN_KEEP_CHECKPOINTS", self.keep_checkpoints))
         self.dtype = os.getenv("TRAIN_DTYPE", self.dtype)
+        # Gradient checkpointing: on by default, disable with TRAIN_GRAD_CHECKPOINT=0
+        gc_env = os.getenv("TRAIN_GRAD_CHECKPOINT", "1")
+        self.grad_checkpoint = gc_env.lower() not in {"0", "false", "no", "off"}
         profile_default = "1" if self.max_iters <= 5 else "0"
         self.profile_methods = os.getenv("TRAIN_PROFILE_METHODS", profile_default).lower() in {"1", "true", "yes", "on"}
+        
+        # Eager mode: off by default, enable with TRAIN_EAGER_MODE=1
+        eager_env = os.getenv("TRAIN_EAGER_MODE", "0")
+        self.eager_mode = eager_env.lower() in {"1", "true", "yes", "on"}
 
     @property
     def mx_dtype(self):

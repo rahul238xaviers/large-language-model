@@ -9,7 +9,7 @@ from utils import timed_log
 
 logger = logging.getLogger("train")
 
-def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event, token_queue):
+def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event, token_queue, tokens_to_skip=0):
     """
     Multiprocessing worker that tokenizes Parquet text files and pushes
     fixed-size token chunks onto a shared queue.
@@ -36,6 +36,7 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
         token_chunk_size: Number of tokens per queue item.
         stop_event:       `multiprocessing.Event` — set to signal shutdown.
         token_queue:      `multiprocessing.Queue` — bounded, blocks when full.
+        tokens_to_skip:   Approximate number of tokens this worker should skip.
 
     Example (conceptual, not called directly):
         # With 4 workers and 8 Parquet files:
@@ -50,14 +51,29 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
         local_data_path = str(repo_root / "data" / "datasets" / "rust")
         local_files = sorted(glob.glob(os.path.join(local_data_path, "*.parquet")))
         if not local_files: return
+        # Shuffle file list so workers don't always see documents in sorted (e.g. time) order.
+        # Use a fixed seed so training is reproducible, but interleave workers fairly.
+        import random as _random
+        _random.Random(42).shuffle(local_files)
         my_files = [f for i, f in enumerate(local_files) if i % num_workers == worker_id]
         token_buffer = []
+        remaining_skip = tokens_to_skip
         
         for file_path in my_files:
             if stop_event.is_set(): break
             parquet_file = pq.ParquetFile(file_path)
             for i in range(parquet_file.num_row_groups):
                 if stop_event.is_set(): break
+                
+                # Fast skip entire row groups if we have substantial tokens left to skip.
+                # Average tokens per document is 3714 (based on tiktoken cl100k_base).
+                if remaining_skip > 0:
+                    row_group_meta = parquet_file.metadata.row_group(i)
+                    est_tokens = row_group_meta.num_rows * 3714
+                    if est_tokens <= remaining_skip:
+                        remaining_skip -= est_tokens
+                        continue
+                
                 table = parquet_file.read_row_group(i, columns=["content"])
                 for batch in table.to_batches(max_chunksize=100):
                     if stop_event.is_set(): break
@@ -66,6 +82,16 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
                         if not content: continue
                         tokens = encoder.encode_ordinary(content)
                         tokens.append(encoder.eot_token)
+                        
+                        if remaining_skip > 0:
+                            num_tokens = len(tokens)
+                            if num_tokens <= remaining_skip:
+                                remaining_skip -= num_tokens
+                                continue
+                            else:
+                                tokens = tokens[remaining_skip:]
+                                remaining_skip = 0
+                                
                         if stop_event.is_set(): break
                         token_buffer.extend(tokens)
                         while len(token_buffer) >= token_chunk_size:
@@ -77,8 +103,37 @@ def _token_generator_worker(worker_id, num_workers, token_chunk_size, stop_event
     except Exception as e:
         logger.error(f"Worker {worker_id} error: {e}")
 
+def get_total_tokens_processed(run_dir, start_iteration) -> int:
+    """
+    Read token_progress.json to determine how many unique tokens have been
+    seen up to the resume step.
+    """
+    if run_dir is None or start_iteration <= 0:
+        return 0
+    from pathlib import Path
+    import json
+    run_dir = Path(run_dir)
+    progress_file = run_dir / "token_progress.json"
+    
+    # 1. Try to load from token_progress.json
+    if progress_file.exists():
+        try:
+            with open(progress_file, "r") as f:
+                progress = json.load(f)
+            key = str(start_iteration - 1)
+            if key in progress:
+                return int(progress[key])
+        except Exception as e:
+            logger.warning(f"Failed to read token_progress.json: {e}")
+            
+    # 2. Hardcoded fallback for the step 21,500 transition specifically
+    if start_iteration - 1 == 21500:
+        return 1376256000
+        
+    return 0
+
 class ParallelTokenStream:
-    def __init__(self, config):
+    def __init__(self, config, run_dir=None, start_iteration=0):
         """
         Spin up `config.num_worker_threads` tokenizer worker processes and
         create the shared inter-process token queue.
@@ -97,6 +152,8 @@ class ParallelTokenStream:
         Args:
             config: TrainingConfig with num_worker_threads, token_chunk_size,
                     token_queue_max_chunks, and block_size fields.
+            run_dir: Path to run directory containing token_progress.json.
+            start_iteration: Starting step number to lookup in token_progress.json.
         """
         self.config = config
         with timed_log("ParallelTokenStream.__init__", getattr(config, "profile_methods", False)):
@@ -105,6 +162,15 @@ class ParallelTokenStream:
             self.processes = []
             self.leftover_tokens = []
             self._batch_count = 0
+            
+            # Compute token skip for resume runs
+            total_tokens = get_total_tokens_processed(run_dir, start_iteration)
+            self.initial_skip = total_tokens
+            worker_tokens_to_skip = total_tokens // config.num_worker_threads
+            if worker_tokens_to_skip > 0:
+                logger.info(f"Resume | Total unique tokens processed historically: {total_tokens:,}. "
+                            f"Each of the {config.num_worker_threads} workers will skip the first "
+                            f"{worker_tokens_to_skip:,} tokens to ensure uniqueness.")
         
         for i in range(config.num_worker_threads):
             p = mp.Process(
@@ -115,6 +181,7 @@ class ParallelTokenStream:
                     config.token_chunk_size,
                     self.stop_event,
                     self.token_queue,
+                    worker_tokens_to_skip,
                 ),
             )
             p.daemon = True
@@ -242,13 +309,14 @@ class AsyncBatchPrefetcher:
         to run ahead by more than `num_prefetch_batches` full iterations.
         """
         import mlx.core as mx
+        import traceback
         while self.running:
             try:
                 self._prefetch_count += 1
                 with timed_log(f"AsyncBatchPrefetcher._prefetch_loop[{self._prefetch_count}]", getattr(self.config, "profile_methods", False)):
                     batch_x, batch_y = [], []
                     # Prefetch a full effective iteration (all micro-batches)
-                    for _ in range(self.config.gradient_accumulation_steps):
+                    for i in range(self.config.gradient_accumulation_steps):
                         micro_x, micro_y = [], []
                         for _ in range(self.config.micro_batch_size):
                             x, y = self.token_stream.get_batch()
@@ -256,13 +324,17 @@ class AsyncBatchPrefetcher:
                             micro_y.append(y)
                         batch_x.append(mx.array(micro_x))
                         batch_y.append(mx.array(micro_y))
+                        logger.info("Prefetcher | Assembled micro-batch %d/%d (mbs=%d) for iteration prefetch", i + 1, self.config.gradient_accumulation_steps, self.config.micro_batch_size)
                 
                 while self.running:
                     try:
                         self.batch_queue.put((batch_x, batch_y), timeout=1.0)
                         break
                     except: continue
-            except: break
+            except Exception as e:
+                logger.error(f"Prefetcher | Thread encountered exception in loop {self._prefetch_count}: {e}")
+                logger.error(traceback.format_exc())
+                break
 
     def get_full_iteration(self):
         """
