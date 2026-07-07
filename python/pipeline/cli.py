@@ -396,13 +396,18 @@ def cmd_train_pretrain(args: argparse.Namespace) -> None:
     # Register output artefacts produced by the Trainer
     train_dir = ctx.run_dir / "training"
     metrics_path = train_dir / "metrics.csv"
+    if not metrics_path.exists():
+        metrics_path = ctx.run_dir / "metrics.csv" # Legacy fallback
     if metrics_path.exists():
         registry.register("training", "metrics", metrics_path)
 
     ckpt_dir = train_dir / "checkpoints"
-    for ckpt in sorted(ckpt_dir.glob("step_*.safetensors")):
-        key = ckpt.stem   # e.g. step_0010000
-        registry.register("training", key, ckpt)
+    if not ckpt_dir.exists() or not list(ckpt_dir.glob("step_*.safetensors")):
+         ckpt_dir = ctx.run_dir / "checkpoints" # Legacy fallback
+    if ckpt_dir.exists():
+        for ckpt in sorted(ckpt_dir.glob("step_*.safetensors")):
+            key = ckpt.stem   # e.g. step_0010000
+            registry.register("training", key, ckpt)
 
     logger.info("Stage 5 complete.  Run ID: %s", ctx.run_id)
     print(ctx.run_id)

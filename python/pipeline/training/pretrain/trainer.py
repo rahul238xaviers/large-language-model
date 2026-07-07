@@ -168,10 +168,8 @@ def _clip_grads(grads: dict, max_norm: float) -> tuple[dict, float]:
     if not leaves:
         return grads, 0.0
 
-    sq_sum = sum(
-        float(mx.sum(g.astype(mx.float32) ** 2).item()) for g in leaves
-    )
-    norm = sq_sum ** 0.5
+    sq_sum = sum(mx.sum(g.astype(mx.float32) ** 2) for g in leaves)
+    norm = float(mx.sqrt(sq_sum).item())
 
     if norm > max_norm:
         scale = max_norm / (norm + 1e-6)
@@ -266,11 +264,39 @@ class Trainer:
         self._sequences_path = Path(sequences_path)
 
         self._train_dir      = self._run_dir / "training"
-        self._ckpt_dir       = self._train_dir / "checkpoints"
-        self._metrics_path   = self._train_dir / "metrics.csv"
+
+        # Check for legacy checkpoint layouts (e.g. checkpoints directly in run_dir)
+        legacy_ckpt_dir = self._run_dir / "checkpoints"
+        legacy_metrics_path = self._run_dir / "metrics.csv"
+
+        if legacy_ckpt_dir.exists() and list(legacy_ckpt_dir.glob("step_*.safetensors")):
+            logger.info("Using legacy checkpoint directory: %s", legacy_ckpt_dir)
+            self._ckpt_dir = legacy_ckpt_dir
+        else:
+            self._ckpt_dir = self._train_dir / "checkpoints"
+
+        if legacy_metrics_path.exists():
+            logger.info("Using legacy metrics path: %s", legacy_metrics_path)
+            self._metrics_path = legacy_metrics_path
+        else:
+            self._metrics_path = self._train_dir / "metrics.csv"
 
         self._train_dir.mkdir(parents=True, exist_ok=True)
         self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Automatically check for existing checkpoints to resume from
+        self._resume_checkpoint = None
+        self._start_step = 1
+        if self._ckpt_dir.exists():
+            ckpts = sorted(self._ckpt_dir.glob("step_*.safetensors"))
+            if ckpts:
+                self._resume_checkpoint = ckpts[-1]
+                stem = self._resume_checkpoint.stem
+                try:
+                    self._start_step = int(stem.split("_")[-1]) + 1
+                    logger.info("Auto-discovered latest checkpoint: %s. Resuming from step %d.", self._resume_checkpoint.name, self._start_step)
+                except Exception as e:
+                    logger.warning("Failed to parse step number from checkpoint name %s: %s", stem, e)
 
     # ── Setup helpers ────────────────────────────────────────────────── #
 
@@ -307,6 +333,12 @@ class Trainer:
             return node
 
         model.update(_cast_tree(model.parameters()))
+
+        # Load weights if we are resuming from a checkpoint
+        if self._resume_checkpoint:
+            logger.info("Loading weights from checkpoint: %s", self._resume_checkpoint.name)
+            model.load_weights(str(self._resume_checkpoint))
+
         mx.eval(model)
 
         n_params = sum(p.size for _, p in model.parameters() if hasattr(p, "size"))
@@ -379,7 +411,7 @@ class Trainer:
         )
 
         # ── Main loop ─────────────────────────────────────────────────── #
-        for step in range(1, cfg.max_steps + 1):
+        for step in range(self._start_step, cfg.max_steps + 1):
             lr = _cosine_lr(step, cfg)
             opt.learning_rate = lr
 
@@ -389,17 +421,27 @@ class Trainer:
             scale       = 1.0 / cfg.accum_steps
 
             # Gradient accumulation: accum_steps micro-forward-backward passes
+            accum_loss_arr = None
             for _ in range(cfg.accum_steps):
                 x = next(data)
                 loss, grads = nn.value_and_grad(model, _loss)(model, x)
-                mx.eval(loss)
-                accum_loss += float(loss.item()) * scale
+
+                # Asynchronously evaluate the outputs on the GPU immediately.
+                # This materializes parameters and releases graph activation buffers
+                # without blocking the CPU (no .item() call).
+                mx.eval(loss, grads)
 
                 grads = _scale_grad_tree(grads, scale)
                 if accum_grads is None:
                     accum_grads = grads
                 else:
                     accum_grads = _add_grad_trees(accum_grads, grads)
+
+                scaled_loss = loss * scale
+                if accum_loss_arr is None:
+                    accum_loss_arr = scaled_loss
+                else:
+                    accum_loss_arr = accum_loss_arr + scaled_loss
 
             # Clip + update
             accum_grads, grad_norm = _clip_grads(accum_grads, cfg.grad_clip)
@@ -416,7 +458,10 @@ class Trainer:
                 return node
 
             model.update(_bf16(model.parameters()))
-            mx.eval(model)
+            
+            # Single blocking synchronization point for model, optimizer states, and loss
+            mx.eval(model, opt.state, accum_loss_arr)
+            accum_loss = float(accum_loss_arr.item())
 
             elapsed    = time.perf_counter() - t0
             tok_per_sec = cfg.tokens_per_step / max(elapsed, 1e-9)

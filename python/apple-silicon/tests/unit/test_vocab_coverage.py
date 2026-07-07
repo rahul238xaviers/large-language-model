@@ -24,8 +24,9 @@ def process_file(file_path):
 def test_vocab_coverage():
     # Find dataset path
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    local_data_path = os.path.join(script_dir, "../../../data/datasets/rust")
-    local_files = sorted(glob.glob(os.path.join(local_data_path, "*.parquet")))
+    local_data_path = os.path.join(script_dir, "../../../../data/datasets/rust")
+    # Limit to first 2 files to prevent OOM / memory exhaustion during unit testing
+    local_files = sorted(glob.glob(os.path.join(local_data_path, "*.parquet")))[:2]
     
     assert len(local_files) > 0, f"No training parquet files found in {local_data_path}!"
     
