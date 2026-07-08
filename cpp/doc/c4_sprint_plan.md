@@ -96,12 +96,12 @@ class Tensor {
     // Shape dispatcher inside selects: CPU cblas_sgemm, gemm_gqa, gemm_proj, or gemm_ffn
 };
 
-// MetalMatmul.hpp — GPU compute layer (Sprint 6b)
-namespace metal_compute {
+// MetalBridge.hpp — GPU compute layer (Sprint 6b)
+namespace metal_bridge {
     void initialize();         // one-time device + pipeline state setup
     bool is_available();
-    void gemm_gqa(const float* Q, const float* K, const float* V, float* out,
-                  const GQAParams& p);
+    void gemm_gqa(const float* q, const float* k, const float* v, float* out,
+                  size_t batch, size_t heads, size_t seq_len, size_t head_dim);
     void gemm_proj(const float* A, const float* B, float* C, size_t M, size_t N, size_t K);
     void gemm_ffn(const float* A, const float* B, float* C, size_t M, size_t N, size_t K);
     void heterogeneous_op_split(std::function<void()> gpu_task,
@@ -255,14 +255,14 @@ Attention backward:
 **New deliverables:**
 
 ```
-cpp/metal/
+cpp/src/gpu_kernel/
   gemm_gqa.metal          Fused QK^T + softmax + V
   gemm_proj.metal         Weight-resident projection streaming
   gemm_ffn.metal          Max arithmetic intensity GEMM (128×128 tiles)
-cpp/include/
-  MetalMatmul.hpp         C++ interface + shape-aware dispatcher
-cpp/src/
-  MetalMatmul.mm          Objective-C++ bridge (Metal API calls)
+cpp/include/gpu_kernel/
+  MetalBridge.hpp         C++ interface + shape-aware dispatcher
+cpp/src/gpu_kernel/
+  MetalBridge.mm          Objective-C++ bridge (Metal API calls)
 ```
 
 **CMake changes needed:**
@@ -270,11 +270,11 @@ cpp/src/
 ```cmake
 # Compile Metal shaders to .metallib at build time
 find_program(XCRUN xcrun)
-add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/matmul.metallib ...)
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/default.metallib ...)
 
 # Link Metal + Foundation frameworks
 target_link_libraries(data_ingestion PUBLIC "-framework Metal" "-framework Foundation")
-target_sources(data_ingestion PRIVATE cpp/src/MetalMatmul.mm)
+target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 ```
 
 **Verification gates:**

@@ -11,15 +11,15 @@
 
 #include "Tensor.hpp"
 #define ACCELERATE_NEW_LAPACK
+#include "gpu_kernel/MetalBridge.hpp"
 #include <Accelerate/Accelerate.h>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
-#include <chrono>
-#include <cstdlib>
-#include "gpu_kernel/MetalBridge.hpp"
 
 /**
  * @brief Construct a new empty Tensor object.
@@ -48,7 +48,8 @@ Tensor::Tensor(const std::vector<size_t> &shape)
 }
 
 /**
- * @brief Construct a new Tensor object with shape, initialized to a scalar value.
+ * @brief Construct a new Tensor object with shape, initialized to a scalar
+ * value.
  *
  * @param shape Vector containing dimension sizes.
  * @param val Scalar value to fill the tensor with.
@@ -59,7 +60,8 @@ Tensor::Tensor(const std::vector<size_t> &shape, float val)
 }
 
 /**
- * @brief Precomputes the row-major index offset multiplier (stride) for each dimension.
+ * @brief Precomputes the row-major index offset multiplier (stride) for each
+ * dimension.
  */
 void Tensor::compute_strides() {
   strides_.resize(shape_.size(), 1);
@@ -73,7 +75,8 @@ void Tensor::compute_strides() {
 }
 
 /**
- * @brief Flattens multi-dimensional indices into a single row-major 1D index offset.
+ * @brief Flattens multi-dimensional indices into a single row-major 1D index
+ * offset.
  *
  * @param indices Vector of indices per dimension.
  * @return size_t Flat index offset.
@@ -225,7 +228,7 @@ void Tensor::add_(const Tensor &other) {
   }
   // vDSP_vadd: NEON-vectorized element-wise addition
   vDSP_vadd(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
-             static_cast<vDSP_Length>(data_.size()));
+            static_cast<vDSP_Length>(data_.size()));
 }
 
 /**
@@ -241,7 +244,7 @@ void Tensor::mul_(const Tensor &other) {
   }
   // vDSP_vmul: NEON-vectorized element-wise multiply
   vDSP_vmul(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
-             static_cast<vDSP_Length>(data_.size()));
+            static_cast<vDSP_Length>(data_.size()));
 }
 
 /**
@@ -254,7 +257,7 @@ void Tensor::mul_(const Tensor &other) {
 void Tensor::scale_(float factor) {
   // vDSP_vsmul: NEON-vectorized scalar multiply
   vDSP_vsmul(data_.data(), 1, &factor, data_.data(), 1,
-               static_cast<vDSP_Length>(data_.size()));
+             static_cast<vDSP_Length>(data_.size()));
 }
 
 /**
@@ -367,7 +370,7 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *w_data = other.data().data();
     float *res_data = result.data().data();
 
-    const char* gpu_enabled_env = std::getenv("GPU_ENABLED");
+    const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
     bool use_gpu = false;
     if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
       metal_bridge::initialize();
@@ -378,18 +381,28 @@ Tensor Tensor::matmul(const Tensor &other) const {
 
     if (use_gpu) {
       auto start = std::chrono::high_resolution_clock::now();
-      metal_bridge::gemm_ffn(x_data, w_data, res_data, M, N, K);
+      if (K == N) {
+        metal_bridge::gemm_proj(x_data, w_data, res_data, M, N, K);
+      } else {
+        metal_bridge::gemm_ffn(x_data, w_data, res_data, M, N, K);
+      }
       auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_gpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      metal_bridge::accum_gpu_time_ms +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+              .count() /
+          1000.0;
       metal_bridge::count_gpu_calls++;
     } else {
       auto start = std::chrono::high_resolution_clock::now();
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
-                  static_cast<int>(N), static_cast<int>(K), 1.0f, x_data,
-                  static_cast<int>(K), w_data, static_cast<int>(N), 0.0f,
-                  res_data, static_cast<int>(N));
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                  static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                  1.0f, x_data, static_cast<int>(K), w_data,
+                  static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
       auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+      metal_bridge::accum_cpu_time_ms +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+              .count() /
+          1000.0;
       metal_bridge::count_cpu_calls++;
     }
 
@@ -449,15 +462,15 @@ Tensor Tensor::matmul(const Tensor &other) const {
 
     // Use Apple Accelerate BLAS for SIMD-vectorized matrix multiplication
     auto start = std::chrono::high_resolution_clock::now();
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                1.0f,
-                dataA, static_cast<int>(K),
-                dataB, static_cast<int>(N),
-                0.0f,
-                dataC, static_cast<int>(N));
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
+                static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
+                static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
+                static_cast<int>(N));
     auto end = std::chrono::high_resolution_clock::now();
-    metal_bridge::accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+    metal_bridge::accum_cpu_time_ms +=
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count() /
+        1000.0;
     metal_bridge::count_cpu_calls++;
   }
 

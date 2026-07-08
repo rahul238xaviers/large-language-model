@@ -106,6 +106,7 @@ kernel void gemm_proj(
     //Example would be :- if M=128, N=256, K=512, threads = 64
     // 64 thread would mean 2 SIMD groups in Apple Silicon.
     for(uint k = 0; k < dims.z; k+= TILE_K) {
+      
       for(uint i =0; i < TILE_K; i++) { 
         if(k + i >= dims.z || dims.x <= global_row) {
           shared_A[thread_col][i]  = 0.0f;
@@ -125,14 +126,27 @@ kernel void gemm_proj(
            shared_B[i][thread_col] = B[(k + i )* dims.y + global_col];
          }
       }
+      // First Barrier: Wait for loading to finish
       threadgroup_barrier(mem_flags::mem_threadgroup);
-    } 
-
-    for(size_t i = 0; i < TILE_K ; i++) {
-      for(size_t j = 0; j < TILE_M ; j++) {
-        accum_array[j]+=shared_A[j][i] * shared_B[i][thread_col];
+      for(size_t i = 0; i < TILE_K ; i++) {
+        for(size_t j = 0; j < TILE_M ; j++) {
+          accum_array[j]+=shared_A[j][i] * shared_B[i][thread_col];
+        }
       }
-    }
+      // Second Barrier: Wait for computation to finish
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      } 
+
+      //Write the accum array back to the Matrix C in the RAM/Unified memory
+
+      for(uint j=0; j< TILE_M; j++) {
+
+        if(tile_start_row + j <dims.x && global_col < dims.y){
+          C[(tile_start_row + j) * dims.y + global_col] = accum_array[j];
+        }
+      }
+
+
 
     
 

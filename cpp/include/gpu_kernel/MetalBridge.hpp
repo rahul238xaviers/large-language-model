@@ -1,6 +1,5 @@
 #pragma once
 #include <cstddef>
-#include <vector>
 
 namespace metal_bridge {
 
@@ -10,8 +9,6 @@ namespace metal_bridge {
  * @note Must be called before any other Metal operations
  */
 void initialize();
-
-
 
 /**
  * @brief Multiply matrices A [M x K] and B [K x N] to produce C [M x N] on GPU
@@ -23,10 +20,29 @@ void initialize();
  * @param N Number of columns in B and C
  * @param K Number of columns in A and rows in B
  */
-void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N, size_t K);
+void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
+              size_t K);
 
 /**
- * @brief Check if Metal device and FFN pipeline state are initialized and available
+ * @brief Multiply matrices A [M x K] and B [K x N] to produce C [M x N] on GPU
+ *        using the custom projection GEMM kernel (weight-resident projection).
+ *
+ * @note Optimized specifically for projection layers where weight Matrix B [K x
+ * N] represents the transformer projection weight.
+ *
+ * @param a Pointer to raw Matrix A memory on host (size M * K)
+ * @param b Pointer to raw Matrix B memory on host (size K * N)
+ * @param c Pointer to raw Matrix C memory on host (size M * N)
+ * @param M Number of rows in A and C
+ * @param N Number of columns in B and C
+ * @param K Number of columns in A and rows in B
+ */
+void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
+               size_t K);
+
+/**
+ * @brief Check if Metal device and FFN pipeline state are initialized and
+ * available
  *
  * @return true if available, false otherwise
  */
