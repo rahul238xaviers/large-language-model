@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 namespace metal_bridge {
 
@@ -9,6 +10,14 @@ namespace metal_bridge {
  * @note Must be called before any other Metal operations
  */
 void initialize();
+
+struct GQAParams {
+  uint32_t batch;
+  uint32_t n_heads;
+  uint32_t n_kv_heads;
+  uint32_t seq_len;
+  uint32_t head_dim;
+};
 
 /**
  * @brief Multiply matrices A [M x K] and B [K x N] to produce C [M x N] on GPU
@@ -58,5 +67,16 @@ extern size_t count_cpu_calls;
  * @brief Reset cumulative profiling statistics
  */
 void reset_profile_stats();
+
+/**
+ * @brief GQA kernel
+ * @param gqa_params
+ * @param q [batch, seq_len, n_heads, head_dim]
+ * @param k [batch, seq_len, n_kv_heads, head_dim]
+ * @param v [batch, seq_len, n_kv_heads, head_dim]
+ * @param out_gqa [batch, seq_len, n_heads, head_dim]
+ */
+void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
+              const float *v, float *out_gqa);
 
 } // namespace metal_bridge

@@ -145,11 +145,6 @@ kernel void gemm_proj(
           C[(tile_start_row + j) * dims.y + global_col] = accum_array[j];
         }
       }
-
-
-
-    
-
     }
 
     
