@@ -245,10 +245,8 @@ int main() {
 
     set_gpu_enabled(true);
     Tensor out_gpu = attn.forward(x, rope);
-
-    std::cout << "[DEBUG] CPU output first 5 elements: ";
+   
     for (int i = 0; i < 5; ++i) std::cout << out_cpu.data()[i] << " ";
-    std::cout << "\n[DEBUG] GPU output first 5 elements: ";
     for (int i = 0; i < 5; ++i) std::cout << out_gpu.data()[i] << " ";
     std::cout << std::endl;
 
