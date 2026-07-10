@@ -160,19 +160,42 @@ target_link_libraries(test_trainer PUBLIC
 # 1. Find the xcrun tool on macOS
 find_program(XCRUN xcrun)
 
-# 2. Add custom commands to compile our shaders
+# 2. Configure maximum sequence length for the GQA shader
+set(MAX_SEQ_LEN 2048 CACHE STRING "Maximum sequence length for GQA attention kernel")
+
+# 3. Add custom commands to compile our shaders
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             -o ${CMAKE_BINARY_DIR}/gemm_ffn.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_proj.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            -DMAX_SEQ_LEN=${MAX_SEQ_LEN}
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_gqa.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
+            ${CMAKE_BINARY_DIR}/gemm_proj.air
+            ${CMAKE_BINARY_DIR}/gemm_gqa.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)
 add_dependencies(data_ingestion compile_shaders)
+
+# 4. Define our GPU kernels verification test executable
+add_executable(test_gpu_kernels
+    cpp/tests/test_gpu_kernels.cpp
+)
+# Link it against our library
+target_link_libraries(test_gpu_kernels PUBLIC
+    data_ingestion
+)
 
 

@@ -150,10 +150,12 @@ void Trainer::train() {
     float lr = get_scheduled_lr(step);
     float loss = 0.0f;
 
+    metal_bridge::start_batch();
     run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
                       grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
                       grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
                       grad_output_projection, loss);
+    metal_bridge::commit_batch();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;

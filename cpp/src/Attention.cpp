@@ -1,6 +1,7 @@
 /**
  * @file Attention.cpp
- * @brief Implementation of the GQA (Grouped Query Attention) layer forward & backward passes
+ * @brief Implementation of the GQA (Grouped Query Attention) layer forward &
+ * backward passes
  *
  * ============================================================================
  *                             PIPELINE FLOW & PURPOSE
@@ -13,10 +14,11 @@
 #include "RMSNorm.hpp"
 #include "Tensor.hpp"
 #define ACCELERATE_NEW_LAPACK
+#include "gpu_kernel/MetalBridge.hpp"
 #include <Accelerate/Accelerate.h>
-#include <dispatch/dispatch.h>
 #include <cmath>
 #include <cstddef>
+#include <dispatch/dispatch.h>
 #include <stdexcept>
 #include <vector>
 
@@ -36,7 +38,7 @@ Attention::Attention(const ModelConfig &config)
       Wk_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
       Wv_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
       Wo_({config.n_heads * config.head_dim, config.hidden_dim}) {
-  
+
   if (config.n_kv_heads > config.n_heads) {
     throw std::invalid_argument("n_kv_heads cannot be greater than n_heads");
   }
@@ -169,6 +171,15 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
         "Input tensor hidden dim must match model config");
   }
 
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
   RMSNorm rms_norm(config_.hidden_dim, config_.rms_norm_eps);
 
   Tensor x_norm = rms_norm.forward(x);
@@ -191,66 +202,97 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
   Tensor attn_output({batch, seq_len, config_.hidden_dim}, 0.0f);
 
   // GCD-parallel dispatch over (batch × n_heads): each (b,h) pair writes to
-  // non-overlapping output channels [h*head_dim, (h+1)*head_dim), so no mutex needed.
-  const float* q4_ptr = q4.data().data();
-  const float* k4_ptr = k4.data().data();
-  const float* v4_ptr = v4.data().data();
-  float*       out_ptr = attn_output.data().data();
+  // non-overlapping output channels [h*head_dim, (h+1)*head_dim), so no mutex
+  // needed.
+  const float *q4_ptr = q4.data().data();
+  const float *k4_ptr = k4.data().data();
+  const float *v4_ptr = v4.data().data();
+  float *out_ptr = attn_output.data().data();
 
-  const size_t n_h  = config_.n_heads;
-  const size_t h_d  = config_.head_dim;
+  const size_t n_h = config_.n_heads;
+  const size_t h_d = config_.head_dim;
   const size_t n_kv = config_.n_kv_heads;
 
-  dispatch_apply(batch * n_h,
-                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
-                 ^(size_t bh) {
-    const size_t b    = bh / n_h;
-    const size_t h    = bh % n_h;
-    const size_t kv_h = h / gqa_factor;
+  if (use_gpu) {
 
-    std::vector<float> scores(seq_len, 0.0f); // thread-local scratch
+    metal_bridge::GQAParams gqa_params = {
+        .batch = static_cast<uint32_t>(batch),
+        .n_q_heads = static_cast<uint32_t>(n_h),
+        .n_kv_heads = static_cast<uint32_t>(n_kv),
+        .seq_len = static_cast<uint32_t>(seq_len),
+        .head_dim = static_cast<uint32_t>(h_d),
+    };
+    auto start = std::chrono::high_resolution_clock::now();
+    metal_bridge::gemm_gqa(gqa_params, q4_ptr, k4_ptr, v4_ptr, out_ptr);
+    auto end = std::chrono::high_resolution_clock::now();
+    metal_bridge::accum_gpu_time_ms +=
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count() /
+        1000.0;
+    metal_bridge::count_gpu_calls++;
+  } else {
+    dispatch_apply(
+        batch * n_h, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
+        ^(size_t bh) {
+          const size_t b = bh / n_h;
+          const size_t h = bh % n_h;
+          const size_t kv_h = h / gqa_factor;
 
-    for (size_t s_q = 0; s_q < seq_len; ++s_q) {
-      const float* q_row = q4_ptr + (b * n_h * seq_len + h * seq_len + s_q) * h_d;
+          std::vector<float> scores(seq_len, 0.0f); // thread-local scratch
 
-      float max_score = -INFINITY;
-      for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-        const float* k_row = k4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
-        float dot = 0.0f;
-        for (size_t d = 0; d < h_d; ++d) dot += q_row[d] * k_row[d];
-        scores[s_k] = dot * scale;
-        if (scores[s_k] > max_score) max_score = scores[s_k];
-      }
+          for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+            const float *q_row =
+                q4_ptr + (b * n_h * seq_len + h * seq_len + s_q) * h_d;
 
-      // Stable softmax: compute exp in-place, reuse stored values
-      float sum_exp = 0.0f;
-      for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-        scores[s_k] = std::exp(scores[s_k] - max_score);
-        sum_exp += scores[s_k];
-      }
+            float max_score = -INFINITY;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              const float *k_row =
+                  k4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
+              float dot = 0.0f;
+              for (size_t d = 0; d < h_d; ++d)
+                dot += q_row[d] * k_row[d];
+              scores[s_k] = dot * scale;
+              if (scores[s_k] > max_score)
+                max_score = scores[s_k];
+            }
 
-      // Weighted accumulation — thread-safe: h writes to h*h_d..(h+1)*h_d-1
-      float* out_row = out_ptr + (b * seq_len + s_q) * (n_h * h_d) + h * h_d;
-      for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-        const float prob    = scores[s_k] / sum_exp;
-        const float* v_row  = v4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
-        for (size_t d = 0; d < h_d; ++d) out_row[d] += prob * v_row[d];
-      }
-    }
-  });
+            // Stable softmax: compute exp in-place, reuse stored values
+            float sum_exp = 0.0f;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              scores[s_k] = std::exp(scores[s_k] - max_score);
+              sum_exp += scores[s_k];
+            }
 
+            // Weighted accumulation — thread-safe: h writes to
+            // h*h_d..(h+1)*h_d-1
+            float *out_row =
+                out_ptr + (b * seq_len + s_q) * (n_h * h_d) + h * h_d;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              const float prob = scores[s_k] / sum_exp;
+              const float *v_row =
+                  v4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
+              for (size_t d = 0; d < h_d; ++d)
+                out_row[d] += prob * v_row[d];
+            }
+          }
+        });
+  }
   Tensor out = attn_output.matmul(Wo_);
   return out;
 }
 /**
- * @brief Helper function to perform GQA backward pass calculations for a single query token.
+ * @brief Helper function to perform GQA backward pass calculations for a single
+ * query token.
  *
- * Implements softmax backward and accumulates gradients w.r.t queries, keys, and values.
+ * Implements softmax backward and accumulates gradients w.r.t queries, keys,
+ * and values.
  */
-static void gqa_backward_query_token(
-    size_t b, size_t h, size_t kv_h, size_t s_q, size_t seq_len, size_t head_dim,
-    float scale, const Tensor &q4, const Tensor &k4, const Tensor &v4,
-    const Tensor &grad_attn_output, Tensor &grad_q4, Tensor &grad_k4, Tensor &grad_v4) {
+static void
+gqa_backward_query_token(size_t b, size_t h, size_t kv_h, size_t s_q,
+                         size_t seq_len, size_t head_dim, float scale,
+                         const Tensor &q4, const Tensor &k4, const Tensor &v4,
+                         const Tensor &grad_attn_output, Tensor &grad_q4,
+                         Tensor &grad_k4, Tensor &grad_v4) {
 
   std::vector<float> raw_scores(seq_len);
   std::vector<float> prob(seq_len);
@@ -291,7 +333,8 @@ static void gqa_backward_query_token(
     sum_dP_prob += dP[s_k] * prob[s_k];
   }
 
-  // Step C: Backprop through Softmax and Scaled Dot-Product to grad_q4 & grad_k4
+  // Step C: Backprop through Softmax and Scaled Dot-Product to grad_q4 &
+  // grad_k4
   for (size_t s_k = 0; s_k <= s_q; ++s_k) {
     float dS = prob[s_k] * (dP[s_k] - sum_dP_prob);
     float dS_scaled = dS * scale;
@@ -358,46 +401,53 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
 
   // --- Run the backward recomputed forward pass with GCD parallel dispatch ---
   {
-    const float* q4_ptr = q4.data().data();
-    const float* k4_ptr = k4.data().data();
-    const float* v4_ptr = v4.data().data();
-    float* out_ptr = attn_output.data().data();
+    const float *q4_ptr = q4.data().data();
+    const float *k4_ptr = k4.data().data();
+    const float *v4_ptr = v4.data().data();
+    float *out_ptr = attn_output.data().data();
     const size_t n_h = n_heads;
     const size_t h_d = head_dim;
     const size_t n_kv = n_kv_heads;
 
-    dispatch_apply(batch * n_h,
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
-                   ^(size_t bh) {
-      const size_t b    = bh / n_h;
-      const size_t h    = bh % n_h;
-      const size_t kv_h = h / gqa_factor;
+    dispatch_apply(
+        batch * n_h, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
+        ^(size_t bh) {
+          const size_t b = bh / n_h;
+          const size_t h = bh % n_h;
+          const size_t kv_h = h / gqa_factor;
 
-      std::vector<float> scores(seq_len, 0.0f);
+          std::vector<float> scores(seq_len, 0.0f);
 
-      for (size_t s_q = 0; s_q < seq_len; ++s_q) {
-        const float* q_row = q4_ptr + (b * n_h * seq_len + h * seq_len + s_q) * h_d;
-        float max_score = -INFINITY;
-        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-          const float* k_row = k4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
-          float dot = 0.0f;
-          for (size_t d = 0; d < h_d; ++d) dot += q_row[d] * k_row[d];
-          scores[s_k] = dot * scale;
-          if (scores[s_k] > max_score) max_score = scores[s_k];
-        }
-        float sum_exp = 0.0f;
-        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-          scores[s_k] = std::exp(scores[s_k] - max_score);
-          sum_exp += scores[s_k];
-        }
-        float* out_row = out_ptr + (b * seq_len + s_q) * (n_h * h_d) + h * h_d;
-        for (size_t s_k = 0; s_k <= s_q; ++s_k) {
-          const float prob   = scores[s_k] / sum_exp;
-          const float* v_row = v4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
-          for (size_t d = 0; d < h_d; ++d) out_row[d] += prob * v_row[d];
-        }
-      }
-    });
+          for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+            const float *q_row =
+                q4_ptr + (b * n_h * seq_len + h * seq_len + s_q) * h_d;
+            float max_score = -INFINITY;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              const float *k_row =
+                  k4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
+              float dot = 0.0f;
+              for (size_t d = 0; d < h_d; ++d)
+                dot += q_row[d] * k_row[d];
+              scores[s_k] = dot * scale;
+              if (scores[s_k] > max_score)
+                max_score = scores[s_k];
+            }
+            float sum_exp = 0.0f;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              scores[s_k] = std::exp(scores[s_k] - max_score);
+              sum_exp += scores[s_k];
+            }
+            float *out_row =
+                out_ptr + (b * seq_len + s_q) * (n_h * h_d) + h * h_d;
+            for (size_t s_k = 0; s_k <= s_q; ++s_k) {
+              const float prob = scores[s_k] / sum_exp;
+              const float *v_row =
+                  v4_ptr + (b * n_kv * seq_len + kv_h * seq_len + s_k) * h_d;
+              for (size_t d = 0; d < h_d; ++d)
+                out_row[d] += prob * v_row[d];
+            }
+          }
+        });
   }
 
   // 2. grad_Wo[NH*HD, H] = attn_output[B*S, NH*HD].T @ grad_output[B*S, H]
@@ -405,12 +455,10 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   {
     size_t BS = batch * seq_len;
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                static_cast<int>(n_heads * head_dim), static_cast<int>(hidden_dim),
-                static_cast<int>(BS),
-                1.0f,
+                static_cast<int>(n_heads * head_dim),
+                static_cast<int>(hidden_dim), static_cast<int>(BS), 1.0f,
                 attn_output.data().data(), static_cast<int>(n_heads * head_dim),
-                grad_output.data().data(), static_cast<int>(hidden_dim),
-                0.0f,
+                grad_output.data().data(), static_cast<int>(hidden_dim), 0.0f,
                 grad_Wo.data().data(), static_cast<int>(hidden_dim));
   }
 
@@ -427,9 +475,9 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
     for (size_t h = 0; h < n_heads; ++h) {
       size_t kv_h = h / gqa_factor;
       for (size_t s_q = 0; s_q < seq_len; ++s_q) {
-        gqa_backward_query_token(
-            b, h, kv_h, s_q, seq_len, head_dim, scale, q4, k4, v4,
-            grad_attn_output, grad_q4, grad_k4, grad_v4);
+        gqa_backward_query_token(b, h, kv_h, s_q, seq_len, head_dim, scale, q4,
+                                 k4, v4, grad_attn_output, grad_q4, grad_k4,
+                                 grad_v4);
       }
     }
   }
@@ -451,30 +499,24 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   grad_Wv.fill(0.0f);
   {
     size_t BS = batch * seq_len;
-    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                static_cast<int>(hidden_dim), static_cast<int>(n_heads * head_dim),
-                static_cast<int>(BS),
-                1.0f,
-                x_norm.data().data(), static_cast<int>(hidden_dim),
-                grad_q_proj.data().data(), static_cast<int>(n_heads * head_dim),
-                0.0f,
-                grad_Wq.data().data(), static_cast<int>(n_heads * head_dim));
-    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                static_cast<int>(hidden_dim), static_cast<int>(n_kv_heads * head_dim),
-                static_cast<int>(BS),
-                1.0f,
-                x_norm.data().data(), static_cast<int>(hidden_dim),
-                grad_k_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
-                0.0f,
-                grad_Wk.data().data(), static_cast<int>(n_kv_heads * head_dim));
-    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                static_cast<int>(hidden_dim), static_cast<int>(n_kv_heads * head_dim),
-                static_cast<int>(BS),
-                1.0f,
-                x_norm.data().data(), static_cast<int>(hidden_dim),
-                grad_v_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
-                0.0f,
-                grad_Wv.data().data(), static_cast<int>(n_kv_heads * head_dim));
+    cblas_sgemm(
+        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
+        static_cast<int>(n_heads * head_dim), static_cast<int>(BS), 1.0f,
+        x_norm.data().data(), static_cast<int>(hidden_dim),
+        grad_q_proj.data().data(), static_cast<int>(n_heads * head_dim), 0.0f,
+        grad_Wq.data().data(), static_cast<int>(n_heads * head_dim));
+    cblas_sgemm(
+        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
+        static_cast<int>(n_kv_heads * head_dim), static_cast<int>(BS), 1.0f,
+        x_norm.data().data(), static_cast<int>(hidden_dim),
+        grad_k_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
+        0.0f, grad_Wk.data().data(), static_cast<int>(n_kv_heads * head_dim));
+    cblas_sgemm(
+        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
+        static_cast<int>(n_kv_heads * head_dim), static_cast<int>(BS), 1.0f,
+        x_norm.data().data(), static_cast<int>(hidden_dim),
+        grad_v_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
+        0.0f, grad_Wv.data().data(), static_cast<int>(n_kv_heads * head_dim));
   }
 
   // 9. Compute gradient w.r.t normalized input

@@ -13,7 +13,7 @@ void initialize();
 
 struct GQAParams {
   uint32_t batch;
-  uint32_t n_heads;
+  uint32_t n_q_heads;
   uint32_t n_kv_heads;
   uint32_t seq_len;
   uint32_t head_dim;
@@ -78,5 +78,15 @@ void reset_profile_stats();
  */
 void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
               const float *v, float *out_gqa);
+
+/**
+ * @brief Start a single grouped command buffer batch for the entire forward step.
+ */
+void start_batch();
+
+/**
+ * @brief Commit the active compute encoder and command buffer, and wait for GPU completion once.
+ */
+void commit_batch();
 
 } // namespace metal_bridge

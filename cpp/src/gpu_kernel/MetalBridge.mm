@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <iostream>
 #import <simd/simd.h>
+#include <unordered_map>
 
 namespace metal_bridge {
 
@@ -33,8 +34,18 @@ static id<MTLCommandQueue> commandQueue = nil;
 // tiled FFN GEMM.
 static id<MTLComputePipelineState> pipelineStateFFN = nil;
 static id<MTLComputePipelineState> pipelineStateProj = nil;
+static id<MTLComputePipelineState> pipelineStateGQA = nil;
 
 static bool initialized = false;
+
+static id<MTLCommandBuffer> activeCmdBuffer = nil;
+static id<MTLComputeCommandEncoder> activeEncoder = nil;
+static bool batchActive = false;
+
+// Address-to-Buffer cache mapping raw host pointers to persistent MTLBuffers
+static std::unordered_map<const void*, id<MTLBuffer>> bufferCache;
+
+static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes);
 
 // Profiling statistics definitions
 double accum_gpu_time_ms = 0.0;
@@ -51,7 +62,7 @@ size_t count_cpu_calls = 0;
  */
 bool is_available() {
   return (device != nil) && (pipelineStateFFN != nil) &&
-         (pipelineStateProj != nil);
+         (pipelineStateProj != nil) && (pipelineStateGQA != nil);
 }
 
 /**
@@ -173,177 +184,235 @@ void initialize() {
   std::cout << "Metal Pipeline State compiled successfully for 'gemm_proj'!"
             << std::endl;
 
+  id<MTLFunction> gqaFunction =
+      [defaultLibrary newFunctionWithName:@"gemm_gqa"];
+  if (!gqaFunction) {
+    std::cerr << "Failed to find kernel function 'gemm_gqa' in library!"
+              << std::endl;
+    return;
+  }
+  pipelineStateGQA = [device newComputePipelineStateWithFunction:gqaFunction
+                                                           error:&error];
+  if (!pipelineStateGQA) {
+    std::cerr << "Failed to compile pipeline state for 'gemm_gqa'! Error: " <<
+        [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'gemm_gqa'!"
+            << std::endl;
+
   initialized = true;
 }
 
 void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
               size_t K) {
-  // WHAT: Safety guard checking if any dimension is zero.
-  // WHY: A matrix multiplication with size 0 has no work to do, and would cause
-  // division/allocation errors.
   if (M == 0 || N == 0 || K == 0)
     return;
 
-  // WHAT: Calculates the byte sizes of our three matrices.
-  // WHY: Zero-copy buffer allocation operates on raw byte counts.
   size_t bytesA = M * K * sizeof(float);
   size_t bytesB = K * N * sizeof(float);
   size_t bytesC = M * N * sizeof(float);
 
-  // WHAT: Creates a zero-copy pointer to CPU Matrix A.
-  // WHY: Unified memory allows the GPU to read A directly from CPU RAM without
-  // copying.
-  id<MTLBuffer> bufferA =
-      [device newBufferWithBytesNoCopy:(void *)a
-                                length:bytesA
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
+  id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
+  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
+  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC);
 
-  // WHAT: Creates a zero-copy pointer to CPU Matrix B.
-  // WHY: Unified memory allows the GPU to read B directly from CPU RAM without
-  // copying.
-  id<MTLBuffer> bufferB =
-      [device newBufferWithBytesNoCopy:(void *)b
-                                length:bytesB
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-
-  // WHAT: Creates a zero-copy pointer to CPU Matrix C.
-  // WHY: Unified memory allows the GPU to write results directly into CPU RAM.
-  id<MTLBuffer> bufferC =
-      [device newBufferWithBytesNoCopy:(void *)c
-                                length:bytesC
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-
-  // WHAT: Validates all buffer allocations succeeded.
-  // WHY: To prevent accessing null references, which crashes the GPU.
   if (!bufferA || !bufferB || !bufferC) {
     std::cerr << "Failed to allocate Metal GEMM buffers!" << std::endl;
     return;
   }
 
-  // WHAT: Execute MPS Matrix Multiplication within an autorelease pool.
-  // WHY: Metal Performance Shaders are objective-C classes that allocate
-  // temporary wrappers. Wrapping
-  //      them in @autoreleasepool ensures they are immediately freed, avoiding
-  //      memory growth.
-  @autoreleasepool {
-    // WHAT: Creates a command buffer packet (cmdBuffer) for the GPU.
-    // WHY: To bundle all GEMM configuration commands into a single
-    // transmission.
-    id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
 
-    simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
-
-    id<MTLComputeCommandEncoder> computeEncoder =
-        [cmdBuffer computeCommandEncoder];
-    [computeEncoder setComputePipelineState:pipelineStateFFN];
-    [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
-    [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
-    [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
-    [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateFFN];
+    [activeEncoder setBuffer:bufferA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferB offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferC offset:0 atIndex:2];
+    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
 
     MTLSize threadgroupsPerGrid =
         MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
-
     MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
-    [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                   threadsPerThreadgroup:threadsPerThreadgroup];
-    [computeEncoder endEncoding];
 
-    // WHAT: Submits the command buffer packet to the commandQueue conveyor
-    // belt. WHY: Triggers the GPU hardware to execute the tasks.
-    [cmdBuffer commit];
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateFFN];
+      [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
+      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
 
-    // WHAT: Blocks the C++ thread until the GPU finishes calculating the GEMM.
-    // WHY: Guarantees the output matrix C contains the results before we read
-    // it on the CPU.
-    [cmdBuffer waitUntilCompleted];
+      MTLSize threadgroupsPerGrid =
+          MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
+
+      MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                     threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+    }
   }
 }
 
 void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
                size_t K) {
-  // WHAT: Safety guard checking if any dimension is zero.
-  // WHY: A matrix multiplication with size 0 has no work to do, and would cause
-  // division/allocation errors.
   if (M == 0 || N == 0 || K == 0)
     return;
 
-  // WHAT: Calculates the byte sizes of our three matrices.
-  // WHY: Zero-copy buffer allocation operates on raw byte counts.
   size_t bytesA = M * K * sizeof(float);
   size_t bytesB = K * N * sizeof(float);
   size_t bytesC = M * N * sizeof(float);
 
-  // WHAT: Creates a zero-copy pointer to CPU Matrix A.
-  // WHY: Unified memory allows the GPU to read A directly from CPU RAM without
-  // copying.
-  id<MTLBuffer> bufferA =
-      [device newBufferWithBytesNoCopy:(void *)a
-                                length:bytesA
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-  // WHAT: Creates a zero-copy pointer to CPU Matrix B.
-  // WHY: Unified memory allows the GPU to read B directly from CPU RAM without
-  // copying.
-  id<MTLBuffer> bufferB =
-      [device newBufferWithBytesNoCopy:(void *)b
-                                length:bytesB
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
-  // WHAT: Creates a zero-copy pointer to CPU Matrix C.
-  // WHY: Unified memory allows the GPU to write results directly into CPU RAM.
-  id<MTLBuffer> bufferC =
-      [device newBufferWithBytesNoCopy:(void *)c
-                                length:bytesC
-                               options:MTLResourceStorageModeShared
-                           deallocator:nil];
+  id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
+  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
+  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC);
 
-  // WHAT: Checks if buffer allocation failed.
-  // WHY: If the GPU runs out of memory, buffers will be nil, and we must abort
-  // gracefully.
   if (!bufferA || !bufferB || !bufferC) {
     std::cerr << "Failed to allocate Metal buffers for gemm_proj!" << std::endl;
     return;
   }
 
-  // WHAT: Packages the matrix dimensions into a Metal-compatible struct.
-  // WHY: The MSL kernel expects dimensions as a SIMD vector for efficient
-  // thread indexing.
   simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
 
-  @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
-    id<MTLComputeCommandEncoder> computeEncoder =
-        [cmdBuffer computeCommandEncoder];
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateProj];
+    [activeEncoder setBuffer:bufferA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferB offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferC offset:0 atIndex:2];
+    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
 
-    [computeEncoder setComputePipelineState:pipelineStateProj];
-    [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
-    [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
-    [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
-    [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-
-    // WHAT: Calculates the number of threadgroup blocks needed to cover the
-    // output matrix.
-    // WHY: We divide the total rows (M) and columns (N) by our tile size (64)
-    // to determine the grid dimensions.
     MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-
-    // WHAT: Defines the computational unit: a block of 64 threads working in
-    // lockstep.
-    // WHY: Hardcoded to 64 to match the MSL kernel's SIMDwidth (32) plus
-    // its parallel SIMDgroup structure (2 groups of 32).
     MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
 
-    [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                   threadsPerThreadgroup:threadsPerThreadgroup];
-    [computeEncoder endEncoding];
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
 
-    [cmdBuffer commit];
-    [cmdBuffer waitUntilCompleted];
+      [computeEncoder setComputePipelineState:pipelineStateProj];
+      [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
+      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+
+      MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
+      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                     threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+    }
   }
+}
+
+void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
+              const float *v, float *out_gqa) {
+
+  size_t bytesQ = gqa_params.batch * gqa_params.seq_len * gqa_params.n_q_heads *
+                  gqa_params.head_dim * sizeof(float);
+  size_t bytesK = gqa_params.batch * gqa_params.seq_len *
+                  gqa_params.n_kv_heads * gqa_params.head_dim * sizeof(float);
+  size_t bytesV = gqa_params.batch * gqa_params.seq_len *
+                  gqa_params.n_kv_heads * gqa_params.head_dim * sizeof(float);
+  size_t bytesOut = gqa_params.batch * gqa_params.seq_len *
+                    gqa_params.n_q_heads * gqa_params.head_dim * sizeof(float);
+
+  id<MTLBuffer> bufferQ = get_or_create_buffer(q, bytesQ);
+  id<MTLBuffer> bufferK = get_or_create_buffer(k, bytesK);
+  id<MTLBuffer> bufferV = get_or_create_buffer(v, bytesV);
+  id<MTLBuffer> bufferOut = get_or_create_buffer(out_gqa, bytesOut);
+
+  if (!bufferQ || !bufferK || !bufferV || !bufferOut) {
+    std::cerr << "Failed to allocate Metal buffers for gemm_gqa!" << std::endl;
+    return;
+  }
+
+  MTLSize threadsPerGrid =
+      MTLSizeMake(gqa_params.batch, gqa_params.seq_len, gqa_params.n_q_heads);
+  MTLSize threadsPerThreadgroup = MTLSizeMake(1, 32, 1);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGQA];
+    [activeEncoder setBuffer:bufferQ offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferK offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferV offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufferOut offset:0 atIndex:3];
+    [activeEncoder setBytes:&gqa_params length:sizeof(GQAParams) atIndex:4];
+
+    [activeEncoder dispatchThreads:threadsPerGrid
+              threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateGQA];
+      [computeEncoder setBuffer:bufferQ offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferK offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferV offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufferOut offset:0 atIndex:3];
+      [computeEncoder setBytes:&gqa_params length:sizeof(GQAParams) atIndex:4];
+
+      [computeEncoder dispatchThreads:threadsPerGrid
+                threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+    }
+  }
+}
+static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes) {
+  if (ptr == nullptr || bytes == 0) return nil;
+  
+  auto it = bufferCache.find(ptr);
+  if (it != bufferCache.end()) {
+    return it->second;
+  }
+  
+  id<MTLBuffer> buf = [device newBufferWithBytesNoCopy:(void*)ptr
+                                                length:bytes
+                                               options:MTLResourceStorageModeShared
+                                           deallocator:nil];
+  if (buf) {
+    bufferCache[ptr] = buf;
+  }
+  return buf;
+}
+
+void start_batch() {
+  if (batchActive) return;
+  activeCmdBuffer = [commandQueue commandBuffer];
+  activeEncoder = [activeCmdBuffer computeCommandEncoder];
+  batchActive = true;
+}
+
+void commit_batch() {
+  if (!batchActive) return;
+  [activeEncoder endEncoding];
+  activeEncoder = nil;
+  
+  [activeCmdBuffer commit];
+  [activeCmdBuffer waitUntilCompleted];
+  activeCmdBuffer = nil;
+  
+  batchActive = false;
+  bufferCache.clear();
 }
 
 } // namespace metal_bridge
