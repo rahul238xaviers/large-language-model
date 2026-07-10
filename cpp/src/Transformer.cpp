@@ -13,6 +13,7 @@
 #include "Transformer.hpp"
 #include "Activations.hpp"
 #include "Tensor.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 #include <cstddef>
@@ -71,9 +72,33 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
 
     // 2. FFN Block (SwiGLU) with Residual
     Tensor ffn_in = layer.ffn_norm.forward(h);
-    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
-    Tensor up_proj = ffn_in.matmul(layer.w_up);
-    Tensor activated = activatations::swiglu(gate_proj, up_proj);
+    
+    const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+    bool use_gpu = false;
+    if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+      metal_bridge::initialize();
+      if (metal_bridge::is_available()) {
+        use_gpu = true;
+      }
+    }
+
+    Tensor activated({batch_size, seq_len, config_.intermediate_dim}, 0.0f);
+    if (use_gpu && (batch_size * seq_len) % 8 == 0 && config_.intermediate_dim % 8 == 0) {
+      metal_bridge::gemm_ffn(
+          ffn_in.data().data(),
+          layer.w_gate.data().data(),
+          layer.w_up.data().data(),
+          activated.data().data(),
+          batch_size * seq_len,
+          config_.intermediate_dim,
+          config_.hidden_dim
+      );
+    } else {
+      Tensor gate_proj = ffn_in.matmul(layer.w_gate);
+      Tensor up_proj = ffn_in.matmul(layer.w_up);
+      activated = activatations::swiglu(gate_proj, up_proj);
+    }
+
     Tensor ffn_out = activated.matmul(layer.w_down);
     h.add_(ffn_out);
   }

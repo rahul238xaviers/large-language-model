@@ -1,6 +1,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Inline helper for SIMD group reduction using intra-register shuffles
+inline float simd_sum(float val) {
+    val += simd_shuffle_down(val, 16);
+    val += simd_shuffle_down(val, 8);
+    val += simd_shuffle_down(val, 4);
+    val += simd_shuffle_down(val, 2);
+    val += simd_shuffle_down(val, 1);
+    return val;
+}
+
 kernel void rms_norm_forward(
     device const float* input       [[buffer(0)]],
     device float*       output      [[buffer(1)]],
@@ -9,10 +19,12 @@ kernel void rms_norm_forward(
     constant uint&      dims        [[buffer(4)]],
     uint                row_idx     [[threadgroup_position_in_grid]],
     uint                tid         [[thread_position_in_threadgroup]],
-    uint                tpg         [[threads_per_threadgroup]]
+    uint                tpg         [[threads_per_threadgroup]],
+    uint                simd_id     [[simdgroup_index_in_threadgroup]],
+    uint                lane_id     [[thread_index_in_simdgroup]]
 ) {
-    // Threadgroup shared memory to perform parallel reduction
-    threadgroup float shared_sq_sum[256];
+    // Threadgroup scratch space for SIMDgroup sums (max 8 SIMD groups for 256 threads)
+    threadgroup float shared_scratch[8];
     
     // Each thread calculates its local sum of squares
     float local_sum = 0.0f;
@@ -20,21 +32,24 @@ kernel void rms_norm_forward(
         float val = input[row_idx * dims + col];
         local_sum += val * val;
     }
-    shared_sq_sum[tid] = local_sum;
+    
+    // Reduce within the SIMDgroup
+    float simd_sq = simd_sum(local_sum);
+    if (lane_id == 0) {
+        shared_scratch[simd_id] = simd_sq;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Perform tree reduction in shared memory to sum across all threads
-    for (uint stride = tpg / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    
-    // Thread 0 calculates the final RMS divisor
+    // First SIMD group reduces the 8 intermediate sums
     threadgroup float rms;
-    if (tid == 0) {
-        rms = rsqrt(shared_sq_sum[0] / (float)dims + eps);
+    if (simd_id == 0) {
+        float val = (lane_id < 8) ? shared_scratch[lane_id] : 0.0f;
+        val += simd_shuffle_down(val, 4);
+        val += simd_shuffle_down(val, 2);
+        val += simd_shuffle_down(val, 1);
+        if (lane_id == 0) {
+            rms = rsqrt(val / (float)dims + eps);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     

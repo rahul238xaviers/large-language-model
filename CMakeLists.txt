@@ -163,13 +163,24 @@ find_program(XCRUN xcrun)
 # 2. Configure maximum sequence length for the GQA shader
 set(MAX_SEQ_LEN 2048 CACHE STRING "Maximum sequence length for GQA attention kernel")
 
+# Tiling configurations for GEMM kernels (can be customized at build time)
+set(FFN_TILE_M 128 CACHE STRING "FFN tile M dimension size")
+set(FFN_TILE_N 128 CACHE STRING "FFN tile N dimension size")
+set(FFN_TILE_K 32 CACHE STRING "FFN tile K dimension size")
+
+set(PROJ_TILE_M 64 CACHE STRING "Projection tile M dimension size")
+set(PROJ_TILE_N 64 CACHE STRING "Projection tile N dimension size")
+set(PROJ_TILE_K 32 CACHE STRING "Projection tile K dimension size")
+
 # 3. Add custom commands to compile our shaders
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
     COMMAND ${XCRUN} -sdk macosx metal -c
+            -DTILE_M=${FFN_TILE_M} -DTILE_N=${FFN_TILE_N} -DTILE_K=${FFN_TILE_K}
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             -o ${CMAKE_BINARY_DIR}/gemm_ffn.air
     COMMAND ${XCRUN} -sdk macosx metal -c
+            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
             -o ${CMAKE_BINARY_DIR}/gemm_proj.air
     COMMAND ${XCRUN} -sdk macosx metal -c

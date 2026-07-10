@@ -374,18 +374,14 @@ Tensor Tensor::matmul(const Tensor &other) const {
     bool use_gpu = false;
     if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
       metal_bridge::initialize();
-      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
+      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0) && (K == N)) {
         use_gpu = true;
       }
     }
 
     if (use_gpu) {
       auto start = std::chrono::high_resolution_clock::now();
-      if (K == N) {
-        metal_bridge::gemm_proj(x_data, w_data, res_data, M, N, K);
-      } else {
-        metal_bridge::gemm_ffn(x_data, w_data, res_data, M, N, K);
-      }
+      metal_bridge::gemm_proj(x_data, w_data, res_data, M, N, K);
       auto end = std::chrono::high_resolution_clock::now();
       metal_bridge::accum_gpu_time_ms +=
           std::chrono::duration_cast<std::chrono::microseconds>(end - start)

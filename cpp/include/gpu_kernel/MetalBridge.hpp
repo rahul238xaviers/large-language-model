@@ -29,7 +29,7 @@ struct GQAParams {
  * @param N Number of columns in B and C
  * @param K Number of columns in A and rows in B
  */
-void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
+void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c, size_t M, size_t N,
               size_t K);
 
 /**

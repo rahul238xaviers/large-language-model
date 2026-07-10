@@ -1,22 +1,46 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Pass 1: Compute input gradient dx and row-wise weight gradient terms dw_rows
+// Helper function to perform atomic float addition in device memory
+inline void atomic_add_float(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float expected_val = as_type<float>(expected);
+        float new_val = expected_val + value;
+        uint desired = as_type<uint>(new_val);
+        if (atomic_compare_exchange_weak_explicit(addr, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+// Inline helper for SIMD group reduction using intra-register shuffles
+inline float simd_sum(float val) {
+    val += simd_shuffle_down(val, 16);
+    val += simd_shuffle_down(val, 8);
+    val += simd_shuffle_down(val, 4);
+    val += simd_shuffle_down(val, 2);
+    val += simd_shuffle_down(val, 1);
+    return val;
+}
+
+// Pass 1: Compute input gradient dx and accumulate weight gradient dw directly in a single pass
 kernel void rms_norm_backward_dx(
     device const float* grad_output     [[buffer(0)]],
     device const float* input           [[buffer(1)]],
     device const float* weight          [[buffer(2)]],
     device float*       grad_input      [[buffer(3)]],
-    device float*       dw_rows         [[buffer(4)]],
+    device float*       grad_weight     [[buffer(4)]],
     constant float&     eps             [[buffer(5)]],
     constant uint&      dims            [[buffer(6)]],
     uint                row_idx         [[threadgroup_position_in_grid]],
-    uint                tid         [[thread_position_in_threadgroup]],
-    uint                tpg         [[threads_per_threadgroup]]
+    uint                tid             [[thread_position_in_threadgroup]],
+    uint                tpg             [[threads_per_threadgroup]],
+    uint                simd_id         [[simdgroup_index_in_threadgroup]],
+    uint                lane_id         [[thread_index_in_simdgroup]]
 ) {
-    // Threadgroup shared memory for parallel reductions
-    threadgroup float shared_sq_sum[256];
-    threadgroup float shared_sum_g_w_xhat[256];
+    // Shared memory for SIMD group reduction results (max 8 SIMD groups for 256 threads)
+    threadgroup float shared_scratch[8];
     
     // 1. Calculate sum of squares for this row to compute RMS
     float local_sq_sum = 0.0f;
@@ -24,20 +48,24 @@ kernel void rms_norm_backward_dx(
         float val = input[row_idx * dims + col];
         local_sq_sum += val * val;
     }
-    shared_sq_sum[tid] = local_sq_sum;
+    
+    // Reduce local sum within each SIMD group
+    float simd_sq = simd_sum(local_sq_sum);
+    if (lane_id == 0) {
+        shared_scratch[simd_id] = simd_sq;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Tree reduction for sum of squares
-    for (uint stride = tpg / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    
+    // First SIMD group reduces the 8 intermediate sums
     threadgroup float rms;
-    if (tid == 0) {
-        rms = sqrt(shared_sq_sum[0] / (float)dims + eps);
+    if (simd_id == 0) {
+        float val = (lane_id < 8) ? shared_scratch[lane_id] : 0.0f;
+        val += simd_shuffle_down(val, 4);
+        val += simd_shuffle_down(val, 2);
+        val += simd_shuffle_down(val, 1);
+        if (lane_id == 0) {
+            rms = sqrt(val / (float)dims + eps);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
@@ -48,20 +76,27 @@ kernel void rms_norm_backward_dx(
         float xhat = input[idx] / rms;
         local_g_w_xhat += grad_output[idx] * weight[col] * xhat;
     }
-    shared_sum_g_w_xhat[tid] = local_g_w_xhat;
+    
+    // Reduce local sum within each SIMD group
+    float simd_g_w_xhat = simd_sum(local_g_w_xhat);
+    if (lane_id == 0) {
+        shared_scratch[simd_id] = simd_g_w_xhat;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    // Tree reduction for inner sum term
-    for (uint stride = tpg / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            shared_sum_g_w_xhat[tid] += shared_sum_g_w_xhat[tid + stride];
+    threadgroup float sum_g_w_xhat;
+    if (simd_id == 0) {
+        float val = (lane_id < 8) ? shared_scratch[lane_id] : 0.0f;
+        val += simd_shuffle_down(val, 4);
+        val += simd_shuffle_down(val, 2);
+        val += simd_shuffle_down(val, 1);
+        if (lane_id == 0) {
+            sum_g_w_xhat = val / (float)dims;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     
-    float sum_g_w_xhat = shared_sum_g_w_xhat[0] / (float)dims;
-    
-    // 3. Compute gradients w.r.t input and write weight gradient term
+    // 3. Compute gradients w.r.t input and write directly to global grad_weight
     for (uint col = tid; col < dims; col += tpg) {
         uint idx = row_idx * dims + col;
         float xhat = input[idx] / rms;
@@ -69,26 +104,8 @@ kernel void rms_norm_backward_dx(
         // grad_input calculation
         grad_input[idx] = (1.0f / rms) * (grad_output[idx] * weight[col] - xhat * sum_g_w_xhat);
         
-        // dw_row term
-        dw_rows[idx] = grad_output[idx] * xhat;
+        // Accumulate to global weight gradient directly using atomic floats
+        float dw_val = grad_output[idx] * xhat;
+        atomic_add_float((device atomic_uint*)&grad_weight[col], dw_val);
     }
-}
-
-// Pass 2: Sum columns of dw_rows to produce final grad_weight
-kernel void rms_norm_backward_dw_reduce(
-    device const float* dw_rows     [[buffer(0)]],
-    device float*       grad_weight [[buffer(1)]],
-    constant uint&      num_rows    [[buffer(2)]],
-    constant uint&      dims        [[buffer(3)]],
-    uint                col         [[thread_position_in_grid]]
-) {
-    if (col >= dims) return;
-    
-    float sum = 0.0f;
-    for (uint r = 0; r < num_rows; ++r) {
-        sum += dw_rows[r * dims + col];
-    }
-    
-    // Accumulate to global weight gradient
-    grad_weight[col] += sum;
 }

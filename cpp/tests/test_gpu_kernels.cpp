@@ -1,6 +1,8 @@
 #include "Attention.hpp"
 #include "Positional.hpp"
 #include "Tensor.hpp"
+#include "Activations.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -114,23 +116,31 @@ int main() {
     total_checks++;
     size_t M = 128;
     size_t K = 256;
-    size_t N = 512; // K != N triggers gemm_ffn
+    size_t N = 512;
 
     std::vector<float> dataA(M * K);
-    std::vector<float> dataB(K * N);
+    std::vector<float> dataB_gate(K * N);
+    std::vector<float> dataB_up(K * N);
+    std::vector<float> dataC_gpu(M * N, 0.0f);
+
     initialize_random(dataA, 0.0f, 0.05f);
-    initialize_random(dataB, 0.0f, 0.05f);
+    initialize_random(dataB_gate, 0.0f, 0.05f);
+    initialize_random(dataB_up, 0.0f, 0.05f);
 
     Tensor A({M, K}, dataA);
-    Tensor B({K, N}, dataB);
+    Tensor B_gate({K, N}, dataB_gate);
+    Tensor B_up({K, N}, dataB_up);
 
     set_gpu_enabled(false);
-    Tensor C_cpu = A.matmul(B);
+    Tensor gate_proj = A.matmul(B_gate);
+    Tensor up_proj = A.matmul(B_up);
+    Tensor C_cpu = activatations::swiglu(gate_proj, up_proj);
 
     set_gpu_enabled(true);
-    Tensor C_gpu = A.matmul(B);
+    metal_bridge::initialize();
+    metal_bridge::gemm_ffn(dataA.data(), dataB_gate.data(), dataB_up.data(), dataC_gpu.data(), M, N, K);
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data());
+    float l2_error = calculate_l2_relative_error(C_cpu.data(), dataC_gpu);
     bool pass = (l2_error < 1e-4f);
     if (pass)
       passed_checks++;
@@ -236,6 +246,12 @@ int main() {
     set_gpu_enabled(true);
     Tensor out_gpu = attn.forward(x, rope);
 
+    std::cout << "[DEBUG] CPU output first 5 elements: ";
+    for (int i = 0; i < 5; ++i) std::cout << out_cpu.data()[i] << " ";
+    std::cout << "\n[DEBUG] GPU output first 5 elements: ";
+    for (int i = 0; i < 5; ++i) std::cout << out_gpu.data()[i] << " ";
+    std::cout << std::endl;
+
     float l2_error = calculate_l2_relative_error(out_cpu.data(), out_gpu.data());
     bool pass = (l2_error < 1e-4f);
     if (pass)
@@ -289,25 +305,41 @@ int main() {
     // 1. Warm-up GPU to compile pipelines and allocate static buffers
     set_gpu_enabled(true);
     for (int w = 0; w < warmup_runs; ++w) {
-      Tensor dummy = A.matmul(B);
+      if (bench.is_proj) {
+        Tensor dummy = A.matmul(B);
+      } else {
+        std::vector<float> res_gpu(bench.M * bench.N, 0.0f);
+        metal_bridge::gemm_ffn(dataA.data(), dataB.data(), dataB.data(), res_gpu.data(), bench.M, bench.N, bench.K);
+      }
     }
 
     // 2. Measure GPU latency
     auto start_gpu = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < benchmark_runs; ++r) {
-      Tensor C_gpu = A.matmul(B);
+      if (bench.is_proj) {
+        Tensor C_gpu = A.matmul(B);
+      } else {
+        std::vector<float> res_gpu(bench.M * bench.N, 0.0f);
+        metal_bridge::gemm_ffn(dataA.data(), dataB.data(), dataB.data(), res_gpu.data(), bench.M, bench.N, bench.K);
+      }
     }
     auto end_gpu = std::chrono::high_resolution_clock::now();
     double gpu_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                              end_gpu - start_gpu)
                              .count() /
-                         (1000.0 * benchmark_runs);
+                          (1000.0 * benchmark_runs);
 
     // 3. Measure CPU latency
     set_gpu_enabled(false);
     auto start_cpu = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < benchmark_runs; ++r) {
-      Tensor C_cpu = A.matmul(B);
+      if (bench.is_proj) {
+        Tensor C_cpu = A.matmul(B);
+      } else {
+        Tensor gate_proj = A.matmul(B);
+        Tensor up_proj = A.matmul(B);
+        Tensor activated = activatations::swiglu(gate_proj, up_proj);
+      }
     }
     auto end_cpu = std::chrono::high_resolution_clock::now();
     double cpu_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(

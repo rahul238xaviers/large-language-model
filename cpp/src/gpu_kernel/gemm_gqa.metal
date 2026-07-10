@@ -58,68 +58,76 @@ kernel void gemm_gqa(
     constant GQAParams& gqa  [[buffer(4)]],
     uint3 tg_id   [[thread_position_in_grid]]
 ) {
-    // We passe this as 3-D grid because we wanted to process Q, K and V as 3-D arrays
-    //The b is for the batch dimension, s_q is the sequence length, h is the query head index
-    //The size of the grid is [gqa.batch, gqa.seq_len, gqa.n_q_heads]   
-   uint b = tg_id.x;
-   uint s_q = tg_id.y;
-   uint h = tg_id.z;
+    // We pass this as 3-D grid because we wanted to process Q, K and V as 3-D arrays
+    // The b is for the batch dimension, s_q is the sequence length, h is the query head index
+    // The size of the grid is [gqa.batch, gqa.seq_len, gqa.n_q_heads]   
+    uint b = tg_id.x;
+    uint s_q = tg_id.y;
+    uint h = tg_id.z;
 
-   float scores[MAX_SEQ_LEN] = {0.0f};
-   
+    uint group_size = gqa.n_q_heads / gqa.n_kv_heads;
+    uint h_kv = h / group_size;
 
-  uint group_size = gqa.n_q_heads / gqa.n_kv_heads;
-  uint h_kv = h /group_size;
-
-  device const float* q_ptr = Q + (b * gqa.n_q_heads * gqa.seq_len + h * gqa.seq_len + s_q) * gqa.head_dim;
-  device float* out_ptr =  out + (b * gqa.seq_len * gqa.n_q_heads + s_q * gqa.n_q_heads + h) * gqa.head_dim;
+    device const float* q_ptr = Q + (b * gqa.n_q_heads * gqa.seq_len + h * gqa.seq_len + s_q) * gqa.head_dim;
+    device float* out_ptr =  out + (b * gqa.seq_len * gqa.n_q_heads + s_q * gqa.n_q_heads + h) * gqa.head_dim;
   
-//the shape of K and V is [B, H_KV (gqa.n_kv_heads), S (gqa.seq_len), D (gqa.head_dim)] and 
-//indices are batch = b, token index = 0, key head index = h_kv
-uint kv_common_factor = (b * gqa.n_kv_heads * gqa.seq_len + h_kv * gqa.seq_len) * gqa.head_dim;
-device const float* k_base = K + kv_common_factor;
-device const float* v_base = V + kv_common_factor;
+    // the shape of K and V is [B, H_KV, S, D] and indices are batch = b, token index = 0, key head index = h_kv
+    uint kv_common_factor = (b * gqa.n_kv_heads * gqa.seq_len + h_kv * gqa.seq_len) * gqa.head_dim;
+    device const float* k_base = K + kv_common_factor;
+    device const float* v_base = V + kv_common_factor;
 
-for(uint s_k = 0; s_k <= s_q; s_k++){
+    float scale = 1.0f / sqrt((float)gqa.head_dim);
 
-    device const float* k_ptr = k_base + s_k * gqa.head_dim;
-
-
-    float sum = 0.0f;
-
-    for(uint d = 0; d < gqa.head_dim; d++){
-        sum += q_ptr[d] * k_ptr[d];
+    // Initialize online softmax with s_k = 0
+    device const float* k_ptr_0 = k_base;
+    float sum_0 = 0.0f;
+    for (uint d = 0; d < gqa.head_dim; d++) {
+        sum_0 += q_ptr[d] * k_ptr_0[d];
     }
-    scores[s_k] = sum * (1.0f / sqrt((float)gqa.head_dim))   ;
-    
-}
+    float max_val = sum_0 * scale;
+    float sum_exp = 1.0f;
 
-    float max_val = scores[0];
-    float sum_exp = 0.0f;   
-
-    for(uint i = 0; i <= s_q; i++){
-        max_val = max(max_val, scores[i]);
+    device const float* v_ptr_0 = v_base;
+    float accum_val[128];
+    for (uint d = 0; d < gqa.head_dim; d++) {
+        accum_val[d] = v_ptr_0[d];
     }
 
-    for(uint i = 0; i <= s_q; i++){
-        scores[i] = exp(scores[i] - max_val);
-        sum_exp += scores[i];
+    // Process remaining keys s_k from 1 to s_q
+    for (uint s_k = 1; s_k <= s_q; s_k++) {
+        device const float* k_ptr = k_base + s_k * gqa.head_dim;
+
+        // 1. Compute dot product Q * K
+        float sum = 0.0f;
+        for (uint d = 0; d < gqa.head_dim; d++) {
+            sum += q_ptr[d] * k_ptr[d];
+        }
+        float score = sum * scale;
+
+        // 2. Online softmax update
+        float m_old = max_val;
+        if (score > max_val) {
+            max_val = score;
+            float exp_scale = exp(m_old - max_val);
+            sum_exp = sum_exp * exp_scale + 1.0f;
+
+            device const float* v_ptr = v_base + s_k * gqa.head_dim;
+            for (uint d = 0; d < gqa.head_dim; d++) {
+                accum_val[d] = accum_val[d] * exp_scale + v_ptr[d];
+            }
+        } else {
+            float exp_term = exp(score - max_val);
+            sum_exp += exp_term;
+
+            device const float* v_ptr = v_base + s_k * gqa.head_dim;
+            for (uint d = 0; d < gqa.head_dim; d++) {
+                accum_val[d] += exp_term * v_ptr[d];
+            }
+        }
     }
 
-// 1. Loop over head dimension (Outer Loop)
-for (uint d = 0; d < gqa.head_dim; ++d) {
-    float acc = 0.0f;
-    
-    // 2. Loop over tokens to accumulate (Inner Loop)
-    for (uint s_k = 0; s_k <= s_q; ++s_k) {
-        device const float* v_ptr = v_base + (s_k * gqa.head_dim);
-        float weight = scores[s_k] / sum_exp;
-        acc += weight * v_ptr[d];
+    // 3. Normalize and write to VRAM
+    for (uint d = 0; d < gqa.head_dim; ++d) {
+        out_ptr[d] = accum_val[d] / sum_exp;
     }
-    
-    // 3. Write final result once to VRAM
-    out_ptr[d] = acc;
-}
-
-
 }

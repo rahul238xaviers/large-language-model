@@ -37,7 +37,6 @@ static id<MTLComputePipelineState> pipelineStateProj = nil;
 static id<MTLComputePipelineState> pipelineStateGQA = nil;
 static id<MTLComputePipelineState> pipelineStateRMSForward = nil;
 static id<MTLComputePipelineState> pipelineStateRMSBackwardDX = nil;
-static id<MTLComputePipelineState> pipelineStateRMSBackwardDWReduce = nil;
 
 static bool initialized = false;
 
@@ -244,23 +243,12 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for 'rms_norm_backward_dx'!" << std::endl;
 
-  id<MTLFunction> rmsBackwardDWReduceFunc = [defaultLibrary newFunctionWithName:@"rms_norm_backward_dw_reduce"];
-  if (!rmsBackwardDWReduceFunc) {
-    std::cerr << "Failed to find kernel function 'rms_norm_backward_dw_reduce' in library!" << std::endl;
-    return;
-  }
-  pipelineStateRMSBackwardDWReduce = [device newComputePipelineStateWithFunction:rmsBackwardDWReduceFunc error:&error];
-  if (!pipelineStateRMSBackwardDWReduce) {
-    std::cerr << "Failed to compile pipeline state for 'rms_norm_backward_dw_reduce'! Error: " <<
-        [[error localizedDescription] UTF8String] << std::endl;
-    return;
-  }
-  std::cout << "Metal Pipeline State compiled successfully for 'rms_norm_backward_dw_reduce'!" << std::endl;
+
 
   initialized = true;
 }
 
-void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
+void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c, size_t M, size_t N,
               size_t K) {
   if (M == 0 || N == 0 || K == 0)
     return;
@@ -270,11 +258,12 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
   size_t bytesC = M * N * sizeof(float);
 
   id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
-  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
+  id<MTLBuffer> bufferB_gate = get_or_create_buffer(b_gate, bytesB);
+  id<MTLBuffer> bufferB_up = get_or_create_buffer(b_up, bytesB);
   id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
 
-  if (!bufferA || !bufferB || !bufferC) {
-    std::cerr << "Failed to allocate Metal GEMM buffers!" << std::endl;
+  if (!bufferA || !bufferB_gate || !bufferB_up || !bufferC) {
+    std::cerr << "Failed to allocate Metal GEMM buffers for gemm_ffn!" << std::endl;
     return;
   }
 
@@ -283,9 +272,10 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
   if (batchActive) {
     [activeEncoder setComputePipelineState:pipelineStateFFN];
     [activeEncoder setBuffer:bufferA offset:0 atIndex:0];
-    [activeEncoder setBuffer:bufferB offset:0 atIndex:1];
-    [activeEncoder setBuffer:bufferC offset:0 atIndex:2];
-    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+    [activeEncoder setBuffer:bufferB_gate offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferB_up offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufferC offset:0 atIndex:3];
+    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:4];
 
     MTLSize threadgroupsPerGrid =
         MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
@@ -300,9 +290,10 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
           [cmdBuffer computeCommandEncoder];
       [computeEncoder setComputePipelineState:pipelineStateFFN];
       [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
-      [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
-      [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
-      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+      [computeEncoder setBuffer:bufferB_gate offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferB_up offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufferC offset:0 atIndex:3];
+      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:4];
 
       MTLSize threadgroupsPerGrid =
           MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
@@ -315,6 +306,7 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
+      bufferCache.clear();
     }
   }
 }
@@ -373,6 +365,7 @@ void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
+      bufferCache.clear();
     }
   }
 }
@@ -433,6 +426,7 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
+      bufferCache.clear();
     }
   }
 }
@@ -529,6 +523,7 @@ void rms_norm_forward(const float *input, float *output, const float *weight,
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
+      bufferCache.clear();
     }
   }
 }
@@ -547,20 +542,11 @@ void rms_norm_backward(const float *grad_output, const float *input, const float
   id<MTLBuffer> bufferGradInput = get_or_create_buffer(grad_input, bytesIn, true);
   id<MTLBuffer> bufferGradWeight = get_or_create_buffer(grad_weight, bytesW, true);
 
-  // Opaque shared intermediate buffer for column reductions (GPU Private memory)
-  static id<MTLBuffer> bufferDwRows = nil;
-  static size_t dwRowsCachedSize = 0;
-  if (!bufferDwRows || dwRowsCachedSize < bytesIn) {
-    bufferDwRows = [device newBufferWithLength:bytesIn options:MTLResourceStorageModePrivate];
-    dwRowsCachedSize = bytesIn;
-  }
-
-  if (!bufferGradOutput || !bufferInput || !bufferWeight || !bufferGradInput || !bufferGradWeight || !bufferDwRows) {
+  if (!bufferGradOutput || !bufferInput || !bufferWeight || !bufferGradInput || !bufferGradWeight) {
     std::cerr << "Failed to allocate Metal buffers for rms_norm_backward!" << std::endl;
     return;
   }
 
-  uint num_rows_val = (uint)num_rows;
   uint dims_val = (uint)dims;
 
   if (batchActive) {
@@ -569,7 +555,7 @@ void rms_norm_backward(const float *grad_output, const float *input, const float
     [activeEncoder setBuffer:bufferInput offset:0 atIndex:1];
     [activeEncoder setBuffer:bufferWeight offset:0 atIndex:2];
     [activeEncoder setBuffer:bufferGradInput offset:0 atIndex:3];
-    [activeEncoder setBuffer:bufferDwRows offset:0 atIndex:4];
+    [activeEncoder setBuffer:bufferGradWeight offset:0 atIndex:4];
     [activeEncoder setBytes:&eps length:sizeof(float) atIndex:5];
     [activeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:6];
 
@@ -578,18 +564,6 @@ void rms_norm_backward(const float *grad_output, const float *input, const float
 
     [activeEncoder dispatchThreadgroups:threadgroupsPerGrid1
                   threadsPerThreadgroup:threadsPerThreadgroup1];
-
-    [activeEncoder setComputePipelineState:pipelineStateRMSBackwardDWReduce];
-    [activeEncoder setBuffer:bufferDwRows offset:0 atIndex:0];
-    [activeEncoder setBuffer:bufferGradWeight offset:0 atIndex:1];
-    [activeEncoder setBytes:&num_rows_val length:sizeof(uint) atIndex:2];
-    [activeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:3];
-
-    MTLSize threadgroupsPerGrid2 = MTLSizeMake((dims + 255) / 256, 1, 1);
-    MTLSize threadsPerThreadgroup2 = MTLSizeMake(256, 1, 1);
-
-    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid2
-                  threadsPerThreadgroup:threadsPerThreadgroup2];
   } else {
     @autoreleasepool {
       id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
@@ -601,7 +575,7 @@ void rms_norm_backward(const float *grad_output, const float *input, const float
       [computeEncoder setBuffer:bufferInput offset:0 atIndex:1];
       [computeEncoder setBuffer:bufferWeight offset:0 atIndex:2];
       [computeEncoder setBuffer:bufferGradInput offset:0 atIndex:3];
-      [computeEncoder setBuffer:bufferDwRows offset:0 atIndex:4];
+      [computeEncoder setBuffer:bufferGradWeight offset:0 atIndex:4];
       [computeEncoder setBytes:&eps length:sizeof(float) atIndex:5];
       [computeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:6];
 
@@ -611,22 +585,11 @@ void rms_norm_backward(const float *grad_output, const float *input, const float
       [computeEncoder dispatchThreadgroups:threadgroupsPerGrid1
                     threadsPerThreadgroup:threadsPerThreadgroup1];
 
-      [computeEncoder setComputePipelineState:pipelineStateRMSBackwardDWReduce];
-      [computeEncoder setBuffer:bufferDwRows offset:0 atIndex:0];
-      [computeEncoder setBuffer:bufferGradWeight offset:0 atIndex:1];
-      [computeEncoder setBytes:&num_rows_val length:sizeof(uint) atIndex:2];
-      [computeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:3];
-
-      MTLSize threadgroupsPerGrid2 = MTLSizeMake((dims + 255) / 256, 1, 1);
-      MTLSize threadsPerThreadgroup2 = MTLSizeMake(256, 1, 1);
-
-      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid2
-                    threadsPerThreadgroup:threadsPerThreadgroup2];
-
       [computeEncoder endEncoding];
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
+      bufferCache.clear();
     }
   }
 }
