@@ -35,6 +35,9 @@ static id<MTLCommandQueue> commandQueue = nil;
 static id<MTLComputePipelineState> pipelineStateFFN = nil;
 static id<MTLComputePipelineState> pipelineStateProj = nil;
 static id<MTLComputePipelineState> pipelineStateGQA = nil;
+static id<MTLComputePipelineState> pipelineStateRMSForward = nil;
+static id<MTLComputePipelineState> pipelineStateRMSBackwardDX = nil;
+static id<MTLComputePipelineState> pipelineStateRMSBackwardDWReduce = nil;
 
 static bool initialized = false;
 
@@ -45,7 +48,21 @@ static bool batchActive = false;
 // Address-to-Buffer cache mapping raw host pointers to persistent MTLBuffers
 static std::unordered_map<const void*, id<MTLBuffer>> bufferCache;
 
-static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes);
+struct CopyBackTask {
+  void* dest;
+  id<MTLBuffer> src;
+  size_t size;
+};
+static std::vector<CopyBackTask> copyBackQueue;
+
+static void run_copy_back_tasks() {
+  for (const auto& task : copyBackQueue) {
+    memcpy(task.dest, [task.src contents], task.size);
+  }
+  copyBackQueue.clear();
+}
+
+static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes, bool is_write = false);
 
 // Profiling statistics definitions
 double accum_gpu_time_ms = 0.0;
@@ -201,6 +218,45 @@ void initialize() {
   std::cout << "Metal Pipeline State compiled successfully for 'gemm_gqa'!"
             << std::endl;
 
+  id<MTLFunction> rmsForwardFunc = [defaultLibrary newFunctionWithName:@"rms_norm_forward"];
+  if (!rmsForwardFunc) {
+    std::cerr << "Failed to find kernel function 'rms_norm_forward' in library!" << std::endl;
+    return;
+  }
+  pipelineStateRMSForward = [device newComputePipelineStateWithFunction:rmsForwardFunc error:&error];
+  if (!pipelineStateRMSForward) {
+    std::cerr << "Failed to compile pipeline state for 'rms_norm_forward'! Error: " <<
+        [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'rms_norm_forward'!" << std::endl;
+
+  id<MTLFunction> rmsBackwardDXFunc = [defaultLibrary newFunctionWithName:@"rms_norm_backward_dx"];
+  if (!rmsBackwardDXFunc) {
+    std::cerr << "Failed to find kernel function 'rms_norm_backward_dx' in library!" << std::endl;
+    return;
+  }
+  pipelineStateRMSBackwardDX = [device newComputePipelineStateWithFunction:rmsBackwardDXFunc error:&error];
+  if (!pipelineStateRMSBackwardDX) {
+    std::cerr << "Failed to compile pipeline state for 'rms_norm_backward_dx'! Error: " <<
+        [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'rms_norm_backward_dx'!" << std::endl;
+
+  id<MTLFunction> rmsBackwardDWReduceFunc = [defaultLibrary newFunctionWithName:@"rms_norm_backward_dw_reduce"];
+  if (!rmsBackwardDWReduceFunc) {
+    std::cerr << "Failed to find kernel function 'rms_norm_backward_dw_reduce' in library!" << std::endl;
+    return;
+  }
+  pipelineStateRMSBackwardDWReduce = [device newComputePipelineStateWithFunction:rmsBackwardDWReduceFunc error:&error];
+  if (!pipelineStateRMSBackwardDWReduce) {
+    std::cerr << "Failed to compile pipeline state for 'rms_norm_backward_dw_reduce'! Error: " <<
+        [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'rms_norm_backward_dw_reduce'!" << std::endl;
+
   initialized = true;
 }
 
@@ -215,7 +271,7 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
 
   id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
   id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
-  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC);
+  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
 
   if (!bufferA || !bufferB || !bufferC) {
     std::cerr << "Failed to allocate Metal GEMM buffers!" << std::endl;
@@ -258,6 +314,7 @@ void gemm_ffn(const float *a, const float *b, float *c, size_t M, size_t N,
 
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
     }
   }
 }
@@ -273,7 +330,7 @@ void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
 
   id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
   id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
-  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC);
+  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
 
   if (!bufferA || !bufferB || !bufferC) {
     std::cerr << "Failed to allocate Metal buffers for gemm_proj!" << std::endl;
@@ -315,6 +372,7 @@ void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
 
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
     }
   }
 }
@@ -334,7 +392,7 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
   id<MTLBuffer> bufferQ = get_or_create_buffer(q, bytesQ);
   id<MTLBuffer> bufferK = get_or_create_buffer(k, bytesK);
   id<MTLBuffer> bufferV = get_or_create_buffer(v, bytesV);
-  id<MTLBuffer> bufferOut = get_or_create_buffer(out_gqa, bytesOut);
+  id<MTLBuffer> bufferOut = get_or_create_buffer(out_gqa, bytesOut, true);
 
   if (!bufferQ || !bufferK || !bufferV || !bufferOut) {
     std::cerr << "Failed to allocate Metal buffers for gemm_gqa!" << std::endl;
@@ -374,10 +432,11 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
 
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
     }
   }
 }
-static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes) {
+static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes, bool is_write) {
   if (ptr == nullptr || bytes == 0) return nil;
   
   auto it = bufferCache.find(ptr);
@@ -385,14 +444,191 @@ static id<MTLBuffer> get_or_create_buffer(const void* ptr, size_t bytes) {
     return it->second;
   }
   
-  id<MTLBuffer> buf = [device newBufferWithBytesNoCopy:(void*)ptr
-                                                length:bytes
-                                               options:MTLResourceStorageModeShared
-                                           deallocator:nil];
+  id<MTLBuffer> buf = nil;
+  
+  // Check if both pointer and size are 16KB page-aligned
+  bool is_aligned = (((uintptr_t)ptr % 16384) == 0) && ((bytes % 16384) == 0);
+  
+  if (is_aligned) {
+    buf = [device newBufferWithBytesNoCopy:(void*)ptr
+                                    length:bytes
+                                   options:MTLResourceStorageModeShared
+                               deallocator:nil];
+  }
+  
+  // If not aligned, or if NoCopy allocation failed, fall back to copy allocation
+  if (!buf) {
+    buf = [device newBufferWithBytes:(void*)ptr
+                              length:bytes
+                             options:MTLResourceStorageModeShared];
+    
+    // If it was copy-allocated and we intend to write to it, register a copy-back task
+    if (buf && is_write) {
+      copyBackQueue.push_back({(void*)ptr, buf, bytes});
+    }
+  }
+  
   if (buf) {
     bufferCache[ptr] = buf;
   }
   return buf;
+}
+
+void rms_norm_forward(const float *input, float *output, const float *weight,
+                      float eps, size_t num_rows, size_t dims) {
+  if (num_rows == 0 || dims == 0) return;
+
+  size_t bytesIn = num_rows * dims * sizeof(float);
+  size_t bytesOut = num_rows * dims * sizeof(float);
+  size_t bytesW = dims * sizeof(float);
+
+  id<MTLBuffer> bufferIn = get_or_create_buffer(input, bytesIn);
+  id<MTLBuffer> bufferOut = get_or_create_buffer(output, bytesOut, true);
+  id<MTLBuffer> bufferW = get_or_create_buffer(weight, bytesW);
+
+  if (!bufferIn || !bufferOut || !bufferW) {
+    std::cerr << "Failed to allocate Metal buffers for rms_norm_forward!" << std::endl;
+    return;
+  }
+
+  uint dims_val = (uint)dims;
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateRMSForward];
+    [activeEncoder setBuffer:bufferIn offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferOut offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferW offset:0 atIndex:2];
+    [activeEncoder setBytes:&eps length:sizeof(float) atIndex:3];
+    [activeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:4];
+
+    MTLSize threadgroupsPerGrid = MTLSizeMake(num_rows, 1, 1);
+    MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateRMSForward];
+      [computeEncoder setBuffer:bufferIn offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferOut offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferW offset:0 atIndex:2];
+      [computeEncoder setBytes:&eps length:sizeof(float) atIndex:3];
+      [computeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:4];
+
+      MTLSize threadgroupsPerGrid = MTLSizeMake(num_rows, 1, 1);
+      MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                     threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+void rms_norm_backward(const float *grad_output, const float *input, const float *weight,
+                       float *grad_input, float *grad_weight, float eps,
+                       size_t num_rows, size_t dims) {
+  if (num_rows == 0 || dims == 0) return;
+
+  size_t bytesIn = num_rows * dims * sizeof(float);
+  size_t bytesW = dims * sizeof(float);
+
+  id<MTLBuffer> bufferGradOutput = get_or_create_buffer(grad_output, bytesIn);
+  id<MTLBuffer> bufferInput = get_or_create_buffer(input, bytesIn);
+  id<MTLBuffer> bufferWeight = get_or_create_buffer(weight, bytesW);
+  id<MTLBuffer> bufferGradInput = get_or_create_buffer(grad_input, bytesIn, true);
+  id<MTLBuffer> bufferGradWeight = get_or_create_buffer(grad_weight, bytesW, true);
+
+  // Opaque shared intermediate buffer for column reductions (GPU Private memory)
+  static id<MTLBuffer> bufferDwRows = nil;
+  static size_t dwRowsCachedSize = 0;
+  if (!bufferDwRows || dwRowsCachedSize < bytesIn) {
+    bufferDwRows = [device newBufferWithLength:bytesIn options:MTLResourceStorageModePrivate];
+    dwRowsCachedSize = bytesIn;
+  }
+
+  if (!bufferGradOutput || !bufferInput || !bufferWeight || !bufferGradInput || !bufferGradWeight || !bufferDwRows) {
+    std::cerr << "Failed to allocate Metal buffers for rms_norm_backward!" << std::endl;
+    return;
+  }
+
+  uint num_rows_val = (uint)num_rows;
+  uint dims_val = (uint)dims;
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateRMSBackwardDX];
+    [activeEncoder setBuffer:bufferGradOutput offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferInput offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferWeight offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufferGradInput offset:0 atIndex:3];
+    [activeEncoder setBuffer:bufferDwRows offset:0 atIndex:4];
+    [activeEncoder setBytes:&eps length:sizeof(float) atIndex:5];
+    [activeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:6];
+
+    MTLSize threadgroupsPerGrid1 = MTLSizeMake(num_rows, 1, 1);
+    MTLSize threadsPerThreadgroup1 = MTLSizeMake(256, 1, 1);
+
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid1
+                  threadsPerThreadgroup:threadsPerThreadgroup1];
+
+    [activeEncoder setComputePipelineState:pipelineStateRMSBackwardDWReduce];
+    [activeEncoder setBuffer:bufferDwRows offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferGradWeight offset:0 atIndex:1];
+    [activeEncoder setBytes:&num_rows_val length:sizeof(uint) atIndex:2];
+    [activeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:3];
+
+    MTLSize threadgroupsPerGrid2 = MTLSizeMake((dims + 255) / 256, 1, 1);
+    MTLSize threadsPerThreadgroup2 = MTLSizeMake(256, 1, 1);
+
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid2
+                  threadsPerThreadgroup:threadsPerThreadgroup2];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateRMSBackwardDX];
+      [computeEncoder setBuffer:bufferGradOutput offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferInput offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferWeight offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufferGradInput offset:0 atIndex:3];
+      [computeEncoder setBuffer:bufferDwRows offset:0 atIndex:4];
+      [computeEncoder setBytes:&eps length:sizeof(float) atIndex:5];
+      [computeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:6];
+
+      MTLSize threadgroupsPerGrid1 = MTLSizeMake(num_rows, 1, 1);
+      MTLSize threadsPerThreadgroup1 = MTLSizeMake(256, 1, 1);
+
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid1
+                    threadsPerThreadgroup:threadsPerThreadgroup1];
+
+      [computeEncoder setComputePipelineState:pipelineStateRMSBackwardDWReduce];
+      [computeEncoder setBuffer:bufferDwRows offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferGradWeight offset:0 atIndex:1];
+      [computeEncoder setBytes:&num_rows_val length:sizeof(uint) atIndex:2];
+      [computeEncoder setBytes:&dims_val length:sizeof(uint) atIndex:3];
+
+      MTLSize threadgroupsPerGrid2 = MTLSizeMake((dims + 255) / 256, 1, 1);
+      MTLSize threadsPerThreadgroup2 = MTLSizeMake(256, 1, 1);
+
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid2
+                    threadsPerThreadgroup:threadsPerThreadgroup2];
+
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
 }
 
 void start_batch() {
@@ -410,6 +646,9 @@ void commit_batch() {
   [activeCmdBuffer commit];
   [activeCmdBuffer waitUntilCompleted];
   activeCmdBuffer = nil;
+  
+  // Run copy-back tasks for unaligned writes
+  run_copy_back_tasks();
   
   batchActive = false;
   bufferCache.clear();

@@ -80,6 +80,19 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
               const float *v, float *out_gqa);
 
 /**
+ * @brief Performs RMSNorm forward pass on the GPU.
+ */
+void rms_norm_forward(const float *input, float *output, const float *weight,
+                      float eps, size_t num_rows, size_t dims);
+
+/**
+ * @brief Performs RMSNorm backward pass on the GPU.
+ */
+void rms_norm_backward(const float *grad_output, const float *input, const float *weight,
+                       float *grad_input, float *grad_weight, float eps,
+                       size_t num_rows, size_t dims);
+
+/**
  * @brief Start a single grouped command buffer batch for the entire forward step.
  */
 void start_batch();

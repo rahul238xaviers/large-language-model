@@ -13,12 +13,14 @@
  */
 
 #include "RMSNorm.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <cmath>
 #include <cstddef>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
 #include <thread>
+#include <cstdlib>
 
 /**
  * @brief Construct a new RMSNorm object
@@ -59,6 +61,21 @@ Tensor RMSNorm::forward(const Tensor &x) const {
   Tensor result(x_shape);
   size_t total_elements = x.size();
   size_t num_rows = total_elements / dims;
+
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    metal_bridge::rms_norm_forward(x.data().data(), result.data().data(), weight_.data().data(),
+                                   eps_, num_rows, dims);
+    return result;
+  }
 
   unsigned int num_threads = std::thread::hardware_concurrency();
   if (num_threads == 0) num_threads = 4;
@@ -120,6 +137,22 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   Tensor grad_input(input.shape(), 0.0f);
   size_t total_elements = input.size();
   size_t num_rows = total_elements / dims;
+
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    metal_bridge::rms_norm_backward(grad_output.data().data(), input.data().data(), weight_.data().data(),
+                                    grad_input.data().data(), grad_weight.data().data(), eps_,
+                                    num_rows, dims);
+    return grad_input;
+  }
 
   float *dw_data = grad_weight.data().data();
 

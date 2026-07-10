@@ -176,14 +176,24 @@ add_custom_command(
             -DMAX_SEQ_LEN=${MAX_SEQ_LEN}
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
             -o ${CMAKE_BINARY_DIR}/gemm_gqa.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_forward.metal
+            -o ${CMAKE_BINARY_DIR}/rms_norm_forward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
+            -o ${CMAKE_BINARY_DIR}/rms_norm_backward.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
             ${CMAKE_BINARY_DIR}/gemm_gqa.air
+            ${CMAKE_BINARY_DIR}/rms_norm_forward.air
+            ${CMAKE_BINARY_DIR}/rms_norm_backward.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_forward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)
