@@ -142,8 +142,9 @@ class Checkpoint {
                     ▼
 ┌────────────────────────────────────────────────────────┐
 │  Sprint 6a: CPU Acceleration (Accelerate)      ✅ DONE  │
-│  Sprint 6b: Custom Metal GPU Kernels           🔄 NOW   │
-│  Sprint 6c: Safetensors Checkpointing          🔲 NEXT  │
+│  Sprint 6b: Custom Metal GPU Forward Kernels   ✅ DONE  │
+│  Sprint 6c: Custom Metal GPU Training Kernels  🔄 NOW   │
+│  Sprint 6d: Safetensors Checkpointing          🔲 NEXT  │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -214,7 +215,7 @@ class Checkpoint {
 
 ---
 
-### Sprint 6b: Custom Metal GPU Kernels 🔄
+### Sprint 6b: Custom Metal GPU Forward Kernels ✅
 
 **Objective**: Move large matrix multiplications to Apple Silicon GPU using custom Metal compute shaders that beat `MPSMatrixMultiplication` for our specific training shapes.
 
@@ -284,7 +285,39 @@ target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 
 ---
 
-### Sprint 6c: Safetensors Checkpointing 🔲
+### Sprint 6c: Custom Metal GPU Training Kernels 🔄
+
+**Objective**: Move all remaining non-GEMM forward/backward layers and the optimizer step to custom GPU kernels. This completely eliminates CPU bottlenecks and host-device memory copying, unlocking full end-to-end GPU training.
+
+**Shaders to implement:**
+
+| Shader | Operation | Purpose |
+|---|---|---|
+| `rms_norm_forward.metal` | RMSNorm Forward | GPU row-level mean-square normalizer |
+| `rms_norm_backward.metal` | RMSNorm Backward | Row-level dx calculation + two-pass weight gradient reduction |
+| `swiglu_backward.metal` | SwiGLU Backward | Element-wise SwiGLU derivative maps |
+| `rope_backward.metal` | RoPE Backward | Inverse phase rotation of Q & K gradients |
+| `gqa_backward.metal` | GQA Attention Backward | Fused softmax derivative + KV gradient accumulation |
+| `adamw_step.metal` | AdamW Update | Fused parameter update (moments, weight decay, update application) |
+
+**New deliverables:**
+```
+cpp/src/gpu_kernel/
+  rms_norm_forward.metal
+  rms_norm_backward.metal
+  swiglu_backward.metal
+  rope_backward.metal
+  gqa_backward.metal
+  adamw_step.metal
+```
+
+**Verification gates:**
+- Correctness: Run `./build/test_gpu_kernels` to verify L2 relative error remains `0.000000` for all forward & backward passes.
+- Performance: Run `./build/test_trainer` to verify training step latency drops from **~84,000 ms** (due to CPU backward pass) to **< 100 ms**!
+
+---
+
+### Sprint 6d: Safetensors Checkpointing 🔲
 
 **Objective**: Serialize and deserialize model weights to/from the safetensors format for checkpoint save/load/resume.
 
