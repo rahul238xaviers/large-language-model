@@ -24,11 +24,25 @@ public:
   void forward(Tensor &q, Tensor &k) const;
 
   // Accessors for testing
-  const std::vector<std::vector<float>> &cos_table() const {
-    return cos_table_;
+  std::vector<std::vector<float>> cos_table() const {
+    size_t half_dim = head_dim_ / 2;
+    std::vector<std::vector<float>> res(max_seq_len_, std::vector<float>(half_dim));
+    for (size_t s = 0; s < max_seq_len_; s++) {
+      for (size_t i = 0; i < half_dim; i++) {
+        res[s][i] = cos_table_[s * half_dim + i];
+      }
+    }
+    return res;
   }
-  const std::vector<std::vector<float>> &sin_table() const {
-    return sin_table_;
+  std::vector<std::vector<float>> sin_table() const {
+    size_t half_dim = head_dim_ / 2;
+    std::vector<std::vector<float>> res(max_seq_len_, std::vector<float>(half_dim));
+    for (size_t s = 0; s < max_seq_len_; s++) {
+      for (size_t i = 0; i < half_dim; i++) {
+        res[s][i] = sin_table_[s * half_dim + i];
+      }
+    }
+    return res;
   }
   // Applies inverse rotary position embeddings to Query and Key gradients
   // in-place
@@ -39,9 +53,9 @@ private:
   size_t max_seq_len_;
   float base_;
 
-  // Pre-computed tables of shape [max_seq_len, head_dim / 2]
-  std::vector<std::vector<float>> cos_table_;
-  std::vector<std::vector<float>> sin_table_;
+  // Pre-computed tables of shape [max_seq_len * (head_dim / 2)]
+  std::vector<float> cos_table_;
+  std::vector<float> sin_table_;
 
   void precompute_tables();
 };

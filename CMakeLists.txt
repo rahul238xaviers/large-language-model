@@ -164,8 +164,8 @@ find_program(XCRUN xcrun)
 set(MAX_SEQ_LEN 2048 CACHE STRING "Maximum sequence length for GQA attention kernel")
 
 # Tiling configurations for GEMM kernels (can be customized at build time)
-set(FFN_TILE_M 128 CACHE STRING "FFN tile M dimension size")
-set(FFN_TILE_N 128 CACHE STRING "FFN tile N dimension size")
+set(FFN_TILE_M 64 CACHE STRING "FFN tile M dimension size")
+set(FFN_TILE_N 64 CACHE STRING "FFN tile N dimension size")
 set(FFN_TILE_K 32 CACHE STRING "FFN tile K dimension size")
 
 set(PROJ_TILE_M 64 CACHE STRING "Projection tile M dimension size")
@@ -193,18 +193,28 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
             -o ${CMAKE_BINARY_DIR}/rms_norm_backward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_backward.metal
+            -o ${CMAKE_BINARY_DIR}/swiglu_backward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_backward.metal
+            -o ${CMAKE_BINARY_DIR}/rope_backward.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
             ${CMAKE_BINARY_DIR}/gemm_gqa.air
             ${CMAKE_BINARY_DIR}/rms_norm_forward.air
             ${CMAKE_BINARY_DIR}/rms_norm_backward.air
+            ${CMAKE_BINARY_DIR}/swiglu_backward.air
+            ${CMAKE_BINARY_DIR}/rope_backward.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_forward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_backward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_backward.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)

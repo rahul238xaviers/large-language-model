@@ -29,8 +29,8 @@ struct GQAParams {
  * @param N Number of columns in B and C
  * @param K Number of columns in A and rows in B
  */
-void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c, size_t M, size_t N,
-              size_t K);
+void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c,
+              size_t M, size_t N, size_t K);
 
 /**
  * @brief Multiply matrices A [M x K] and B [K x N] to produce C [M x N] on GPU
@@ -88,17 +88,42 @@ void rms_norm_forward(const float *input, float *output, const float *weight,
 /**
  * @brief Performs RMSNorm backward pass on the GPU.
  */
-void rms_norm_backward(const float *grad_output, const float *input, const float *weight,
-                       float *grad_input, float *grad_weight, float eps,
-                       size_t num_rows, size_t dims);
+void rms_norm_backward(const float *grad_output, const float *input,
+                       const float *weight, float *grad_input,
+                       float *grad_weight, float eps, size_t num_rows,
+                       size_t dims);
 
 /**
- * @brief Start a single grouped command buffer batch for the entire forward step.
+ * @brief Performs SwiGLU backward pass on the GPU.
+ * @param grad_output Gradient of the loss with respect to the output of the
+ * SwiGLU layer
+ * @param gate Input to the gate activation function
+ * @param up Input to the up activation function
+ * @param grad_gate Gradient of the loss with respect to the gate activation
+ * function
+ * @param grad_up Gradient of the loss with respect to the up activation
+ * function
+ * @param n Number of elements in the input arrays
+ */
+void swiglu_backward(const float *grad_output, const float *gate,
+                     const float *up, float *grad_gate, float *grad_up,
+                     size_t n);
+
+/**
+ * @brief Performs Rotary Position Embedding (RoPE) backward pass on the GPU in-place.
+ */
+void rope_backward(float *grad, const float *cos_table, const float *sin_table,
+                   size_t batch, size_t heads, size_t seq_len, size_t head_dim);
+
+/**
+ * @brief Start a single grouped command buffer batch for the entire forward
+ * step.
  */
 void start_batch();
 
 /**
- * @brief Commit the active compute encoder and command buffer, and wait for GPU completion once.
+ * @brief Commit the active compute encoder and command buffer, and wait for GPU
+ * completion once.
  */
 void commit_batch();
 

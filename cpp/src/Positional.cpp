@@ -15,6 +15,7 @@
  */
 
 #include "Positional.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -48,8 +49,8 @@ void RoPE::precompute_tables() {
 
   size_t half_dim = head_dim_ / 2;
 
-  cos_table_.resize(max_seq_len_, std::vector<float>(half_dim));
-  sin_table_.resize(max_seq_len_, std::vector<float>(half_dim));
+  cos_table_.resize(max_seq_len_ * half_dim);
+  sin_table_.resize(max_seq_len_ * half_dim);
   std::vector<float> theta(half_dim);
 
   for (size_t i = 0; i < half_dim; i++) {
@@ -60,8 +61,8 @@ void RoPE::precompute_tables() {
   for (size_t pos = 0; pos < max_seq_len_; pos++) {
 
     for (size_t i = 0; i < half_dim; i++) {
-      cos_table_[pos][i] = std::cos(pos * theta[i]);
-      sin_table_[pos][i] = std::sin(pos * theta[i]);
+      cos_table_[pos * half_dim + i] = std::cos(pos * theta[i]);
+      sin_table_[pos * half_dim + i] = std::sin(pos * theta[i]);
     }
   }
 }
@@ -111,8 +112,8 @@ void RoPE::forward(Tensor &q, Tensor &k) const {
             float x0 = t(b, h, s, idx0);
             float x1 = t(b, h, s, idx1);
 
-            float cos_val = cos_table_[s][i];
-            float sin_val = sin_table_[s][i];
+            float cos_val = cos_table_[s * half_dim + i];
+            float sin_val = sin_table_[s * half_dim + i];
 
             t(b, h, s, idx0) = x0 * cos_val - x1 * sin_val;
             t(b, h, s, idx1) = x0 * sin_val + x1 * cos_val;
@@ -154,6 +155,31 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
     throw std::invalid_argument("Head dimensions must match");
   }
 
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    size_t batch = grad_q.shape()[0];
+    size_t q_heads = grad_q.shape()[1];
+    size_t k_heads = grad_k.shape()[1];
+    size_t seq_len = grad_q.shape()[2];
+    size_t head_dim = grad_q.shape()[3];
+
+    metal_bridge::rope_backward(grad_q.data().data(), cos_table_.data(),
+                                sin_table_.data(), batch, q_heads, seq_len,
+                                head_dim);
+    metal_bridge::rope_backward(grad_k.data().data(), cos_table_.data(),
+                                sin_table_.data(), batch, k_heads, seq_len,
+                                head_dim);
+    return;
+  }
+
   auto result_t = [&](Tensor &t) {
     size_t batch_size = t.shape()[0];
     size_t head_count = t.shape()[1];
@@ -170,8 +196,8 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
             float x0 = t(b, h, s, idx0);
             float x1 = t(b, h, s, idx1);
 
-            float cos_val = cos_table_[s][i];
-            float sin_val = sin_table_[s][i];
+            float cos_val = cos_table_[s * half_dim + i];
+            float sin_val = sin_table_[s * half_dim + i];
 
             t(b, h, s, idx0) = x0 * cos_val + x1 * sin_val;
             t(b, h, s, idx1) = -x0 * sin_val + x1 * cos_val;

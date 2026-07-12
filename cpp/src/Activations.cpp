@@ -13,10 +13,11 @@
 #include "Activations.hpp"
 #include "Tensor.hpp"
 #define ACCELERATE_NEW_LAPACK
+#include "gpu_kernel/MetalBridge.hpp"
 #include <Accelerate/Accelerate.h>
 
-#include <vector>
 #include <thread>
+#include <vector>
 
 namespace activatations {
 
@@ -101,6 +102,21 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
   float *dg_ptr = grad_gate.data().data();
   float *du_ptr = grad_up.data().data();
 
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  // Use the GPU if enabled otherwise CPU
+  if (use_gpu) {
+    metal_bridge::swiglu_backward(dy_ptr, g_ptr, u_ptr, dg_ptr, du_ptr, n);
+    return;
+  }
+
   // Compute sig = sigmoid(gate) using vForce exp
   std::vector<float> neg_g(n), sig(n), silu_val(n), dsilu(n);
   vDSP_vneg(g_ptr, 1, neg_g.data(), 1, static_cast<vDSP_Length>(n));
@@ -116,7 +132,8 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
 
   // dsilu = sigmoid * (1 + gate * (1 - sigmoid))
   unsigned int num_threads = std::thread::hardware_concurrency();
-  if (num_threads == 0) num_threads = 4;
+  if (num_threads == 0)
+    num_threads = 4;
 
   std::vector<std::thread> workers;
   int items_per_thread = (n + num_threads - 1) / num_threads;
@@ -125,7 +142,8 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
     int start_idx = t * items_per_thread;
     int end_idx = std::min(start_idx + items_per_thread, n);
 
-    if (start_idx >= end_idx) continue;
+    if (start_idx >= end_idx)
+      continue;
 
     workers.emplace_back([start_idx, end_idx, &dsilu, &sig, g_ptr]() {
       for (int i = start_idx; i < end_idx; ++i) {
