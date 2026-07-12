@@ -289,16 +289,14 @@ target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 
 **Objective**: Move all remaining non-GEMM forward/backward layers and the optimizer step to custom GPU kernels. This completely eliminates CPU bottlenecks and host-device memory copying, unlocking full end-to-end GPU training.
 
-**Shaders to implement:**
-
-| Shader | Operation | Purpose |
+| Shader | Operation | Status |
 |---|---|---|
-| `rms_norm_forward.metal` | RMSNorm Forward | GPU row-level mean-square normalizer |
-| `rms_norm_backward.metal` | RMSNorm Backward | Row-level dx calculation + two-pass weight gradient reduction |
-| `swiglu_backward.metal` | SwiGLU Backward | Element-wise SwiGLU derivative maps |
-| `rope_backward.metal` | RoPE Backward | Inverse phase rotation of Q & K gradients |
-| `gqa_backward.metal` | GQA Attention Backward | Fused softmax derivative + KV gradient accumulation |
-| `adamw_step.metal` | AdamW Update | Fused parameter update (moments, weight decay, update application) |
+| `rms_norm_forward.metal` | RMSNorm Forward | ✅ Completed |
+| `rms_norm_backward.metal` | RMSNorm Backward | ✅ Completed |
+| `swiglu_backward.metal` | SwiGLU Backward | ✅ Completed |
+| `rope_backward.metal` | RoPE Backward | ✅ Completed |
+| `gqa_backward.metal` | GQA Attention Backward | 🔄 In Progress |
+| `adamw_step.metal` | AdamW Update | 🔲 Pending |
 
 **New deliverables:**
 ```
