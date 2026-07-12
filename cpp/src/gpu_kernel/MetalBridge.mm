@@ -278,7 +278,7 @@ void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c, 
     [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:4];
 
     MTLSize threadgroupsPerGrid =
-        MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
+        MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
     MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
 
     [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
@@ -296,7 +296,7 @@ void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c, 
       [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:4];
 
       MTLSize threadgroupsPerGrid =
-          MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
+          MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
 
       MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
       [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
