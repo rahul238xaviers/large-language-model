@@ -20,7 +20,7 @@ graph TD
     Engine -->|Saves| Checkpoints[(Safetensors Checkpoints)]
     Engine -->|Logs Metrics| CSVLogs[(metrics.csv)]
     Engine -->|Dispatches to| CPU[macOS Accelerate\nAMX · BLAS · vDSP · GCD]
-    Engine -->|Dispatches to| GPU[Apple Metal GPU\nCustom GEMM Kernels]
+    Engine -->|Dispatches to| GPU[Apple Metal GPU\nCustom GEMM & Element-wise Shaders]
     CPU <-->|Concurrent\nOperation Split| GPU
 ```
 
@@ -52,8 +52,8 @@ graph TD
     ParquetData -->|Reads| DataIngest
     DataIngest -->|Streams Token Batches| TrainerApp
     TrainerApp -->|Feeds Forward/Backward| ModelCore
-    ModelCore -->|Large matmul → GPU| MetalGPU
-    ModelCore -->|Element-wise & small matmul → CPU| Optimizer
+    ModelCore -->|Matmuls & Element-wise Layers → GPU| MetalGPU
+    ModelCore -->|Small operations & CPU Fallback → CPU| Optimizer
     MetalGPU -.->|Concurrent operation split| ModelCore
     ModelCore -->|Updates Gradients| Optimizer
     TrainerApp -->|Saves| Checkpoints
@@ -83,6 +83,10 @@ graph TD
     ShapeDispatcher -->|Tall × square| ProjKernel[gemm_proj.metal\nWeight-Reuse Streaming]
     ShapeDispatcher -->|Tall × wide| FFNKernel[gemm_ffn.metal\n128×128 tile GEMM]
     ShapeDispatcher -->|Small / unknown| CPUFallback[cblas_sgemm CPU]
+
+    RMSNorm -->|Forward/Backward GPU Shaders| RMSNormKernels[rms_norm_forward.metal\nrms_norm_backward.metal]
+    SwiGLU -->|Backward GPU Shader| SwiGLUKernel[swiglu_backward.metal]
+    RoPE -->|Backward GPU Shader| RoPEKernel[rope_backward.metal]
 ```
 
 ---
@@ -301,6 +305,9 @@ target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 **New deliverables:**
 ```
 cpp/src/gpu_kernel/
+  gemm_ffn.metal
+  gemm_gqa.metal
+  gemm_proj.metal
   rms_norm_forward.metal
   rms_norm_backward.metal
   swiglu_backward.metal
