@@ -1,57 +1,81 @@
-# 🎨 Active Whiteboard: Coding the RoPE Table Generator 🌈
-
-Let's write a complete Python function that builds the cosine and sine tables exactly like the C++ model does.
+# 🎨 Active Whiteboard: Full Self-Attention Flow (Visual) 🌈
 
 ---
 
-## 🧮 The Formulas
-
-### 1. Frequencies (`theta`)
-For each column pair `i` (where `i` goes from `0` to `(head_dim / 2) - 1`):
-* **Exponent:** `exponent = (2.0 * i) / head_dim`
-* **Frequency:** `theta[i] = 1.0 / (base ^ exponent)`
-
-### 2. Table Elements
-For each position `pos` (from `0` to `max_seq_len - 1`) and each pair `i`:
-* `cos_table[pos][i] = cos(pos * theta[i])`
-* `sin_table[pos][i] = sin(pos * theta[i])`
+## 📝 Input: Our 6-Token Sentence
+```
+[ tok1, tok2, tok3, tok4, tok5, tok6 ]
+```
+Each token has been normalized and projected. Now each token has its own Q, K, and V vector.
 
 ---
 
-## ⚙️ The Configuration
-You will write a Python generator for the following production-grade configuration:
-* **`head_dimension`:** `64` (so `head_dim // 2 = 32` column pairs)
-* **`max_seq_len`:** `5` (positions `pos` go from `0` to `4`)
-* **`base`:** `10000.0` (standard LLaMA/Transformer base constant)
-
-Your output tables must have the shape `[5, 32]`.
-
----
-
-## 💻 Python Coding Challenge
-
-Write a Python function with the following signature:
-
-```python
-import numpy as np
-
-def precompute_rope_tables(head_dim: int, max_seq_len: int, base: float = 10000.0):
-    # 1. Initialize empty arrays for cos_table and sin_table of shape [max_seq_len, head_dim // 2]
-    # 2. Compute theta for each pair i in range(head_dim // 2)
-    # 3. For each position pos in range(max_seq_len), compute cos and sin
-    # 4. Return cos_table, sin_table
-    pass
+## 🔢 Step 1: Q, K, V Projections (Token-Local)
+Each token independently computes its own Q, K, V:
+```
+tok1 → Q1, K1, V1
+tok2 → Q2, K2, V2
+tok3 → Q3, K3, V3
+tok4 → Q4, K4, V4
+tok5 → Q5, K5, V5
+tok6 → Q6, K6, V6
 ```
 
 ---
 
-## 🔍 Validation Checkpoints
+## 🔀 Step 2: Raw Attention Scores (Cross-Token)
+Every Q is dot-producted with every K → fills a 6x6 score grid:
+```
+             K1      K2      K3      K4      K5      K6
+           +-------+-------+-------+-------+-------+-------+
+Q1         |Q1·K1  |Q1·K2  |Q1·K3  |Q1·K4  |Q1·K5  |Q1·K6  |
+           +-------+-------+-------+-------+-------+-------+
+Q2         |Q2·K1  |Q2·K2  |Q2·K3  |Q2·K4  |Q2·K5  |Q2·K6  |
+           +-------+-------+-------+-------+-------+-------+
+Q3         |Q3·K1  |Q3·K2  |Q3·K3  |Q3·K4  |Q3·K5  |Q3·K6  |
+           +-------+-------+-------+-------+-------+-------+
+Q4         |Q4·K1  |Q4·K2  |Q4·K3  |Q4·K4  |Q4·K5  |Q4·K6  |
+           +-------+-------+-------+-------+-------+-------+
+Q5         |Q5·K1  |Q5·K2  |Q5·K3  |Q5·K4  |Q5·K5  |Q5·K6  |
+           +-------+-------+-------+-------+-------+-------+
+Q6         |Q6·K1  |Q6·K2  |Q6·K3  |Q6·K4  |Q6·K5  |Q6·K6  |
+           +-------+-------+-------+-------+-------+-------+
+```
 
-To verify your function is 100% correct, run it and check if it yields the following values at these coordinates:
+---
 
-1. **At `pos = 3`, pair `i = 0`:** 
-   What is the value of `cos_table[3][0]`?
-2. **At `pos = 2`, pair `i = 1`:**
-   What is the value of `sin_table[2][1]`?
-3. **At `pos = 4`, pair `i = 16`:**
-   What is the value of `cos_table[4][16]`?
+## 📊 Step 3: Softmax (Row-Wise)
+We apply softmax to EACH ROW independently.
+Each row of 6 raw scores is converted into 6 probabilities that sum to 1.0:
+```
+             K1      K2      K3      K4      K5      K6      SUM
+           +-------+-------+-------+-------+-------+-------+-----+
+Q1         | 0.05  | 0.40  | 0.20  | 0.15  | 0.10  | 0.10  | 1.0 |
+Q2         | 0.30  | 0.10  | 0.20  | 0.10  | 0.20  | 0.10  | 1.0 |
+Q3         | 0.10  | 0.05  | 0.50  | 0.20  | 0.10  | 0.05  | 1.0 |
+...
+           +-------+-------+-------+-------+-------+-------+-----+
+```
+
+---
+
+## 🎯 Step 4: Weighted Sum with V (Output Calculation)
+For each token, we mix the V vectors using that token's row of attention weights:
+```
+output_tok3 = 0.10 * V1
+            + 0.05 * V2
+            + 0.50 * V3   ← tok3 pays most attention to itself here!
+            + 0.20 * V4
+            + 0.10 * V5
+            + 0.05 * V6
+```
+
+The result is a new, context-enriched vector for tok3 that contains information from all other tokens it paid attention to.
+
+---
+
+## ✏️ Interactive Challenge!
+Look at the softmax row for Q3 above: `[0.10, 0.05, 0.50, 0.20, 0.10, 0.05]`.
+
+1. Which token does tok3 pay the **most** attention to?
+2. If we want tok3's output to be heavily influenced by tok6, what would we need the weight for K6 to be: higher or lower than `0.05`?
