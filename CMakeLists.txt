@@ -158,6 +158,15 @@ target_link_libraries(test_trainer PUBLIC
     data_ingestion
 )
 
+# Define our production Run Trainer executable
+add_executable(run_trainer
+    cpp/src/RunTrainer.cpp
+)
+# Link it against our library
+target_link_libraries(run_trainer PUBLIC
+    data_ingestion
+)
+
 # 1. Find the xcrun tool on macOS
 find_program(XCRUN xcrun)
 
