@@ -47,7 +47,7 @@ static void initialize_gpt_weights(Transformer &model) {
 }
 
 int main(int argc, char* argv[]) {
-  bool use_gpu = true; // Enabled by default for production pre-training
+  bool use_gpu = true;
   size_t batch_size = 4;
   size_t max_steps = 10000;
   std::string data_dir = "data/raw_chunks/bigcode/the-stack-v2/data/c++/";
@@ -55,6 +55,21 @@ int main(int argc, char* argv[]) {
   std::string checkpoint_dir = "checkpoints";
   std::string metrics_filepath = "metrics.csv";
   bool resume = true;
+
+  // Default 1.6B parameter Rust-GPT production configurations
+  ModelConfig config;
+  config.vocab_size = 100277; // cl100k_base
+  config.hidden_dim = 2048;
+  config.intermediate_dim = 5461;
+  config.n_layers = 24;
+  config.n_heads = 16;
+  config.n_kv_heads = 8;
+  config.head_dim = 128;
+  config.max_seq_len = 2048;
+  config.rope_base = 10000.0f;
+  config.rms_norm_eps = 1e-5f;
+
+  size_t checkpoint_interval = 500;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -76,6 +91,22 @@ int main(int argc, char* argv[]) {
       metrics_filepath = argv[++i];
     } else if (arg == "--no-resume") {
       resume = false;
+    } else if (arg == "--hidden_dim" && i + 1 < argc) {
+      config.hidden_dim = std::stoull(argv[++i]);
+    } else if (arg == "--intermediate_dim" && i + 1 < argc) {
+      config.intermediate_dim = std::stoull(argv[++i]);
+    } else if (arg == "--n_layers" && i + 1 < argc) {
+      config.n_layers = std::stoull(argv[++i]);
+    } else if (arg == "--n_heads" && i + 1 < argc) {
+      config.n_heads = std::stoull(argv[++i]);
+    } else if (arg == "--n_kv_heads" && i + 1 < argc) {
+      config.n_kv_heads = std::stoull(argv[++i]);
+    } else if (arg == "--head_dim" && i + 1 < argc) {
+      config.head_dim = std::stoull(argv[++i]);
+    } else if (arg == "--max_seq_len" && i + 1 < argc) {
+      config.max_seq_len = std::stoull(argv[++i]);
+    } else if (arg == "--checkpoint_interval" && i + 1 < argc) {
+      checkpoint_interval = std::stoull(argv[++i]);
     }
   }
 
@@ -87,19 +118,6 @@ int main(int argc, char* argv[]) {
     setenv("GPU_ENABLED", "0", 1);
     std::cout << "[INFO] CPU execution enabled (GPU_ENABLED=0)" << std::endl;
   }
-
-  // 1.6B parameter Rust-GPT production configurations
-  ModelConfig config;
-  config.vocab_size = 100277; // cl100k_base
-  config.hidden_dim = 2048;
-  config.intermediate_dim = 5461;
-  config.n_layers = 24;
-  config.n_heads = 16;
-  config.n_kv_heads = 8;
-  config.head_dim = 128;
-  config.max_seq_len = 2048;
-  config.rope_base = 10000.0f;
-  config.rms_norm_eps = 1e-5f;
 
   std::cout << "==========================================================" << std::endl;
   std::cout << "    RUST-GPT 1.6B LLM C++ PRODUCTION PRE-TRAINING ENGINE" << std::endl;
@@ -138,7 +156,7 @@ int main(int argc, char* argv[]) {
   train_cfg.lr_max = 3e-4f;
   train_cfg.lr_min = 3e-5f;
   train_cfg.log_interval = 10;
-  train_cfg.checkpoint_interval = 500;
+  train_cfg.checkpoint_interval = checkpoint_interval;
   train_cfg.keep_last_n_checkpoints = 3;
   train_cfg.checkpoint_dir = checkpoint_dir;
   train_cfg.metrics_filepath = metrics_filepath;
