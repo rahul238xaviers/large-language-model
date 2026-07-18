@@ -30,6 +30,7 @@ public:
   ~DataIngestion();
   std::vector<std::vector<int>> get_batch();
   void skip_sequences(size_t num_sequences);
+  size_t batch_size() const { return batch_size_; }
   static constexpr int EOT = 100257;
 
 private:

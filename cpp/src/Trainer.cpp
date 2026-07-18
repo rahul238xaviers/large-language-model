@@ -148,7 +148,7 @@ void Trainer::_truncate_metrics_file(size_t step_cutoff) {
  * runs the training step (forward, loss, backward), and logs stats.
  */
 void Trainer::train() {
-  size_t batch_size = model_.token_embeddings().shape()[1]; // Toy batch default placeholder
+  size_t batch_size = data_loader_.batch_size();
   
   std::vector<Tensor> grad_w_gate, grad_w_up, grad_w_down, grad_Wq, grad_Wk, grad_Wv, grad_Wo;
   for (const auto &layer : model_.layers()) {
@@ -233,6 +233,7 @@ void Trainer::train() {
   std::cout << "[INFO] Commencing pre-training loop..." << std::endl;
 
   for (size_t step = start_step; step < config_.max_steps; ++step) {
+    std::cout << "[DEBUG] Starting step: " << step << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
     
     std::vector<std::vector<int>> batch = data_loader_.get_batch();

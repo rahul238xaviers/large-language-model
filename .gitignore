@@ -62,10 +62,16 @@ Thumbs.db
 
 # Data files (optional - uncomment if you don't want to commit data)
 # *.txt
-# *.csv
+*.csv
 # *.json
 
 # Logs
 *.log
 apple-silicon/data/
 .continue/
+
+# Checkpoints and outputs
+*.safetensors
+checkpoints/
+test_run_checkpoints/
+test_output.txt
