@@ -290,7 +290,7 @@ void Trainer::train() {
     if ((step + 1) % config_.checkpoint_interval == 0 || (step + 1) == config_.max_steps) {
       fs::create_directories(config_.checkpoint_dir);
       char ckpt_filename[256];
-      std::sprintf(ckpt_filename, "step_%07d.safetensors", static_cast<int>(step + 1));
+      std::snprintf(ckpt_filename, sizeof(ckpt_filename), "step_%07d.safetensors", static_cast<int>(step + 1));
       std::string ckpt_path = (fs::path(config_.checkpoint_dir) / ckpt_filename).string();
       
       std::cout << "[INFO] Saving checkpoint to " << ckpt_path << "..." << std::endl;

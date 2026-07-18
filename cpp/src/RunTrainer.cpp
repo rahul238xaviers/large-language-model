@@ -4,15 +4,11 @@
  */
 
 #include "Trainer.hpp"
-#include "Checkpoint.hpp"
 #include <iostream>
 #include <string>
 #include <cstdlib>
 #include <random>
 #include <cmath>
-#include <filesystem>
-
-namespace fs = std::filesystem;
 
 // WHAT: Helper function to initialize GPT-2/LLaMA style weights using standard normal distributions.
 // WHY: Ensures that if we train from scratch (no checkpoint), the network has standard, stable weight distributions.
