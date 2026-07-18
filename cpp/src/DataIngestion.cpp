@@ -586,3 +586,40 @@ std::vector<std::vector<int>> DataIngestion::get_batch() {
   current_batch_idx_ += batch_count;
   return batch;
 }
+
+void DataIngestion::skip_sequences(size_t num_sequences) {
+  size_t skipped = 0;
+  while (skipped < num_sequences) {
+    if (current_batch_idx_ >= token_batches_.size()) {
+      if (file_paths_.empty()) {
+        break;
+      }
+      flat_tokens_.clear();
+      if (shards_.empty() && current_batch_idx_ == 0 && current_shard_idx_ == 0) {
+        // First time loading shards
+      } else {
+        current_shard_idx_++;
+      }
+      if (current_shard_idx_ >= file_paths_.size()) {
+        break;
+      }
+      auto status = load_parquet_shard(file_paths_[current_shard_idx_]);
+      if (!status.ok()) {
+        current_shard_idx_++;
+        continue;
+      }
+      tokenize_cpp_corpus(shards_.back(), "content");
+      generate_training_sequences();
+      shards_.clear();
+      if (token_batches_.empty()) {
+        continue;
+      }
+    }
+    size_t available = token_batches_.size() - current_batch_idx_;
+    size_t to_skip = std::min(num_sequences - skipped, available);
+    current_batch_idx_ += to_skip;
+    skipped += to_skip;
+  }
+  std::cout << "[INFO] Resume | Skipped " << skipped << " already-processed sequences (" 
+            << skipped * (sequence_length_ + 1) << " tokens) from data stream." << std::endl;
+}

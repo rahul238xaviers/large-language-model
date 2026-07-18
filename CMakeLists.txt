@@ -47,6 +47,7 @@ add_library(data_ingestion
     cpp/src/Loss.cpp
     cpp/src/Optimizer.cpp
     cpp/src/Trainer.cpp
+    cpp/src/Checkpoint.cpp
     cpp/src/gpu_kernel/MetalBridge.mm
 )
 
@@ -199,6 +200,13 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_backward.metal
             -o ${CMAKE_BINARY_DIR}/rope_backward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            -DMAX_SEQ_LEN=${MAX_SEQ_LEN}
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_backward.metal
+            -o ${CMAKE_BINARY_DIR}/gqa_backward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/adamw_step.metal
+            -o ${CMAKE_BINARY_DIR}/adamw_step.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
@@ -207,6 +215,8 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/rms_norm_backward.air
             ${CMAKE_BINARY_DIR}/swiglu_backward.air
             ${CMAKE_BINARY_DIR}/rope_backward.air
+            ${CMAKE_BINARY_DIR}/gqa_backward.air
+            ${CMAKE_BINARY_DIR}/adamw_step.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
@@ -215,6 +225,8 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_backward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_backward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/adamw_step.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)

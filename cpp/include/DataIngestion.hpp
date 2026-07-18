@@ -29,6 +29,7 @@ public:
                 const std::string &vocab_path);
   ~DataIngestion();
   std::vector<std::vector<int>> get_batch();
+  void skip_sequences(size_t num_sequences);
   static constexpr int EOT = 100257;
 
 private:

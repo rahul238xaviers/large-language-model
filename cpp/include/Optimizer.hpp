@@ -15,12 +15,12 @@
 
 #include "Tensor.hpp"
 #include <vector>
-#include <cmath>
 
 /**
  * @brief Base Optimizer class.
  *
- * Tracks references to model parameters and their corresponding gradient tensors.
+ * Tracks references to model parameters and their corresponding gradient
+ * tensors.
  */
 class Optimizer {
 public:
@@ -76,8 +76,10 @@ public:
   /**
    * @brief Construct a new AdamWOptimizer object.
    *
-   * @param beta1 Exponential decay rate for the first moment estimates (default 0.9).
-   * @param beta2 Exponential decay rate for the second moment estimates (default 0.999).
+   * @param beta1 Exponential decay rate for the first moment estimates (default
+   * 0.9).
+   * @param beta2 Exponential decay rate for the second moment estimates
+   * (default 0.999).
    * @param eps Small epsilon to prevent division by zero (default 1e-8).
    * @param weight_decay Decoupled weight decay coefficient (default 0.01).
    */
@@ -98,6 +100,13 @@ public:
    * @param lr Learning rate.
    */
   void step(float lr) override;
+
+  const std::vector<Tensor> &m_states() const { return m_states_; }
+  std::vector<Tensor> &m_states() { return m_states_; }
+  const std::vector<Tensor> &v_states() const { return v_states_; }
+  std::vector<Tensor> &v_states() { return v_states_; }
+  size_t step_count() const { return step_count_; }
+  size_t &step_count() { return step_count_; }
 
 private:
   float beta1_;

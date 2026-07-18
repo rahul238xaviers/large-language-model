@@ -12,6 +12,7 @@
  */
 
 #include "Optimizer.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <stdexcept>
 #include <vector>
 #include <thread>
@@ -101,6 +102,30 @@ static void adamw_update_parameter(
   const float *g_data = grad.data().data();
   float *m_data = m.data().data();
   float *v_data = v.data().data();
+
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    metal_bridge::AdamWStepParams p;
+    p.lr = lr;
+    p.beta1 = beta1;
+    p.beta2 = beta2;
+    p.eps = eps;
+    p.weight_decay = weight_decay;
+    p.bias_correction1 = bias_correction1;
+    p.bias_correction2 = bias_correction2;
+    p.n = static_cast<uint32_t>(n);
+
+    metal_bridge::adamw_step(p_data, g_data, m_data, v_data, p);
+    return;
+  }
 
   unsigned int num_threads = std::thread::hardware_concurrency();
   if (num_threads == 0) num_threads = 4;

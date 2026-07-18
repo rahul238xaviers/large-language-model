@@ -5,11 +5,15 @@
 
 #include "Trainer.hpp"
 #include "Loss.hpp"
+#include "Checkpoint.hpp"
 #include "gpu_kernel/MetalBridge.hpp"
 #include <cmath>
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 
 /**
  * @brief Construct a new Trainer object.
@@ -98,10 +102,53 @@ static void run_training_step(
  * Each step gets a token batch from data loader, computes learning rate,
  * runs the training step (forward, loss, backward), and logs stats.
  */
+namespace fs = std::filesystem;
+
+void Trainer::_truncate_metrics_file(size_t step_cutoff) {
+  if (!fs::exists(config_.metrics_filepath)) return;
+  
+  std::vector<std::string> lines;
+  std::ifstream file(config_.metrics_filepath);
+  if (file.is_open()) {
+    std::string line;
+    std::string header;
+    if (std::getline(file, header)) {
+      lines.push_back(header);
+    }
+    while (std::getline(file, line)) {
+      if (line.empty()) continue;
+      std::stringstream ss(line);
+      std::string step_str;
+      if (std::getline(ss, step_str, ',')) {
+        try {
+          size_t step_val = std::stoull(step_str);
+          if (step_val < step_cutoff) {
+            lines.push_back(line);
+          }
+        } catch (...) {}
+      }
+    }
+    file.close();
+  }
+
+  std::ofstream out(config_.metrics_filepath);
+  if (out.is_open()) {
+    for (const auto &line : lines) {
+      out << line << "\n";
+    }
+    out.close();
+    std::cout << "[INFO] Truncated metrics file to step " << step_cutoff - 1 << std::endl;
+  }
+}
+
+/**
+ * @brief Executes the pre-training loop for the configured number of steps.
+ *
+ * Each step gets a token batch from data loader, computes learning rate,
+ * runs the training step (forward, loss, backward), and logs stats.
+ */
 void Trainer::train() {
   size_t batch_size = model_.token_embeddings().shape()[1]; // Toy batch default placeholder
-  // We can look up batch size from data_loader or set configuration
-  // Let's assume standard training settings
   
   std::vector<Tensor> grad_w_gate, grad_w_up, grad_w_down, grad_Wq, grad_Wk, grad_Wv, grad_Wo;
   for (const auto &layer : model_.layers()) {
@@ -129,9 +176,63 @@ void Trainer::train() {
     optimizer_.register_parameter(&model_.layers()[l].attn.Wo(), &grad_Wo[l]);
   }
 
+  // 1. Checkpoint auto-resume
+  size_t start_step = 0;
+  std::string latest_ckpt = "";
+  if (config_.resume && fs::exists(config_.checkpoint_dir)) {
+    size_t max_step_num = 0;
+    for (const auto &entry : fs::directory_iterator(config_.checkpoint_dir)) {
+      if (entry.is_regular_file()) {
+        std::string filename = entry.path().filename().string();
+        if (filename.rfind("step_", 0) == 0 &&
+            filename.find(".safetensors") != std::string::npos &&
+            filename.find(".opt.safetensors") == std::string::npos) {
+          size_t start = 5;
+          size_t end = filename.find(".safetensors");
+          if (end != std::string::npos && end > start) {
+            try {
+              size_t step_num = std::stoull(filename.substr(start, end - start));
+              if (step_num > max_step_num) {
+                max_step_num = step_num;
+                latest_ckpt = entry.path().string();
+              }
+            } catch (...) {}
+          }
+        }
+      }
+    }
+    if (max_step_num > 0) {
+      std::cout << "[INFO] Auto-discovered latest checkpoint: " << latest_ckpt 
+                << ". Resuming weights and starting from step " << max_step_num << std::endl;
+      if (Checkpoint::load(latest_ckpt, model_, optimizer_, start_step)) {
+        std::cout << "[INFO] Resumed training state successfully. start_step = " << start_step << std::endl;
+        _truncate_metrics_file(start_step);
+      } else {
+        std::cerr << "[WARNING] Failed to load checkpoint. Starting training from scratch." << std::endl;
+        start_step = 0;
+      }
+    }
+  }
+
+  // 2. Token skipping for already processed tokens
+  if (start_step > 0) {
+    size_t num_sequences_to_skip = start_step * batch_size;
+    data_loader_.skip_sequences(num_sequences_to_skip);
+  }
+
+  // 3. Initialize metrics.csv
+  bool metrics_existed = fs::exists(config_.metrics_filepath);
+  if (start_step == 0 || !metrics_existed) {
+    std::ofstream out(config_.metrics_filepath);
+    if (out.is_open()) {
+      out << "step,train_loss,learning_rate,step_latency_ms,gpu_calls,gpu_time_ms,cpu_calls,cpu_time_ms\n";
+      out.close();
+    }
+  }
+
   std::cout << "[INFO] Commencing pre-training loop..." << std::endl;
 
-  for (size_t step = 0; step < config_.max_steps; ++step) {
+  for (size_t step = start_step; step < config_.max_steps; ++step) {
     auto start_time = std::chrono::high_resolution_clock::now();
     
     std::vector<std::vector<int>> batch = data_loader_.get_batch();
@@ -160,6 +261,20 @@ void Trainer::train() {
     auto end_time = std::chrono::high_resolution_clock::now();
     double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;
 
+    // 4. Log to metrics.csv
+    std::ofstream out(config_.metrics_filepath, std::ios::app);
+    if (out.is_open()) {
+      out << step << ","
+          << loss << ","
+          << lr << ","
+          << step_ms << ","
+          << metal_bridge::count_gpu_calls << ","
+          << metal_bridge::accum_gpu_time_ms << ","
+          << metal_bridge::count_cpu_calls << ","
+          << metal_bridge::accum_cpu_time_ms << "\n";
+      out.close();
+    }
+
     if (step % config_.log_interval == 0 || step == config_.max_steps - 1) {
       std::cout << "  Step " << std::setw(4) << step 
                 << " | Loss: " << std::fixed << std::setprecision(5) << loss
@@ -168,7 +283,58 @@ void Trainer::train() {
                 << " [Profile] GPU GEMM: " << metal_bridge::count_gpu_calls << " calls (" << metal_bridge::accum_gpu_time_ms << " ms) | "
                 << "CPU GEMM: " << metal_bridge::count_cpu_calls << " calls (" << metal_bridge::accum_cpu_time_ms << " ms)"
                 << std::endl;
-      metal_bridge::reset_profile_stats();
+    }
+    metal_bridge::reset_profile_stats();
+
+    // 5. Save checkpoints
+    if ((step + 1) % config_.checkpoint_interval == 0 || (step + 1) == config_.max_steps) {
+      fs::create_directories(config_.checkpoint_dir);
+      char ckpt_filename[256];
+      std::sprintf(ckpt_filename, "step_%07d.safetensors", static_cast<int>(step + 1));
+      std::string ckpt_path = (fs::path(config_.checkpoint_dir) / ckpt_filename).string();
+      
+      std::cout << "[INFO] Saving checkpoint to " << ckpt_path << "..." << std::endl;
+      if (Checkpoint::save(ckpt_path, model_, optimizer_, step + 1)) {
+        std::cout << "[INFO] Checkpoint saved successfully: " << ckpt_filename << std::endl;
+        
+        // 6. Prune old checkpoints
+        if (config_.keep_last_n_checkpoints > 0) {
+          std::vector<std::pair<size_t, std::string>> ckpt_files;
+          for (const auto &entry : fs::directory_iterator(config_.checkpoint_dir)) {
+            if (entry.is_regular_file()) {
+              std::string fn = entry.path().filename().string();
+              if (fn.rfind("step_", 0) == 0 &&
+                  fn.find(".safetensors") != std::string::npos &&
+                  fn.find(".opt.safetensors") == std::string::npos) {
+                size_t start = 5;
+                size_t end = fn.find(".safetensors");
+                try {
+                  size_t step_num = std::stoull(fn.substr(start, end - start));
+                  ckpt_files.push_back({step_num, entry.path().string()});
+                } catch (...) {}
+              }
+            }
+          }
+          if (ckpt_files.size() > config_.keep_last_n_checkpoints) {
+            std::sort(ckpt_files.begin(), ckpt_files.end());
+            size_t to_remove = ckpt_files.size() - config_.keep_last_n_checkpoints;
+            for (size_t i = 0; i < to_remove; ++i) {
+              std::string path_to_remove = ckpt_files[i].second;
+              fs::remove(path_to_remove);
+              
+              std::string opt_path = path_to_remove;
+              size_t pos = opt_path.find(".safetensors");
+              if (pos != std::string::npos) {
+                opt_path.replace(pos, 12, ".opt.safetensors");
+              }
+              fs::remove(opt_path);
+              std::cout << "[INFO] Pruned old checkpoint: " << path_to_remove << std::endl;
+            }
+          }
+        }
+      } else {
+        std::cerr << "[ERROR] Failed to save checkpoint: " << ckpt_filename << std::endl;
+      }
     }
   }
 }

@@ -29,6 +29,12 @@ struct TrainerConfig {
   float lr_max = 3e-4f;        ///< Peak learning rate.
   float lr_min = 3e-5f;        ///< Minimum learning rate after decay.
   size_t log_interval = 10;    ///< Step interval for output logs.
+
+  std::string checkpoint_dir = "checkpoints";
+  std::string metrics_filepath = "metrics.csv";
+  size_t checkpoint_interval = 500;
+  size_t keep_last_n_checkpoints = 3;
+  bool resume = true;
 };
 
 /**
@@ -67,4 +73,6 @@ private:
   Optimizer &optimizer_;
   DataIngestion &data_loader_;
   const RoPE &rope_;
+
+  void _truncate_metrics_file(size_t step_cutoff);
 };

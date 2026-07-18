@@ -1,81 +1,52 @@
-# 🎨 Active Whiteboard: Full Self-Attention Flow (Visual) 🌈
+# 🎨 Active Whiteboard: Topic 08 — Causal Masking 🌈
+
+Now that we have computed our Q, K, and V vectors and applied RoPE, we are ready to calculate how tokens talk to each other. 
+
+But before we do the raw multiplications, we must enforce a strict rule of language: **tokens cannot look into the future.**
 
 ---
 
-## 📝 Input: Our 6-Token Sentence
-```
-[ tok1, tok2, tok3, tok4, tok5, tok6 ]
-```
-Each token has been normalized and projected. Now each token has its own Q, K, and V vector.
+## 🚫 1. The Rule: No Peeking Ahead
+If the model is trying to predict the word after *"The cat sat on the"*, it is currently looking at the word **"the"** (position 4). 
+
+It is allowed to look at *"The"* (0), *"cat"* (1), *"sat"* (2), *"on"* (3), and *"the"* (4). 
+But it must **never** be allowed to look at *"bank"* (position 5), because that is the very word it is trying to predict!
 
 ---
 
-## 🔢 Step 1: Q, K, V Projections (Token-Local)
-Each token independently computes its own Q, K, V:
-```
-tok1 → Q1, K1, V1
-tok2 → Q2, K2, V2
-tok3 → Q3, K3, V3
-tok4 → Q4, K4, V4
-tok5 → Q5, K5, V5
-tok6 → Q6, K6, V6
-```
+## 🗺️ 2. The Score Grid Mask
+To enforce this, we apply a mask to our `6 x 6` attention score grid. 
 
----
+For any cell `[Query token i][Key token j]`:
+* If `j > i` (future token): We set the score to **`-INFINITY`** (negative infinity).
+* If `j <= i` (past or current token): We keep the original calculated score.
 
-## 🔀 Step 2: Raw Attention Scores (Cross-Token)
-Every Q is dot-producted with every K → fills a 6x6 score grid:
+Here is the masked grid:
 ```
-             K1      K2      K3      K4      K5      K6
-           +-------+-------+-------+-------+-------+-------+
-Q1         |Q1·K1  |Q1·K2  |Q1·K3  |Q1·K4  |Q1·K5  |Q1·K6  |
-           +-------+-------+-------+-------+-------+-------+
-Q2         |Q2·K1  |Q2·K2  |Q2·K3  |Q2·K4  |Q2·K5  |Q2·K6  |
-           +-------+-------+-------+-------+-------+-------+
-Q3         |Q3·K1  |Q3·K2  |Q3·K3  |Q3·K4  |Q3·K5  |Q3·K6  |
-           +-------+-------+-------+-------+-------+-------+
-Q4         |Q4·K1  |Q4·K2  |Q4·K3  |Q4·K4  |Q4·K5  |Q4·K6  |
-           +-------+-------+-------+-------+-------+-------+
-Q5         |Q5·K1  |Q5·K2  |Q5·K3  |Q5·K4  |Q5·K5  |Q5·K6  |
-           +-------+-------+-------+-------+-------+-------+
-Q6         |Q6·K1  |Q6·K2  |Q6·K3  |Q6·K4  |Q6·K5  |Q6·K6  |
-           +-------+-------+-------+-------+-------+-------+
+                K_tok0    K_tok1    K_tok2    K_tok3    K_tok4    K_tok5
+Q_tok0 (Pos 0)   Keep     -INF      -INF      -INF      -INF      -INF
+Q_tok1 (Pos 1)   Keep      Keep     -INF      -INF      -INF      -INF
+Q_tok2 (Pos 2)   Keep      Keep      Keep     -INF      -INF      -INF
+Q_tok3 (Pos 3)   Keep      Keep      Keep      Keep     -INF      -INF
+Q_tok4 (Pos 4)   Keep      Keep      Keep      Keep      Keep     -INF
+Q_tok5 (Pos 5)   Keep      Keep      Keep      Keep      Keep      Keep
 ```
 
 ---
 
-## 📊 Step 3: Softmax (Row-Wise)
-We apply softmax to EACH ROW independently.
-Each row of 6 raw scores is converted into 6 probabilities that sum to 1.0:
-```
-             K1      K2      K3      K4      K5      K6      SUM
-           +-------+-------+-------+-------+-------+-------+-----+
-Q1         | 0.05  | 0.40  | 0.20  | 0.15  | 0.10  | 0.10  | 1.0 |
-Q2         | 0.30  | 0.10  | 0.20  | 0.10  | 0.20  | 0.10  | 1.0 |
-Q3         | 0.10  | 0.05  | 0.50  | 0.20  | 0.10  | 0.05  | 1.0 |
-...
-           +-------+-------+-------+-------+-------+-------+-----+
-```
+## 🧮 3. Why Negative Infinity (`-INFINITY`)?
+We use `-INFINITY` because of how the **Softmax** step behaves:
 
----
+* The formula uses exponentiation: `e^score`.
+* Mathematically, `e^(-INFINITY) = 0.0`.
 
-## 🎯 Step 4: Weighted Sum with V (Output Calculation)
-For each token, we mix the V vectors using that token's row of attention weights:
-```
-output_tok3 = 0.10 * V1
-            + 0.05 * V2
-            + 0.50 * V3   ← tok3 pays most attention to itself here!
-            + 0.20 * V4
-            + 0.10 * V5
-            + 0.05 * V6
-```
-
-The result is a new, context-enriched vector for tok3 that contains information from all other tokens it paid attention to.
+By setting the future scores to `-INFINITY`, we guarantee that their attention probability (weight) becomes exactly **`0.0`** after Softmax. The model is forced to completely ignore them.
 
 ---
 
 ## ✏️ Interactive Challenge!
-Look at the softmax row for Q3 above: `[0.10, 0.05, 0.50, 0.20, 0.10, 0.05]`.
+Suppose we have a sequence of 4 tokens: `[tok0, tok1, tok2, tok3]`.
 
-1. Which token does tok3 pay the **most** attention to?
-2. If we want tok3's output to be heavily influenced by tok6, what would we need the weight for K6 to be: higher or lower than `0.05`?
+Look at **Row 1** (representing Query token 1, `Q_tok1`):
+1. Which column keys are allowed to be looked at (kept)?
+2. Which column keys are blocked (set to `-INFINITY`)?

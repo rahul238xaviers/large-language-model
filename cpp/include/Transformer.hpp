@@ -77,8 +77,10 @@ public:
   Tensor &token_embeddings() { return token_embeddings_; }
   const Tensor &output_projection() const { return output_projection_; }
   Tensor &output_projection() { return output_projection_; }
-  const std::vector<TransformerLayer> &layers() const { return layers_; }
+   const std::vector<TransformerLayer> &layers() const { return layers_; }
   std::vector<TransformerLayer> &layers() { return layers_; }
+  const RMSNorm &final_norm() const { return final_norm_; }
+  RMSNorm &final_norm() { return final_norm_; }
 
 private:
   ModelConfig config_;

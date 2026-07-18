@@ -471,13 +471,36 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_v4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
 
   // 5. GQA attention backpropagation loops
-  for (size_t b = 0; b < batch; ++b) {
-    for (size_t h = 0; h < n_heads; ++h) {
-      size_t kv_h = h / gqa_factor;
-      for (size_t s_q = 0; s_q < seq_len; ++s_q) {
-        gqa_backward_query_token(b, h, kv_h, s_q, seq_len, head_dim, scale, q4,
-                                 k4, v4, grad_attn_output, grad_q4, grad_k4,
-                                 grad_v4);
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    metal_bridge::GQABackwardParams params;
+    params.batch = batch;
+    params.n_q_heads = n_heads;
+    params.n_kv_heads = n_kv_heads;
+    params.seq_len = seq_len;
+    params.head_dim = head_dim;
+
+    metal_bridge::gqa_backward(params,
+                               q4.data().data(), k4.data().data(), v4.data().data(),
+                               grad_attn_output.data().data(),
+                               grad_q4.data().data(), grad_k4.data().data(), grad_v4.data().data());
+  } else {
+    for (size_t b = 0; b < batch; ++b) {
+      for (size_t h = 0; h < n_heads; ++h) {
+        size_t kv_h = h / gqa_factor;
+        for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+          gqa_backward_query_token(b, h, kv_h, s_q, seq_len, head_dim, scale, q4,
+                                   k4, v4, grad_attn_output, grad_q4, grad_k4,
+                                   grad_v4);
+        }
       }
     }
   }

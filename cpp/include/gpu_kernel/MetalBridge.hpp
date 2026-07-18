@@ -115,6 +115,41 @@ void swiglu_backward(const float *grad_output, const float *gate,
 void rope_backward(float *grad, const float *cos_table, const float *sin_table,
                    size_t batch, size_t heads, size_t seq_len, size_t head_dim);
 
+struct GQABackwardParams {
+  uint32_t batch;
+  uint32_t n_q_heads;
+  uint32_t n_kv_heads;
+  uint32_t seq_len;
+  uint32_t head_dim;
+};
+
+/**
+ * @brief Performs GQA attention backward pass on the GPU.
+ * Computes gradients for Q, K, and V with atomic accumulation for shared KV heads.
+ */
+void gqa_backward(const GQABackwardParams &params,
+                  const float *Q, const float *K, const float *V,
+                  const float *grad_attn_output,
+                  float *grad_Q, float *grad_K, float *grad_V);
+
+struct AdamWStepParams {
+  float lr;
+  float beta1;
+  float beta2;
+  float eps;
+  float weight_decay;
+  float bias_correction1;
+  float bias_correction2;
+  uint32_t n;
+};
+
+/**
+ * @brief Performs a fused AdamW parameter update step on the GPU.
+ * Updates moments, applies weight decay, bias correction, and parameter update.
+ */
+void adamw_step(float *param, const float *grad, float *m, float *v,
+               const AdamWStepParams &params);
+
 /**
  * @brief Start a single grouped command buffer batch for the entire forward
  * step.

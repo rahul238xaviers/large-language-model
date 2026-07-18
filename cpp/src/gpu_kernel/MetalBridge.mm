@@ -39,6 +39,8 @@ static id<MTLComputePipelineState> pipelineStateRMSForward = nil;
 static id<MTLComputePipelineState> pipelineStateRMSBackwardDX = nil;
 static id<MTLComputePipelineState> pipelineStateSwiGLUBackward = nil;
 static id<MTLComputePipelineState> pipelineStateRoPEBackward = nil;
+static id<MTLComputePipelineState> pipelineStateGQABackward = nil;
+static id<MTLComputePipelineState> pipelineStateAdamW = nil;
 
 static bool initialized = false;
 
@@ -298,6 +300,46 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for "
                "'rope_backward'!"
+            << std::endl;
+
+  id<MTLFunction> gqaBackwardFunc =
+      [defaultLibrary newFunctionWithName:@"gqa_backward"];
+  if (!gqaBackwardFunc) {
+    std::cerr << "Failed to find kernel function 'gqa_backward' in library!"
+              << std::endl;
+    return;
+  }
+  pipelineStateGQABackward =
+      [device newComputePipelineStateWithFunction:gqaBackwardFunc
+                                            error:&error];
+  if (!pipelineStateGQABackward) {
+    std::cerr << "Failed to compile pipeline state for 'gqa_backward'! "
+                 "Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for "
+               "'gqa_backward'!"
+            << std::endl;
+
+  id<MTLFunction> adamwFunc =
+      [defaultLibrary newFunctionWithName:@"adamw_step"];
+  if (!adamwFunc) {
+    std::cerr << "Failed to find kernel function 'adamw_step' in library!"
+              << std::endl;
+    return;
+  }
+  pipelineStateAdamW =
+      [device newComputePipelineStateWithFunction:adamwFunc
+                                            error:&error];
+  if (!pipelineStateAdamW) {
+    std::cerr << "Failed to compile pipeline state for 'adamw_step'! "
+                 "Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for "
+               "'adamw_step'!"
             << std::endl;
 
   initialized = true;
@@ -787,6 +829,158 @@ void rope_backward(float *grad, const float *cos_table, const float *sin_table,
       [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
                      threadsPerThreadgroup:threadsPerThreadgroup];
       [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+      bufferCache.clear();
+    }
+  }
+}
+
+void gqa_backward(const GQABackwardParams &params,
+                  const float *Q, const float *K, const float *V,
+                  const float *grad_attn_output,
+                  float *grad_Q, float *grad_K, float *grad_V) {
+  size_t bytesQ = params.batch * params.n_q_heads * params.seq_len *
+                  params.head_dim * sizeof(float);
+  size_t bytesKV = params.batch * params.n_kv_heads * params.seq_len *
+                   params.head_dim * sizeof(float);
+  size_t bytesGradOut = params.batch * params.seq_len * params.n_q_heads *
+                        params.head_dim * sizeof(float);
+
+  id<MTLBuffer> bufferQ = get_or_create_buffer(Q, bytesQ);
+  id<MTLBuffer> bufferK = get_or_create_buffer(K, bytesKV);
+  id<MTLBuffer> bufferV = get_or_create_buffer(V, bytesKV);
+  id<MTLBuffer> bufferGradOut = get_or_create_buffer(grad_attn_output, bytesGradOut);
+  id<MTLBuffer> bufferGradQ = get_or_create_buffer(grad_Q, bytesQ, true);
+  id<MTLBuffer> bufferGradK = get_or_create_buffer(grad_K, bytesKV, true);
+  id<MTLBuffer> bufferGradV = get_or_create_buffer(grad_V, bytesKV, true);
+
+  if (!bufferQ || !bufferK || !bufferV || !bufferGradOut ||
+      !bufferGradQ || !bufferGradK || !bufferGradV) {
+    std::cerr << "Failed to allocate Metal buffers for gqa_backward!"
+              << std::endl;
+    return;
+  }
+
+  // WHAT: Metal shader expects the same struct layout as GQABackwardParams.
+  // We pass the C++ struct directly via setBytes since the layouts match.
+  struct {
+    uint32_t batch;
+    uint32_t n_q_heads;
+    uint32_t n_kv_heads;
+    uint32_t seq_len;
+    uint32_t head_dim;
+  } gpu_params = {params.batch, params.n_q_heads, params.n_kv_heads,
+                  params.seq_len, params.head_dim};
+
+  MTLSize threadsPerGrid =
+      MTLSizeMake(params.batch, params.n_q_heads, params.seq_len);
+  MTLSize threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGQABackward];
+    [activeEncoder setBuffer:bufferQ offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferK offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferV offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufferGradOut offset:0 atIndex:3];
+    [activeEncoder setBuffer:bufferGradQ offset:0 atIndex:4];
+    [activeEncoder setBuffer:bufferGradK offset:0 atIndex:5];
+    [activeEncoder setBuffer:bufferGradV offset:0 atIndex:6];
+    [activeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:7];
+
+    [activeEncoder dispatchThreads:threadsPerGrid
+             threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateGQABackward];
+      [computeEncoder setBuffer:bufferQ offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferK offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferV offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufferGradOut offset:0 atIndex:3];
+      [computeEncoder setBuffer:bufferGradQ offset:0 atIndex:4];
+      [computeEncoder setBuffer:bufferGradK offset:0 atIndex:5];
+      [computeEncoder setBuffer:bufferGradV offset:0 atIndex:6];
+      [computeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:7];
+
+      [computeEncoder dispatchThreads:threadsPerGrid
+               threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+      bufferCache.clear();
+    }
+  }
+}
+
+void adamw_step(float *param, const float *grad, float *m, float *v,
+                const AdamWStepParams &params) {
+  if (params.n == 0)
+    return;
+
+  size_t bytes = params.n * sizeof(float);
+
+  id<MTLBuffer> bufferParam = get_or_create_buffer(param, bytes, true);
+  id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytes);
+  id<MTLBuffer> bufferM = get_or_create_buffer(m, bytes, true);
+  id<MTLBuffer> bufferV = get_or_create_buffer(v, bytes, true);
+
+  if (!bufferParam || !bufferGrad || !bufferM || !bufferV) {
+    std::cerr << "Failed to allocate Metal buffers for adamw_step!"
+              << std::endl;
+    return;
+  }
+
+  // WHAT: Metal shader expects AdamWParams struct with float fields + uint n.
+  struct {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float weight_decay;
+    float bias_correction1;
+    float bias_correction2;
+    uint32_t n;
+  } gpu_params = {params.lr, params.beta1, params.beta2, params.eps,
+                  params.weight_decay, params.bias_correction1,
+                  params.bias_correction2, params.n};
+
+  MTLSize threadgroupsPerGrid = MTLSizeMake((params.n + 255) / 256, 1, 1);
+  MTLSize threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateAdamW];
+    [activeEncoder setBuffer:bufferParam offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufferGrad offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufferM offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufferV offset:0 atIndex:3];
+    [activeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:4];
+
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder =
+          [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateAdamW];
+      [computeEncoder setBuffer:bufferParam offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufferGrad offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufferM offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufferV offset:0 atIndex:3];
+      [computeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:4];
+
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                     threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+
       [cmdBuffer commit];
       [cmdBuffer waitUntilCompleted];
       run_copy_back_tasks();
