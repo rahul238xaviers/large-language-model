@@ -374,7 +374,7 @@ Tensor Tensor::matmul(const Tensor &other) const {
     bool use_gpu = false;
     if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
       metal_bridge::initialize();
-      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0) && (K == N)) {
+      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
         use_gpu = true;
       }
     }
@@ -451,24 +451,66 @@ Tensor Tensor::matmul(const Tensor &other) const {
   const float *b_data = other.data().data();
   float *c_data = result.data().data();
 
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
+      use_gpu = true;
+    }
+  }
+
   for (size_t b = 0; b < num_batches; ++b) {
     const float *dataA = a_data + b * batch_offset_A;
     const float *dataB = b_data + b * batch_offset_B;
     float *dataC = c_data + b * batch_offset_C;
 
-    // Use Apple Accelerate BLAS for SIMD-vectorized matrix multiplication
-    auto start = std::chrono::high_resolution_clock::now();
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
-                static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
-                static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
-                static_cast<int>(N));
-    auto end = std::chrono::high_resolution_clock::now();
-    metal_bridge::accum_cpu_time_ms +=
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-            .count() /
-        1000.0;
-    metal_bridge::count_cpu_calls++;
+    if (use_gpu) {
+      auto start = std::chrono::high_resolution_clock::now();
+      metal_bridge::gemm_proj(dataA, dataB, dataC, M, N, K);
+      auto end = std::chrono::high_resolution_clock::now();
+      metal_bridge::accum_gpu_time_ms +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+              .count() /
+          1000.0;
+      metal_bridge::count_gpu_calls++;
+    } else {
+      auto start = std::chrono::high_resolution_clock::now();
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
+                  static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
+                  static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
+                  static_cast<int>(N));
+      auto end = std::chrono::high_resolution_clock::now();
+      metal_bridge::accum_cpu_time_ms +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+              .count() /
+          1000.0;
+      metal_bridge::count_cpu_calls++;
+    }
   }
 
   return result;
+}
+
+Tensor Tensor::transpose() const {
+  if (shape_.size() != 2) {
+    throw std::invalid_argument("Transpose is only supported for 2D tensors");
+  }
+  size_t rows = shape_[0];
+  size_t cols = shape_[1];
+  Tensor dest({cols, rows}, 0.0f);
+  vDSP_mtrans(data_.data(), 1, dest.data().data(), 1,
+              static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
+  return dest;
+}
+
+Tensor Tensor::reshape(const std::vector<size_t> &new_shape) const {
+  size_t new_size = 1;
+  for (size_t d : new_shape) {
+    new_size *= d;
+  }
+  if (new_size != size()) {
+    throw std::invalid_argument("Total size must match for reshape");
+  }
+  return Tensor(new_shape, data_);
 }

@@ -68,6 +68,12 @@ public:
   // Matrix multiplication (2D or Batched 2D)
   Tensor matmul(const Tensor &other) const;
 
+  // 2D Transpose (uses Accelerate vDSP_mtrans)
+  Tensor transpose() const;
+
+  // Reshape tensor to a new shape of matching size
+  Tensor reshape(const std::vector<size_t> &new_shape) const;
+
 private:
   std::vector<size_t> shape_;
   std::vector<size_t> strides_;

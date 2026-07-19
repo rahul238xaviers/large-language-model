@@ -133,14 +133,7 @@ accumulate_ffn_down_grads(size_t batch, size_t seq_len, size_t intermediate_dim,
                           size_t hidden_dim, const Tensor &activated,
                           const Tensor &grad_output, Tensor &grad_w_down) {
   // grad_w_down [I, H] += activated[B*S, I].T @ grad_output[B*S, H]
-  // Replace 4-nested scalar loop with BLAS transposed matrix multiply
-  size_t BS = batch * seq_len;
-  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-              static_cast<int>(intermediate_dim), static_cast<int>(hidden_dim),
-              static_cast<int>(BS), 1.0f, activated.data().data(),
-              static_cast<int>(intermediate_dim), grad_output.data().data(),
-              static_cast<int>(hidden_dim), 1.0f, grad_w_down.data().data(),
-              static_cast<int>(hidden_dim));
+  grad_w_down.add_(activated.reshape({batch * seq_len, intermediate_dim}).transpose().matmul(grad_output.reshape({batch * seq_len, hidden_dim})));
 }
 
 /**
@@ -168,19 +161,8 @@ accumulate_ffn_gate_up_grads(size_t batch, size_t seq_len, size_t hidden_dim,
                              Tensor &grad_w_gate, Tensor &grad_w_up) {
   // grad_w_gate [H, I] += ffn_in[B*S, H].T @ grad_gate[B*S, I]
   // grad_w_up   [H, I] += ffn_in[B*S, H].T @ grad_up[B*S, I]
-  size_t BS = batch * seq_len;
-  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-              static_cast<int>(hidden_dim), static_cast<int>(intermediate_dim),
-              static_cast<int>(BS), 1.0f, ffn_in.data().data(),
-              static_cast<int>(hidden_dim), grad_gate.data().data(),
-              static_cast<int>(intermediate_dim), 1.0f,
-              grad_w_gate.data().data(), static_cast<int>(intermediate_dim));
-  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-              static_cast<int>(hidden_dim), static_cast<int>(intermediate_dim),
-              static_cast<int>(BS), 1.0f, ffn_in.data().data(),
-              static_cast<int>(hidden_dim), grad_up.data().data(),
-              static_cast<int>(intermediate_dim), 1.0f, grad_w_up.data().data(),
-              static_cast<int>(intermediate_dim));
+  grad_w_gate.add_(ffn_in.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_gate.reshape({batch * seq_len, intermediate_dim})));
+  grad_w_up.add_(ffn_in.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_up.reshape({batch * seq_len, intermediate_dim})));
 }
 
 /**
@@ -349,21 +331,12 @@ static std::vector<Tensor> run_forward_cache(const Transformer &model,
   return h_states;
 }
 
-// Static helper to accumulate parameter gradients for the output projection
-// layer
 static void accumulate_output_projection_grads(
     size_t batch_size, size_t seq_len, size_t hidden_dim, size_t vocab_size,
     const Tensor &final_h, const Tensor &grad_logits,
     Tensor &grad_output_projection) {
   // grad_output_projection [H, V] = final_h[B*S, H].T @ grad_logits[B*S, V]
-  // Replace 4-nested scalar loop with BLAS transposed matrix multiply
-  size_t BS = batch_size * seq_len;
-  cblas_sgemm(
-      CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
-      static_cast<int>(vocab_size), static_cast<int>(BS), 1.0f,
-      final_h.data().data(), static_cast<int>(hidden_dim),
-      grad_logits.data().data(), static_cast<int>(vocab_size), 0.0f,
-      grad_output_projection.data().data(), static_cast<int>(vocab_size));
+  grad_output_projection = final_h.reshape({batch_size * seq_len, hidden_dim}).transpose().matmul(grad_logits.reshape({batch_size * seq_len, vocab_size}));
 }
 
 // Static helper to accumulate gradients w.r.t token embeddings

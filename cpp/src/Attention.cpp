@@ -121,28 +121,6 @@ Tensor reshape_to_3d(const Tensor &src) {
 }
 
 /**
- * @brief Transposes the last two dimensions of a 4D tensor.
- *
- * Used to swap sequence length and head dimension for matrix multiplication.
- *
- * Example:
- *   If src shape is [2, 8, 128, 32], calling transpose_2d(src)
- *   returns a tensor of shape [2, 8, 32, 128].
- *
- * @param src Input 4D tensor to transpose.
- * @return Tensor Transposed 2D tensor.
- */
-Tensor transpose_2d(const Tensor &src) {
-  size_t rows = src.shape()[0];
-  size_t cols = src.shape()[1];
-  Tensor dest({cols, rows}, 0.0f);
-  // Apple vDSP SIMD vectorized transpose — avoids naive element-wise copy
-  vDSP_mtrans(src.data().data(), 1, dest.data().data(), 1,
-              static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
-  return dest;
-}
-
-/**
  * @brief Performs the forward pass of the Attention layer.
  *
  * Flow:
@@ -451,19 +429,10 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   }
 
   // 2. grad_Wo[NH*HD, H] = attn_output[B*S, NH*HD].T @ grad_output[B*S, H]
-  grad_Wo.fill(0.0f);
-  {
-    size_t BS = batch * seq_len;
-    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                static_cast<int>(n_heads * head_dim),
-                static_cast<int>(hidden_dim), static_cast<int>(BS), 1.0f,
-                attn_output.data().data(), static_cast<int>(n_heads * head_dim),
-                grad_output.data().data(), static_cast<int>(hidden_dim), 0.0f,
-                grad_Wo.data().data(), static_cast<int>(hidden_dim));
-  }
+  grad_Wo = attn_output.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_output.reshape({batch * seq_len, hidden_dim}));
 
   // 3. Backpropagate to attention head outputs
-  Tensor grad_attn_output = grad_output.matmul(transpose_2d(Wo_));
+  Tensor grad_attn_output = grad_output.matmul(Wo_.transpose());
 
   // 4. Initialize head gradients
   Tensor grad_q4({batch, n_heads, seq_len, head_dim}, 0.0f);
@@ -517,35 +486,14 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // grad_Wq[H, NH*HD] += x_norm[B*S, H].T @ grad_q_proj[B*S, NH*HD]
   // grad_Wk[H, NKV*HD] += x_norm[B*S, H].T @ grad_k_proj[B*S, NKV*HD]
   // grad_Wv[H, NKV*HD] += x_norm[B*S, H].T @ grad_v_proj[B*S, NKV*HD]
-  grad_Wq.fill(0.0f);
-  grad_Wk.fill(0.0f);
-  grad_Wv.fill(0.0f);
-  {
-    size_t BS = batch * seq_len;
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
-        static_cast<int>(n_heads * head_dim), static_cast<int>(BS), 1.0f,
-        x_norm.data().data(), static_cast<int>(hidden_dim),
-        grad_q_proj.data().data(), static_cast<int>(n_heads * head_dim), 0.0f,
-        grad_Wq.data().data(), static_cast<int>(n_heads * head_dim));
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
-        static_cast<int>(n_kv_heads * head_dim), static_cast<int>(BS), 1.0f,
-        x_norm.data().data(), static_cast<int>(hidden_dim),
-        grad_k_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
-        0.0f, grad_Wk.data().data(), static_cast<int>(n_kv_heads * head_dim));
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans, static_cast<int>(hidden_dim),
-        static_cast<int>(n_kv_heads * head_dim), static_cast<int>(BS), 1.0f,
-        x_norm.data().data(), static_cast<int>(hidden_dim),
-        grad_v_proj.data().data(), static_cast<int>(n_kv_heads * head_dim),
-        0.0f, grad_Wv.data().data(), static_cast<int>(n_kv_heads * head_dim));
-  }
+  grad_Wq = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_q_proj.reshape({batch * seq_len, n_heads * head_dim}));
+  grad_Wk = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_k_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
+  grad_Wv = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_v_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
 
   // 9. Compute gradient w.r.t normalized input
-  Tensor grad_x_norm = grad_q_proj.matmul(transpose_2d(Wq_));
-  grad_x_norm.add_(grad_k_proj.matmul(transpose_2d(Wk_)));
-  grad_x_norm.add_(grad_v_proj.matmul(transpose_2d(Wv_)));
+  Tensor grad_x_norm = grad_q_proj.matmul(Wq_.transpose());
+  grad_x_norm.add_(grad_k_proj.matmul(Wk_.transpose()));
+  grad_x_norm.add_(grad_v_proj.matmul(Wv_.transpose()));
 
   // 10. Backpropagate through RMSNorm to get gradient w.r.t raw input x
   Tensor grad_weight_dummy({hidden_dim}, 0.0f);

@@ -9,6 +9,59 @@
 #include <cstdlib>
 #include <random>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+
+// Custom stream buffer to duplicate stdout/stderr to a log file
+class TeeBuffer : public std::streambuf {
+public:
+  TeeBuffer(std::streambuf * sb1, std::streambuf * sb2) : sb1(sb1), sb2(sb2) {}
+protected:
+  virtual int overflow(int c) override {
+    if (c == EOF) return !EOF;
+    int r1 = sb1->sputc(c);
+    int r2 = sb2->sputc(c);
+    return (r1 == EOF || r2 == EOF) ? EOF : c;
+  }
+  virtual int sync() override {
+    int r1 = sb1->pubsync();
+    int r2 = sb2->pubsync();
+    return (r1 == 0 && r2 == 0) ? 0 : -1;
+  }
+private:
+  std::streambuf * sb1;
+  std::streambuf * sb2;
+};
+
+static std::string get_timestamp() {
+  auto now = std::chrono::system_clock::now();
+  auto in_time_t = std::chrono::system_clock::to_time_t(now);
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
+  return ss.str();
+}
+
+static void save_config_json(const std::string &filepath, const ModelConfig &config, size_t batch_size, size_t max_steps) {
+  std::ofstream out(filepath);
+  if (out.is_open()) {
+    out << "{\n";
+    out << "    \"hidden_dim\": " << config.hidden_dim << ",\n";
+    out << "    \"intermediate_dim\": " << config.intermediate_dim << ",\n";
+    out << "    \"n_layers\": " << config.n_layers << ",\n";
+    out << "    \"n_heads\": " << config.n_heads << ",\n";
+    out << "    \"n_kv_heads\": " << config.n_kv_heads << ",\n";
+    out << "    \"head_dim\": " << config.head_dim << ",\n";
+    out << "    \"max_seq_len\": " << config.max_seq_len << ",\n";
+    out << "    \"vocab_size\": " << config.vocab_size << ",\n";
+    out << "    \"batch_size\": " << batch_size << ",\n";
+    out << "    \"max_steps\": " << max_steps << "\n";
+    out << "}\n";
+    out.close();
+  }
+}
 
 // WHAT: Helper function to initialize GPT-2/LLaMA style weights using standard normal distributions.
 // WHY: Ensures that if we train from scratch (no checkpoint), the network has standard, stable weight distributions.
@@ -52,7 +105,7 @@ int main(int argc, char* argv[]) {
   size_t max_steps = 10000;
   std::string data_dir = "data/datasets/rust/";
   std::string vocab_path = "data/raw_chunks/vocabulary/cl100k_base.tiktoken";
-  std::string checkpoint_dir = "checkpoints";
+  std::string checkpoint_dir = "cpp/runs";
   std::string metrics_filepath = "metrics.csv";
   bool resume = true;
 
@@ -113,9 +166,74 @@ int main(int argc, char* argv[]) {
   // Set GPU execution environment flag
   if (use_gpu) {
     setenv("GPU_ENABLED", "1", 1);
-    std::cout << "[INFO] GPU execution enabled (GPU_ENABLED=1)" << std::endl;
   } else {
     setenv("GPU_ENABLED", "0", 1);
+  }
+
+  // 1. Resolve run directory layout to match Python runs/run_YYYYMMDD_HHMMSS/
+  std::string run_dir = "";
+  std::string log_filepath = "";
+
+  bool found_existing_checkpoint = false;
+  if (resume) {
+    std::filesystem::path cp_path(checkpoint_dir);
+    // Check if cp_path exists and has checkpoints directly
+    if (std::filesystem::exists(cp_path) && std::filesystem::is_directory(cp_path)) {
+      for (const auto &entry : std::filesystem::directory_iterator(cp_path)) {
+        if (entry.path().extension() == ".safetensors") {
+          found_existing_checkpoint = true;
+          break;
+        }
+      }
+    }
+    // Check if cp_path/checkpoints has checkpoints
+    if (!found_existing_checkpoint && std::filesystem::exists(cp_path / "checkpoints")) {
+      for (const auto &entry : std::filesystem::directory_iterator(cp_path / "checkpoints")) {
+        if (entry.path().extension() == ".safetensors") {
+          found_existing_checkpoint = true;
+          checkpoint_dir = (cp_path / "checkpoints").string();
+          break;
+        }
+      }
+    }
+    
+    if (found_existing_checkpoint) {
+      std::filesystem::path resolved_cp_path(checkpoint_dir);
+      if (resolved_cp_path.filename() == "checkpoints") {
+        run_dir = resolved_cp_path.parent_path().string();
+      } else {
+        run_dir = resolved_cp_path.string();
+      }
+      metrics_filepath = (std::filesystem::path(run_dir) / "metrics.csv").string();
+      log_filepath = (std::filesystem::path(run_dir) / "train.log").string();
+    }
+  }
+
+  // Create a new run directory if we didn't find an existing run to resume
+  if (run_dir.empty()) {
+    std::string timestamp = get_timestamp();
+    run_dir = "cpp/runs/run_" + timestamp;
+    checkpoint_dir = run_dir + "/checkpoints";
+    metrics_filepath = run_dir + "/metrics.csv";
+    log_filepath = run_dir + "/train.log";
+    
+    std::filesystem::create_directories(checkpoint_dir);
+    save_config_json(run_dir + "/config.json", config, batch_size, max_steps);
+  } else {
+    std::filesystem::create_directories(checkpoint_dir);
+  }
+
+  // Redirect stdout and stderr to both standard streams and the train.log file
+  std::ofstream log_file(log_filepath, std::ios::app);
+  TeeBuffer tee_cout(std::cout.rdbuf(), log_file.rdbuf());
+  TeeBuffer tee_cerr(std::cerr.rdbuf(), log_file.rdbuf());
+  
+  std::streambuf *orig_cout_buf = std::cout.rdbuf(&tee_cout);
+  std::streambuf *orig_cerr_buf = std::cerr.rdbuf(&tee_cerr);
+
+  if (use_gpu) {
+    std::cout << "[INFO] GPU execution enabled (GPU_ENABLED=1)" << std::endl;
+  } else {
     std::cout << "[INFO] CPU execution enabled (GPU_ENABLED=0)" << std::endl;
   }
 
@@ -168,5 +286,9 @@ int main(int argc, char* argv[]) {
   trainer.train();
 
   std::cout << "[INFO] Pre-training loop completed successfully." << std::endl;
+
+  // Restore original stream buffers
+  std::cout.rdbuf(orig_cout_buf);
+  std::cerr.rdbuf(orig_cerr_buf);
   return 0;
 }
