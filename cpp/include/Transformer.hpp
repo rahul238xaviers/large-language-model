@@ -81,6 +81,7 @@ public:
   std::vector<TransformerLayer> &layers() { return layers_; }
   const RMSNorm &final_norm() const { return final_norm_; }
   RMSNorm &final_norm() { return final_norm_; }
+  const ModelConfig &config() const { return config_; }
 
 private:
   ModelConfig config_;

@@ -12,8 +12,8 @@ int main() {
             << std::endl;
 
   // Paths relative to workspace root
-  std::string data_dir = "data/raw_chunks/bigcode/the-stack-v2/data/c++/";
-  std::string single_file = "train-00000-of-00214.parquet";
+  std::string data_dir = "data/datasets/rust/";
+  std::string single_file = "train-00000-of-00040.parquet";
   std::string vocab_path = "data/raw_chunks/vocabulary/cl100k_base.tiktoken";
 
   // Configuration

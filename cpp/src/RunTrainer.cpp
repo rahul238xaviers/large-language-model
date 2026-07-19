@@ -50,22 +50,22 @@ int main(int argc, char* argv[]) {
   bool use_gpu = true;
   size_t batch_size = 4;
   size_t max_steps = 10000;
-  std::string data_dir = "data/raw_chunks/bigcode/the-stack-v2/data/c++/";
+  std::string data_dir = "data/datasets/rust/";
   std::string vocab_path = "data/raw_chunks/vocabulary/cl100k_base.tiktoken";
   std::string checkpoint_dir = "checkpoints";
   std::string metrics_filepath = "metrics.csv";
   bool resume = true;
 
-  // Default 1.6B parameter Rust-GPT production configurations
+  // Default 380M parameter Rust-GPT production configurations
   ModelConfig config;
   config.vocab_size = 100277; // cl100k_base
-  config.hidden_dim = 2048;
-  config.intermediate_dim = 5461;
+  config.hidden_dim = 1024;
+  config.intermediate_dim = 2730;
   config.n_layers = 24;
   config.n_heads = 16;
   config.n_kv_heads = 8;
-  config.head_dim = 128;
-  config.max_seq_len = 2048;
+  config.head_dim = 64;
+  config.max_seq_len = 1024;
   config.rope_base = 10000.0f;
   config.rms_norm_eps = 1e-5f;
 
