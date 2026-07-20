@@ -377,8 +377,26 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
 
   Tensor attn_output({batch, seq_len, hidden_dim}, 0.0f);
 
-  // --- Run the backward recomputed forward pass with GCD parallel dispatch ---
-  {
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  // --- Run the backward recomputed forward pass ---
+  if (use_gpu) {
+    metal_bridge::GQAParams gqa_params = {
+        .batch = static_cast<uint32_t>(batch),
+        .n_q_heads = static_cast<uint32_t>(n_heads),
+        .n_kv_heads = static_cast<uint32_t>(n_kv_heads),
+        .seq_len = static_cast<uint32_t>(seq_len),
+        .head_dim = static_cast<uint32_t>(head_dim),
+    };
+    metal_bridge::gemm_gqa(gqa_params, q4.data().data(), k4.data().data(), v4.data().data(), attn_output.data().data());
+  } else {
     const float *q4_ptr = q4.data().data();
     const float *k4_ptr = k4.data().data();
     const float *v4_ptr = v4.data().data();
@@ -429,10 +447,33 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   }
 
   // 2. grad_Wo[NH*HD, H] = attn_output[B*S, NH*HD].T @ grad_output[B*S, H]
-  grad_Wo = attn_output.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_output.reshape({batch * seq_len, hidden_dim}));
+  if (use_gpu) {
+    metal_bridge::gemm_backward(
+        attn_output.data().data(),
+        grad_output.data().data(),
+        grad_Wo.data().data(),
+        hidden_dim,
+        hidden_dim,
+        batch * seq_len
+    );
+  } else {
+    grad_Wo = attn_output.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_output.reshape({batch * seq_len, hidden_dim}));
+  }
 
-  // 3. Backpropagate to attention head outputs
-  Tensor grad_attn_output = grad_output.matmul(Wo_.transpose());
+  // 3. Backpropagate to attention head outputs: grad_attn_output = grad_output @ Wo^T
+  Tensor grad_attn_output({batch, seq_len, hidden_dim}, 0.0f);
+  if (use_gpu) {
+    metal_bridge::gemm_proj_trans_b(
+        grad_output.data().data(),
+        Wo_.data().data(),
+        grad_attn_output.data().data(),
+        batch * seq_len,
+        hidden_dim,
+        hidden_dim
+    );
+  } else {
+    grad_attn_output = grad_output.matmul(Wo_.transpose());
+  }
 
   // 4. Initialize head gradients
   Tensor grad_q4({batch, n_heads, seq_len, head_dim}, 0.0f);
@@ -440,15 +481,6 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_v4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
 
   // 5. GQA attention backpropagation loops
-  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
-  bool use_gpu = false;
-  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
-    metal_bridge::initialize();
-    if (metal_bridge::is_available()) {
-      use_gpu = true;
-    }
-  }
-
   if (use_gpu) {
     metal_bridge::GQABackwardParams params;
     params.batch = batch;
@@ -482,18 +514,46 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_k_proj = reshape_to_3d(grad_k4);
   Tensor grad_v_proj = reshape_to_3d(grad_v4);
 
-  // 8. Replace 3-nested weight accumulation loops with cblas_sgemm
-  // grad_Wq[H, NH*HD] += x_norm[B*S, H].T @ grad_q_proj[B*S, NH*HD]
-  // grad_Wk[H, NKV*HD] += x_norm[B*S, H].T @ grad_k_proj[B*S, NKV*HD]
-  // grad_Wv[H, NKV*HD] += x_norm[B*S, H].T @ grad_v_proj[B*S, NKV*HD]
-  grad_Wq = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_q_proj.reshape({batch * seq_len, n_heads * head_dim}));
-  grad_Wk = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_k_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
-  grad_Wv = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_v_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
+  // 8. Parameter gradients for Wq, Wk, Wv
+  if (use_gpu) {
+    metal_bridge::gemm_backward(
+        x_norm.data().data(), grad_q_proj.data().data(), grad_Wq.data().data(),
+        hidden_dim, n_heads * head_dim, batch * seq_len);
+    metal_bridge::gemm_backward(
+        x_norm.data().data(), grad_k_proj.data().data(), grad_Wk.data().data(),
+        hidden_dim, n_kv_heads * head_dim, batch * seq_len);
+    metal_bridge::gemm_backward(
+        x_norm.data().data(), grad_v_proj.data().data(), grad_Wv.data().data(),
+        hidden_dim, n_kv_heads * head_dim, batch * seq_len);
+  } else {
+    grad_Wq = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_q_proj.reshape({batch * seq_len, n_heads * head_dim}));
+    grad_Wk = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_k_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
+    grad_Wv = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_v_proj.reshape({batch * seq_len, n_kv_heads * head_dim}));
+  }
 
-  // 9. Compute gradient w.r.t normalized input
-  Tensor grad_x_norm = grad_q_proj.matmul(Wq_.transpose());
-  grad_x_norm.add_(grad_k_proj.matmul(Wk_.transpose()));
-  grad_x_norm.add_(grad_v_proj.matmul(Wv_.transpose()));
+  // 9. Compute gradient w.r.t normalized input: grad_x_norm = grad_q_proj @ Wq^T + grad_k_proj @ Wk^T + grad_v_proj @ Wv^T
+  Tensor grad_x_norm({batch, seq_len, hidden_dim}, 0.0f);
+  if (use_gpu) {
+    metal_bridge::gemm_proj_trans_b(
+        grad_q_proj.data().data(), Wq_.data().data(), grad_x_norm.data().data(),
+        batch * seq_len, hidden_dim, n_heads * head_dim);
+
+    Tensor grad_k_norm({batch, seq_len, hidden_dim}, 0.0f);
+    metal_bridge::gemm_proj_trans_b(
+        grad_k_proj.data().data(), Wk_.data().data(), grad_k_norm.data().data(),
+        batch * seq_len, hidden_dim, n_kv_heads * head_dim);
+    metal_bridge::residual_add(grad_x_norm.data().data(), grad_k_norm.data().data(), grad_x_norm.size());
+
+    Tensor grad_v_norm({batch, seq_len, hidden_dim}, 0.0f);
+    metal_bridge::gemm_proj_trans_b(
+        grad_v_proj.data().data(), Wv_.data().data(), grad_v_norm.data().data(),
+        batch * seq_len, hidden_dim, n_kv_heads * head_dim);
+    metal_bridge::residual_add(grad_x_norm.data().data(), grad_v_norm.data().data(), grad_x_norm.size());
+  } else {
+    grad_x_norm = grad_q_proj.matmul(Wq_.transpose());
+    grad_x_norm.add_(grad_k_proj.matmul(Wk_.transpose()));
+    grad_x_norm.add_(grad_v_proj.matmul(Wv_.transpose()));
+  }
 
   // 10. Backpropagate through RMSNorm to get gradient w.r.t raw input x
   Tensor grad_weight_dummy({hidden_dim}, 0.0f);

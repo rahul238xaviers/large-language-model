@@ -111,9 +111,11 @@ int main(int argc, char* argv[]) {
 
   // Default 380M parameter Rust-GPT production configurations
   ModelConfig config;
-  config.vocab_size = 100277; // cl100k_base
+  // Pad vocab size to a multiple of 64 for optimal GPU/Metal GEMM tensor core utilization
+  // (cl100k_base has 100277, padded to 100352)
+  config.vocab_size = 100352; 
   config.hidden_dim = 1024;
-  config.intermediate_dim = 2730;
+  config.intermediate_dim = 2752; // Padded from 2730 to a multiple of 32 to avoid CPU fallback
   config.n_layers = 24;
   config.n_heads = 16;
   config.n_kv_heads = 8;
@@ -273,7 +275,7 @@ int main(int argc, char* argv[]) {
   train_cfg.warmup_steps = 500;
   train_cfg.lr_max = 3e-4f;
   train_cfg.lr_min = 3e-5f;
-  train_cfg.log_interval = 10;
+  train_cfg.log_interval = 1;
   train_cfg.checkpoint_interval = checkpoint_interval;
   train_cfg.keep_last_n_checkpoints = 3;
   train_cfg.checkpoint_dir = checkpoint_dir;

@@ -216,6 +216,23 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/adamw_step.metal
             -o ${CMAKE_BINARY_DIR}/adamw_step.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/residual_add.metal
+            -o ${CMAKE_BINARY_DIR}/residual_add.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/embedding_forward.metal
+            -o ${CMAKE_BINARY_DIR}/embedding_forward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/cross_entropy.metal
+            -o ${CMAKE_BINARY_DIR}/cross_entropy.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_backward.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_backward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
@@ -226,6 +243,11 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/rope_backward.air
             ${CMAKE_BINARY_DIR}/gqa_backward.air
             ${CMAKE_BINARY_DIR}/adamw_step.air
+            ${CMAKE_BINARY_DIR}/residual_add.air
+            ${CMAKE_BINARY_DIR}/embedding_forward.air
+            ${CMAKE_BINARY_DIR}/cross_entropy.air
+            ${CMAKE_BINARY_DIR}/gemm_backward.air
+            ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
@@ -236,6 +258,11 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/adamw_step.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/residual_add.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/embedding_forward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/cross_entropy.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_backward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)

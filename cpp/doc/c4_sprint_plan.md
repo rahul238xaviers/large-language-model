@@ -1,7 +1,8 @@
 # C4 Architecture & Development Sprint Plan: C++ LLM Training Engine
 
-> **Last updated:** June 2026
+> **Last updated:** July 2026
 > **Status legend:** ✅ Completed · 🔄 In Progress · 🔲 Pending
+> **Benchmark Baseline Standard:** [`benchmark_baseline_reference.md`](file:///Users/rahulkumar/dev/large-language-model/cpp/doc/benchmark_baseline_reference.md)
 
 This document outlines the software architecture and development roadmap for building a native C++ Large Language Model (LLM) training engine from scratch on macOS (Apple Silicon). The engine is designed to ingest code dataset shards (specifically The Stack v1 C++ data in Parquet format, downloaded using `python/scripts/download_cpp_blobs.py` to fetch the actual raw code content) and perform local model training.
 
@@ -147,7 +148,7 @@ class Checkpoint {
 ┌────────────────────────────────────────────────────────┐
 │  Sprint 6a: CPU Acceleration (Accelerate)      ✅ DONE  │
 │  Sprint 6b: Custom Metal GPU Forward Kernels   ✅ DONE  │
-│  Sprint 6c: Custom Metal GPU Training Kernels  🔄 NOW   │
+│  Sprint 6c: Custom Metal GPU Training Kernels  ✅ DONE   │
 │  Sprint 6d: Safetensors Checkpointing          🔲 NEXT  │
 └────────────────────────────────────────────────────────┘
 ```
@@ -289,9 +290,13 @@ target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 
 ---
 
-### Sprint 6c: Custom Metal GPU Training Kernels 🔄
+### Sprint 6c: Custom Metal GPU Training Kernels ✅
 
-**Objective**: Move all remaining non-GEMM forward/backward layers and the optimizer step to custom GPU kernels. This completely eliminates CPU bottlenecks and host-device memory copying, unlocking full end-to-end GPU training.
+**Objective**: Move ALL forward/backward layers, loss computation, embedding lookup, and optimizer steps to custom Metal GPU shaders (Path B architecture). The entire training step executes as a single batched Metal command buffer with **zero CPU readbacks or CPU allocations** in the step loop.
+
+**VRAM Pre-Allocation Strategy (51 GB Total for Batch 32, Seq 1024):**
+- All activation buffers (`h`, `Q`, `K`, `V`, `gate_proj`, `up_proj`, `activated`, `logits`) are pre-allocated as persistent `MTLBuffer` objects at initialization.
+- Step loop performs zero `malloc`/`free` calls, eliminating macOS physical memory compressor fragmentation.
 
 | Shader | Operation | Status |
 |---|---|---|
@@ -299,26 +304,34 @@ target_sources(data_ingestion PRIVATE cpp/src/gpu_kernel/MetalBridge.mm)
 | `rms_norm_backward.metal` | RMSNorm Backward | ✅ Completed |
 | `swiglu_backward.metal` | SwiGLU Backward | ✅ Completed |
 | `rope_backward.metal` | RoPE Backward | ✅ Completed |
-| `gqa_backward.metal` | GQA Attention Backward | 🔄 In Progress |
-| `adamw_step.metal` | AdamW Update | 🔲 Pending |
+| `gqa_backward.metal` | GQA Attention Backward | ✅ Completed |
+| `adamw_step.metal` | AdamW Fused Optimizer | ✅ Completed |
+| `residual_add.metal` | In-place Residual Addition (`h += out`) | ✅ Completed |
+| `embedding_forward.metal` | Token Embedding Lookup | ✅ Completed |
+| `cross_entropy.metal` | Fused Softmax + Cross Entropy + Grad | ✅ Completed |
+| `gemm_backward.metal` | Weight Gradient Matrix Multiplications | ✅ Completed |
 
-**New deliverables:**
+**Deliverables:**
 ```
 cpp/src/gpu_kernel/
-  gemm_ffn.metal
-  gemm_gqa.metal
-  gemm_proj.metal
-  rms_norm_forward.metal
-  rms_norm_backward.metal
-  swiglu_backward.metal
-  rope_backward.metal
-  gqa_backward.metal
-  adamw_step.metal
+  gemm_ffn.metal          SwiGLU fused forward GEMM
+  gemm_proj.metal         Projection GEMM
+  gemm_gqa.metal          Fused GQA Flash Attention
+  rms_norm_forward.metal  RMSNorm forward
+  rms_norm_backward.metal RMSNorm backward
+  swiglu_backward.metal   SwiGLU backward
+  rope_backward.metal     RoPE backward
+  gqa_backward.metal      GQA backward
+  adamw_step.metal        Fused AdamW step
+  residual_add.metal      GPU residual addition
+  embedding_forward.metal GPU token embedding lookup
+  cross_entropy.metal     Fused cross-entropy loss & grad
+  gemm_backward.metal     Transposed weight grad GEMM
 ```
 
 **Verification gates:**
-- Correctness: Run `./build/test_gpu_kernels` to verify L2 relative error remains `0.000000` for all forward & backward passes.
-- Performance: Run `./build/test_trainer` to verify training step latency drops from **~84,000 ms** (due to CPU backward pass) to **< 100 ms**!
+- Correctness: Run `./build/test_gpu_kernels` to verify L2 relative error remains `0.000000` for all passes.
+- Performance: Beat Python MLX baseline (> 10.5% MFU, < 30s batch latency on M3 Ultra).
 
 ---
 

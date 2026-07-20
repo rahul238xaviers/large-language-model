@@ -10,6 +10,10 @@ public:
   Tensor backward(const Tensor &targets) const;
 
 private:
-  // Saved probabilities from the forward pass
+  // Saved probabilities from the forward pass (CPU path)
   Tensor probs_;
+  // Saved pre-computed gradients from the forward pass (GPU path)
+  mutable Tensor grad_logits_;
+  // Persistent float for GPU loss scalar copy-back
+  mutable float loss_val_ = 0.0f;
 };

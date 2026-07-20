@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace metal_bridge {
 
@@ -161,5 +162,70 @@ void start_batch();
  * completion once.
  */
 void commit_batch();
+
+/**
+ * @brief Performs in-place element-wise residual addition on GPU: a[i] += b[i]
+ * @param a     Pointer to the in-place accumulation buffer (e.g., hidden state h)
+ * @param b     Pointer to the tensor to add (e.g., attn_out or ffn_out)
+ * @param n     Total number of float elements in both tensors
+ */
+void residual_add(float *a, const float *b, size_t n);
+
+/**
+ * @brief Performs token embedding lookup on GPU.
+ *        Replaces the CPU triple-nested loop: h[b,s,d] = embedding_table[token_ids[b,s], d]
+ * @param token_ids       Flat array of uint32 token IDs [total_tokens = B*S]
+ * @param embedding_table Embedding weight matrix [vocab_size * hidden_dim]
+ * @param output          Output hidden state buffer [total_tokens * hidden_dim]
+ * @param total_tokens    B * S
+ * @param hidden_dim      Embedding/hidden dimension H
+ */
+void embedding_forward(const uint32_t *token_ids, const float *embedding_table,
+                       float *output, size_t total_tokens, size_t hidden_dim,
+                       size_t vocab_size);
+
+/**
+ * @brief Performs fused Softmax + Cross Entropy Loss + Gradient computation on GPU.
+ * @param logits       Logits tensor [total_tokens * vocab_size]
+ * @param targets      Target token IDs [total_tokens]
+ * @param loss_out     Single float pointer to accumulate loss scalar
+ * @param grad_logits  Output gradient buffer [total_tokens * vocab_size]
+ * @param total_tokens Total tokens (batch * seq_len)
+ * @param vocab_size   Vocabulary size
+ */
+void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out,
+                   float *grad_logits, size_t total_tokens, size_t vocab_size);
+
+/**
+ * @brief Performs transposed matrix multiplication for weight gradient accumulation: C [M x N] += A^T [M x K] @ B [K x N]
+ * @param a_transposed Matrix A stored as [K x M] in RAM, read transposed
+ * @param b            Matrix B stored as [K x N] in RAM
+ * @param c            Output Matrix C stored as [M x N] in RAM
+ * @param M            Rows of C / Cols of A^T
+ * @param N            Cols of C / Cols of B
+ * @param K            Cols of A^T / Rows of B
+ */
+void gemm_backward(const float *a_transposed, const float *b, float *c,
+                   size_t M, size_t N, size_t K);
+
+/**
+ * @brief Performs matrix multiplication with transposed weight matrix B: C [M x N] = A [M x K] @ B^T [K x N]
+ * @param a            Input activations [M x K]
+ * @param b_transposed Weight matrix stored as [N x K] in RAM, read transposed
+ * @param c            Output gradients [M x N]
+ * @param M            Rows of A and C
+ * @param N            Cols of B^T and C
+ * @param K            Cols of A and Rows of B^T
+ */
+void gemm_proj_trans_b(const float *a, const float *b_transposed, float *c,
+                       size_t M, size_t N, size_t K);
+
+/**
+ * @brief Returns the GPU-computed loss scalar from the last completed batch.
+ */
+float get_last_loss();
+
+void execute_in_autoreleasepool(std::function<void()> func);
+
 
 } // namespace metal_bridge

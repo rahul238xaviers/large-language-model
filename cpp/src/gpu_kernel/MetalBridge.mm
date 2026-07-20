@@ -41,7 +41,13 @@ static id<MTLComputePipelineState> pipelineStateSwiGLUBackward = nil;
 static id<MTLComputePipelineState> pipelineStateRoPEBackward = nil;
 static id<MTLComputePipelineState> pipelineStateGQABackward = nil;
 static id<MTLComputePipelineState> pipelineStateAdamW = nil;
+static id<MTLComputePipelineState> pipelineStateResidualAdd = nil;
+static id<MTLComputePipelineState> pipelineStateEmbeddingFwd = nil;
+static id<MTLComputePipelineState> pipelineStateCrossEntropy = nil;
+static id<MTLComputePipelineState> pipelineStateGEMMBackward = nil;
+static id<MTLComputePipelineState> pipelineStateGEMMProjTransB = nil;
 
+static float last_step_loss = 0.0f;
 static bool initialized = false;
 
 static id<MTLCommandBuffer> activeCmdBuffer = nil;
@@ -49,7 +55,12 @@ static id<MTLComputeCommandEncoder> activeEncoder = nil;
 static bool batchActive = false;
 
 // Address-to-Buffer cache mapping raw host pointers to persistent MTLBuffers
-static std::unordered_map<const void *, id<MTLBuffer>> bufferCache;
+struct CachedBuffer {
+  id<MTLBuffer> buf;
+  bool is_persistent;
+};
+static std::unordered_map<const void *, CachedBuffer> bufferCache;
+static std::unordered_map<size_t, std::vector<id<MTLBuffer>>> freePool;  // pool of deallocated buffers for reuse 
 
 struct CopyBackTask {
   void *dest;
@@ -66,7 +77,8 @@ static void run_copy_back_tasks() {
 }
 
 static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
-                                          bool is_write = false);
+                                          bool is_write = false, bool is_persistent = false,
+                                          bool is_host_input = false);
 
 // Profiling statistics definitions
 double accum_gpu_time_ms = 0.0;
@@ -342,6 +354,71 @@ void initialize() {
                "'adamw_step'!"
             << std::endl;
 
+  id<MTLFunction> residualAddFunc = [defaultLibrary newFunctionWithName:@"residual_add"];
+  if (!residualAddFunc) {
+    std::cerr << "Failed to find kernel function 'residual_add' in library!" << std::endl;
+    return;
+  }
+  pipelineStateResidualAdd = [device newComputePipelineStateWithFunction:residualAddFunc error:&error];
+  if (!pipelineStateResidualAdd) {
+    std::cerr << "Failed to compile pipeline state for 'residual_add'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'residual_add'!" << std::endl;
+
+  id<MTLFunction> embeddingFwdFunc = [defaultLibrary newFunctionWithName:@"embedding_forward"];
+  if (!embeddingFwdFunc) {
+    std::cerr << "Failed to find kernel function 'embedding_forward' in library!" << std::endl;
+    return;
+  }
+  pipelineStateEmbeddingFwd = [device newComputePipelineStateWithFunction:embeddingFwdFunc error:&error];
+  if (!pipelineStateEmbeddingFwd) {
+    std::cerr << "Failed to compile pipeline state for 'embedding_forward'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'embedding_forward'!" << std::endl;
+
+  id<MTLFunction> crossEntropyFunc = [defaultLibrary newFunctionWithName:@"cross_entropy"];
+  if (!crossEntropyFunc) {
+    std::cerr << "Failed to find kernel function 'cross_entropy' in library!" << std::endl;
+    return;
+  }
+  pipelineStateCrossEntropy = [device newComputePipelineStateWithFunction:crossEntropyFunc error:&error];
+  if (!pipelineStateCrossEntropy) {
+    std::cerr << "Failed to compile pipeline state for 'cross_entropy'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'cross_entropy'!" << std::endl;
+
+  id<MTLFunction> gemmBackwardFunc = [defaultLibrary newFunctionWithName:@"gemm_backward"];
+  if (!gemmBackwardFunc) {
+    std::cerr << "Failed to find kernel function 'gemm_backward' in library!" << std::endl;
+    return;
+  }
+  pipelineStateGEMMBackward = [device newComputePipelineStateWithFunction:gemmBackwardFunc error:&error];
+  if (!pipelineStateGEMMBackward) {
+    std::cerr << "Failed to compile pipeline state for 'gemm_backward'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'gemm_backward'!" << std::endl;
+
+  id<MTLFunction> gemmProjTransBFunc = [defaultLibrary newFunctionWithName:@"gemm_proj_trans_b"];
+  if (!gemmProjTransBFunc) {
+    std::cerr << "Failed to find kernel function 'gemm_proj_trans_b' in library!" << std::endl;
+    return;
+  }
+  pipelineStateGEMMProjTransB = [device newComputePipelineStateWithFunction:gemmProjTransBFunc error:&error];
+  if (!pipelineStateGEMMProjTransB) {
+    std::cerr << "Failed to compile pipeline state for 'gemm_proj_trans_b'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'gemm_proj_trans_b'!" << std::endl;
+
   initialized = true;
 }
 
@@ -355,8 +432,8 @@ void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c,
   size_t bytesC = M * N * sizeof(float);
 
   id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
-  id<MTLBuffer> bufferB_gate = get_or_create_buffer(b_gate, bytesB);
-  id<MTLBuffer> bufferB_up = get_or_create_buffer(b_up, bytesB);
+  id<MTLBuffer> bufferB_gate = get_or_create_buffer(b_gate, bytesB, false, true);
+  id<MTLBuffer> bufferB_up = get_or_create_buffer(b_up, bytesB, false, true);
   id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
 
   if (!bufferA || !bufferB_gate || !bufferB_up || !bufferC) {
@@ -420,7 +497,7 @@ void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
   size_t bytesC = M * N * sizeof(float);
 
   id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
-  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB);
+  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB, false, true);
   id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
 
   if (!bufferA || !bufferB || !bufferC) {
@@ -532,45 +609,72 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
     }
   }
 }
+static std::vector<id<MTLBuffer>> activationPool;
+static size_t activationPoolIndex = 0;
+static std::unordered_map<const void *, id<MTLBuffer>> weightCache;
+static std::unordered_map<const void *, id<MTLBuffer>> stepCache;
+
 static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
-                                          bool is_write) {
+                                          bool is_write,
+                                          bool is_persistent,
+                                          bool is_host_input) {
   if (ptr == nullptr || bytes == 0)
     return nil;
 
-  auto it = bufferCache.find(ptr);
-  if (it != bufferCache.end()) {
+  // 1. Persistent Weight / Optimizer state buffers
+  if (is_persistent) {
+    auto it = weightCache.find(ptr);
+    if (it != weightCache.end()) {
+      if (is_write) {
+        copyBackQueue.push_back({const_cast<void *>(ptr), it->second, bytes});
+      }
+      return it->second;
+    }
+    id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (buf && !is_write) {
+      memcpy([buf contents], ptr, bytes);
+    }
+    if (buf && is_write) {
+      copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
+    }
+    if (buf) {
+      weightCache[ptr] = buf;
+    }
+    return buf;
+  }
+
+  // 2. Check if tensor pointer already has a assigned activation buffer in current step
+  auto it = stepCache.find(ptr);
+  if (it != stepCache.end()) {
+    if (is_host_input) {
+      memcpy([it->second contents], ptr, bytes);
+    }
     return it->second;
   }
 
+  // 3. Assign next sequential pool buffer for new intermediate tensor in current step
   id<MTLBuffer> buf = nil;
-
-  // Check if both pointer and size are 16KB page-aligned
-  bool is_aligned = (((uintptr_t)ptr % 16384) == 0) && ((bytes % 16384) == 0);
-
-  if (is_aligned) {
-    buf = [device newBufferWithBytesNoCopy:(void *)ptr
-                                    length:bytes
-                                   options:MTLResourceStorageModeShared
-                               deallocator:nil];
+  if (activationPoolIndex < activationPool.size() &&
+      [activationPool[activationPoolIndex] length] >= bytes) {
+    buf = activationPool[activationPoolIndex++];
+  } else {
+    buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (activationPoolIndex < activationPool.size()) {
+      activationPool[activationPoolIndex] = buf;
+    } else {
+      activationPool.push_back(buf);
+    }
+    activationPoolIndex++;
   }
 
-  // If not aligned, or if NoCopy allocation failed, fall back to copy
-  // allocation
-  if (!buf) {
-    buf = [device newBufferWithBytes:(void *)ptr
-                              length:bytes
-                             options:MTLResourceStorageModeShared];
-
-    // If it was copy-allocated and we intend to write to it, register a
-    // copy-back task
-    if (buf && is_write) {
-      copyBackQueue.push_back({(void *)ptr, buf, bytes});
-    }
+  if (buf && is_host_input) {
+    memcpy([buf contents], ptr, bytes);
   }
 
   if (buf) {
-    bufferCache[ptr] = buf;
+    stepCache[ptr] = buf;
   }
+
   return buf;
 }
 
@@ -585,7 +689,7 @@ void rms_norm_forward(const float *input, float *output, const float *weight,
 
   id<MTLBuffer> bufferIn = get_or_create_buffer(input, bytesIn);
   id<MTLBuffer> bufferOut = get_or_create_buffer(output, bytesOut, true);
-  id<MTLBuffer> bufferW = get_or_create_buffer(weight, bytesW);
+  id<MTLBuffer> bufferW = get_or_create_buffer(weight, bytesW, false, true);
 
   if (!bufferIn || !bufferOut || !bufferW) {
     std::cerr << "Failed to allocate Metal buffers for rms_norm_forward!"
@@ -648,11 +752,11 @@ void rms_norm_backward(const float *grad_output, const float *input,
 
   id<MTLBuffer> bufferGradOutput = get_or_create_buffer(grad_output, bytesIn);
   id<MTLBuffer> bufferInput = get_or_create_buffer(input, bytesIn);
-  id<MTLBuffer> bufferWeight = get_or_create_buffer(weight, bytesW);
+  id<MTLBuffer> bufferWeight = get_or_create_buffer(weight, bytesW, false, true);
   id<MTLBuffer> bufferGradInput =
       get_or_create_buffer(grad_input, bytesIn, true);
   id<MTLBuffer> bufferGradWeight =
-      get_or_create_buffer(grad_weight, bytesW, true);
+      get_or_create_buffer(grad_weight, bytesW, true, true);
 
   if (!bufferGradOutput || !bufferInput || !bufferWeight || !bufferGradInput ||
       !bufferGradWeight) {
@@ -782,8 +886,8 @@ void rope_backward(float *grad, const float *cos_table, const float *sin_table,
   size_t bytesTable = seq_len * half_dim * sizeof(float);
 
   id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytesGrad, true);
-  id<MTLBuffer> bufferCos = get_or_create_buffer(cos_table, bytesTable);
-  id<MTLBuffer> bufferSin = get_or_create_buffer(sin_table, bytesTable);
+  id<MTLBuffer> bufferCos = get_or_create_buffer(cos_table, bytesTable, false, true);
+  id<MTLBuffer> bufferSin = get_or_create_buffer(sin_table, bytesTable, false, true);
 
   if (!bufferGrad || !bufferCos || !bufferSin) {
     std::cerr << "Failed to allocate Metal buffers for rope_backward!"
@@ -926,10 +1030,10 @@ void adamw_step(float *param, const float *grad, float *m, float *v,
 
   size_t bytes = params.n * sizeof(float);
 
-  id<MTLBuffer> bufferParam = get_or_create_buffer(param, bytes, true);
-  id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytes);
-  id<MTLBuffer> bufferM = get_or_create_buffer(m, bytes, true);
-  id<MTLBuffer> bufferV = get_or_create_buffer(v, bytes, true);
+  id<MTLBuffer> bufferParam = get_or_create_buffer(param, bytes, true, true);
+  id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytes, false, true);
+  id<MTLBuffer> bufferM = get_or_create_buffer(m, bytes, true, true);
+  id<MTLBuffer> bufferV = get_or_create_buffer(v, bytes, true, true);
 
   if (!bufferParam || !bufferGrad || !bufferM || !bufferV) {
     std::cerr << "Failed to allocate Metal buffers for adamw_step!"
@@ -989,9 +1093,187 @@ void adamw_step(float *param, const float *grad, float *m, float *v,
   }
 }
 
+void residual_add(float *a, const float *b, size_t n) {
+  // WHAT: Guard: nothing to add for empty tensors.
+  if (n == 0 || a == nullptr || b == nullptr) return;
+
+  size_t bytes = n * sizeof(float);
+
+  id<MTLBuffer> bufA = get_or_create_buffer(a, bytes, true);
+  id<MTLBuffer> bufB = get_or_create_buffer(b, bytes, false);
+  uint32_t un = static_cast<uint32_t>(n);
+
+  if (!bufA || !bufB) {
+    std::cerr << "[residual_add] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  if (batchActive) {
+    // WHAT: Encode into the active batched command encoder.
+    // WHY:  This keeps residual addition inside the single GPU command stream,
+    //       eliminating the need for a CPU readback between attn and FFN blocks.
+    [activeEncoder setComputePipelineState:pipelineStateResidualAdd];
+    [activeEncoder setBuffer:bufA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufB offset:0 atIndex:1];
+    [activeEncoder setBytes:&un length:sizeof(uint32_t) atIndex:2];
+
+    MTLSize threads = MTLSizeMake(256, 1, 1);
+    MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+  }
+}
+
+void embedding_forward(const uint32_t *token_ids, const float *embedding_table,
+                       float *output, size_t total_tokens, size_t hidden_dim,
+                       size_t vocab_size) {
+  // WHAT: Guard: nothing to embed for empty input.
+  if (total_tokens == 0 || hidden_dim == 0) return;
+
+  size_t bytes_ids   = total_tokens * sizeof(uint32_t);
+  size_t bytes_emb   = vocab_size * hidden_dim * sizeof(float);
+  size_t bytes_out   = total_tokens * hidden_dim * sizeof(float);
+
+  // WHAT: Upload token IDs (read-only input, host_input=true) and embedding table (read-only weight, persistent=true).
+  // WHY:  token_ids change every step. embedding_table is persistent (is_persistent=true).
+  id<MTLBuffer> bufIds  = get_or_create_buffer(token_ids,       bytes_ids, false, false, true);
+  id<MTLBuffer> bufEmb  = get_or_create_buffer(embedding_table, bytes_emb, false, true,  false);
+  // WHAT: Output buffer — GPU writes h from scratch. No upload needed (is_write=true).
+  id<MTLBuffer> bufOut  = get_or_create_buffer(output,          bytes_out, true,  false, false);
+
+  if (!bufIds || !bufEmb || !bufOut) {
+    std::cerr << "[embedding_forward] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint32_t u_hidden  = static_cast<uint32_t>(hidden_dim);
+  uint32_t u_tokens  = static_cast<uint32_t>(total_tokens);
+  size_t   n_threads = total_tokens * hidden_dim;  // one thread per float element
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateEmbeddingFwd];
+    [activeEncoder setBuffer:bufIds  offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufEmb  offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufOut  offset:0 atIndex:2];
+    [activeEncoder setBytes:&u_hidden length:sizeof(uint32_t) atIndex:3];
+    [activeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:4];
+
+    // WHAT: 1D grid — one thread per float in the output tensor.
+    // WHY:  Threads are completely independent; no synchronization required.
+    MTLSize threads = MTLSizeMake(256, 1, 1);
+    MTLSize grid    = MTLSizeMake((n_threads + 255) / 256, 1, 1);
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+  }
+}
+
+void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out,
+                   float *grad_logits, size_t total_tokens, size_t vocab_size) {
+  if (total_tokens == 0 || vocab_size == 0) return;
+
+  size_t bytes_logits = total_tokens * vocab_size * sizeof(float);
+  size_t bytes_targets = total_tokens * sizeof(uint32_t);
+  size_t bytes_loss = sizeof(float);
+
+  last_step_loss = 0.0f;
+  id<MTLBuffer> bufLogits  = get_or_create_buffer(logits,          bytes_logits, false, false, false);
+  id<MTLBuffer> bufTargets = get_or_create_buffer(targets,         bytes_targets, false, false, true);
+  id<MTLBuffer> bufLoss    = get_or_create_buffer(&last_step_loss, bytes_loss,    true,  true,  false);
+  id<MTLBuffer> bufGrad    = get_or_create_buffer(grad_logits,     bytes_logits,  true,  false, false);
+
+  if (!bufLogits || !bufTargets || !bufLoss || !bufGrad) {
+    std::cerr << "[cross_entropy] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint32_t u_vocab  = static_cast<uint32_t>(vocab_size);
+  uint32_t u_tokens = static_cast<uint32_t>(total_tokens);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateCrossEntropy];
+    [activeEncoder setBuffer:bufLogits  offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufTargets offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufLoss    offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufGrad    offset:0 atIndex:3];
+    [activeEncoder setBytes:&u_vocab  length:sizeof(uint32_t) atIndex:4];
+    [activeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:5];
+
+    // Grid: 256 threads per threadgroup (x), total_tokens threadgroups (y)
+    MTLSize threadsPerTG = MTLSizeMake(256, 1, 1);
+    MTLSize tgGrid       = MTLSizeMake(1, total_tokens, 1);
+    [activeEncoder dispatchThreadgroups:tgGrid threadsPerThreadgroup:threadsPerTG];
+  }
+}
+
+void gemm_backward(const float *a_transposed, const float *b, float *c,
+                   size_t M, size_t N, size_t K) {
+  if (M == 0 || N == 0 || K == 0) return;
+
+  size_t bytesA = K * M * sizeof(float); // A in memory is [K x M]
+  size_t bytesB = K * N * sizeof(float); // B in memory is [K x N]
+  size_t bytesC = M * N * sizeof(float); // C in memory is [M x N]
+
+  id<MTLBuffer> bufA = get_or_create_buffer(a_transposed, bytesA, false, false);
+  id<MTLBuffer> bufB = get_or_create_buffer(b,            bytesB, false, false);
+  id<MTLBuffer> bufC = get_or_create_buffer(c,            bytesC, true,  true);
+
+  if (!bufA || !bufB || !bufC) {
+    std::cerr << "[gemm_backward] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGEMMBackward];
+    [activeEncoder setBuffer:bufA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufB offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufC offset:0 atIndex:2];
+    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+
+    MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+    MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  }
+}
+
+void gemm_proj_trans_b(const float *a, const float *b_transposed, float *c,
+                       size_t M, size_t N, size_t K) {
+  if (M == 0 || N == 0 || K == 0) return;
+
+  size_t bytesA = M * K * sizeof(float);
+  size_t bytesB = N * K * sizeof(float); // B in memory is [N x K]
+  size_t bytesC = M * N * sizeof(float);
+
+  id<MTLBuffer> bufA = get_or_create_buffer(a,            bytesA, false, false);
+  id<MTLBuffer> bufB = get_or_create_buffer(b_transposed, bytesB, false, true);
+  id<MTLBuffer> bufC = get_or_create_buffer(c,            bytesC, true,  false);
+
+  if (!bufA || !bufB || !bufC) {
+    std::cerr << "[gemm_proj_trans_b] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGEMMProjTransB];
+    [activeEncoder setBuffer:bufA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufB offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufC offset:0 atIndex:2];
+    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+
+    MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+    MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
+    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                  threadsPerThreadgroup:threadsPerThreadgroup];
+  }
+}
+
 void start_batch() {
   if (batchActive)
     return;
+  activationPoolIndex = 0;
+  stepCache.clear();
   activeCmdBuffer = [commandQueue commandBuffer];
   activeEncoder = [activeCmdBuffer computeCommandEncoder];
   batchActive = true;
@@ -1003,15 +1285,37 @@ void commit_batch() {
   [activeEncoder endEncoding];
   activeEncoder = nil;
 
+  std::cout << "[GPU-EXEC] Dispatched batch to Apple Silicon hardware... GPU executing..." << std::endl;
+  auto start = std::chrono::high_resolution_clock::now();
+
   [activeCmdBuffer commit];
   [activeCmdBuffer waitUntilCompleted];
+
+  auto end = std::chrono::high_resolution_clock::now();
+  double gpu_time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+  accum_gpu_time_ms += gpu_time;
+  count_gpu_calls++;
+
+  std::cout << "[GPU-EXEC] GPU Hardware finished execution in " << gpu_time << " ms." << std::endl;
+
   activeCmdBuffer = nil;
 
   // Run copy-back tasks for unaligned writes
   run_copy_back_tasks();
 
   batchActive = false;
-  bufferCache.clear();
+  activationPoolIndex = 0;
+  stepCache.clear();
+}
+
+float get_last_loss() {
+  return last_step_loss;
+}
+
+void execute_in_autoreleasepool(std::function<void()> func) {
+  @autoreleasepool {
+    func();
+  }
 }
 
 } // namespace metal_bridge

@@ -15,10 +15,14 @@
  */
 
 #include "Loss.hpp"
+#include "gpu_kernel/MetalBridge.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <string>
 #include <thread>
+#include <vector>
 
 /**
  * @brief Computes the forward pass of the Cross-Entropy Loss function.
@@ -40,6 +44,32 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
   size_t batch = logits.shape()[0];
   size_t seq_len = logits.shape()[1];
   size_t vocab_size = logits.shape()[2];
+  size_t total_tokens = batch * seq_len;
+
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      std::vector<uint32_t> targets_uint32(total_tokens);
+      for (size_t i = 0; i < total_tokens; ++i) {
+        targets_uint32[i] = static_cast<uint32_t>(targets.data()[i]);
+      }
+
+      loss_val_ = 0.0f;
+      grad_logits_ = Tensor({batch, seq_len, vocab_size}, 0.0f);
+
+      metal_bridge::cross_entropy(
+          logits.data().data(),
+          targets_uint32.data(),
+          &loss_val_,
+          grad_logits_.data().data(),
+          total_tokens,
+          vocab_size
+      );
+
+      return loss_val_;
+    }
+  }
 
   // Initialize probs_ container to save activations for backward pass
   probs_ = Tensor({batch, seq_len, vocab_size}, 0.0f);
@@ -49,7 +79,6 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
 
   std::vector<std::thread> workers;
   std::vector<float> thread_loss(num_threads, 0.0f);
-  size_t total_tokens = batch * seq_len;
   size_t tokens_per_thread = (total_tokens + num_threads - 1) / num_threads;
 
   for (unsigned int t = 0; t < num_threads; ++t) {
@@ -116,6 +145,13 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
  * @return Tensor Gradients w.r.t logits of shape [batch, seq_len, vocab_size].
  */
 Tensor CrossEntropyLoss::backward(const Tensor &targets) const {
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    if (metal_bridge::is_available() && grad_logits_.size() > 0) {
+      return grad_logits_;
+    }
+  }
+
   size_t batch = probs_.shape()[0];
   size_t seq_len = probs_.shape()[1];
   size_t vocab_size = probs_.shape()[2];

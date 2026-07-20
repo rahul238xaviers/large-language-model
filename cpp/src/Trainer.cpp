@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <sys/resource.h>
 
 /**
  * @brief Construct a new Trainer object.
@@ -73,10 +74,17 @@ static void run_training_step(
     std::vector<Tensor> &grad_Wk, std::vector<Tensor> &grad_Wv,
     std::vector<Tensor> &grad_Wo, Tensor &grad_embeddings,
     Tensor &grad_output_projection, float &loss_out) {
+
+  auto t0 = std::chrono::high_resolution_clock::now();
   Tensor logits = model.forward(tokens);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  
   CrossEntropyLoss loss_fn;
   loss_out = loss_fn.forward(logits, targets);
+  auto t2 = std::chrono::high_resolution_clock::now();
+  
   Tensor grad_logits = loss_fn.backward(targets);
+  auto t3 = std::chrono::high_resolution_clock::now();
 
   grad_embeddings.fill(0.0f);
   grad_output_projection.fill(0.0f);
@@ -93,7 +101,22 @@ static void run_training_step(
   model.backward(grad_logits, tokens, grad_w_gate, grad_w_up, grad_w_down,
                  grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
                  grad_output_projection, rope);
+  auto t4 = std::chrono::high_resolution_clock::now();
+
   optimizer.step(lr);
+  auto t5 = std::chrono::high_resolution_clock::now();
+
+  double ms_fwd      = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+  double ms_loss_fwd = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.0;
+  double ms_loss_bwd = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000.0;
+  double ms_bwd      = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count() / 1000.0;
+  double ms_opt      = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count() / 1000.0;
+
+  std::cout << "[PROFILE] Model Forward (queue):  " << ms_fwd      << " ms" << std::endl;
+  std::cout << "[PROFILE] Loss Forward (queue):   " << ms_loss_fwd << " ms" << std::endl;
+  std::cout << "[PROFILE] Loss Backward (queue):  " << ms_loss_bwd << " ms" << std::endl;
+  std::cout << "[PROFILE] Model Backward (queue): " << ms_bwd      << " ms" << std::endl;
+  std::cout << "[PROFILE] Optimizer Step (queue): " << ms_opt      << " ms" << std::endl;
 }
 
 /**
@@ -225,7 +248,7 @@ void Trainer::train() {
   if (start_step == 0 || !metrics_existed) {
     std::ofstream out(config_.metrics_filepath);
     if (out.is_open()) {
-      out << "step,train_loss,learning_rate,step_latency_ms,gpu_calls,gpu_time_ms,cpu_calls,cpu_time_ms\n";
+      out << "step,train_loss,tokens_per_sec,learning_rate,vram_usage_gb,mfu_pct,step_time_ms,gpu_calls,gpu_time_ms,cpu_calls,cpu_time_ms,gpu_active_pct\n";
       out.close();
     }
   }
@@ -252,27 +275,57 @@ void Trainer::train() {
     float lr = get_scheduled_lr(step);
     float loss = 0.0f;
 
-    metal_bridge::start_batch();
-    run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
-                      grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
-                      grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
-                      grad_output_projection, loss);
-    metal_bridge::commit_batch();
+    metal_bridge::execute_in_autoreleasepool([&]() {
+      metal_bridge::start_batch();
+      run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
+                        grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
+                        grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                        grad_output_projection, loss);
+      auto t_commit_start = std::chrono::high_resolution_clock::now();
+      metal_bridge::commit_batch();
+      loss = metal_bridge::get_last_loss();
+      auto t_commit_end = std::chrono::high_resolution_clock::now();
+      double ms_commit = std::chrono::duration_cast<std::chrono::microseconds>(t_commit_end - t_commit_start).count() / 1000.0;
+      std::cout << "[PROFILE] GPU Commit & Hardware Exec: " << ms_commit << " ms" << std::endl;
+    });
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;
+
+    double tokens_per_sec = (active_batch_size * seq_len) / (step_ms / 1000.0);
+    struct rusage usage;
+    double vram_gb = 0.0;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+      vram_gb = static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);
+    }
+    const auto& mcfg = model_.config();
+    size_t param_count = mcfg.vocab_size * mcfg.hidden_dim +
+        mcfg.n_layers * (
+            mcfg.hidden_dim * (mcfg.n_heads * mcfg.head_dim) +
+            mcfg.hidden_dim * (mcfg.n_kv_heads * mcfg.head_dim) * 2 +
+            (mcfg.n_heads * mcfg.head_dim) * mcfg.hidden_dim +
+            mcfg.hidden_dim * mcfg.intermediate_dim * 2 +
+            mcfg.intermediate_dim * mcfg.hidden_dim +
+            mcfg.hidden_dim * 2
+        ) + mcfg.hidden_dim + mcfg.hidden_dim * mcfg.vocab_size;
+    double mfu_pct = ((6.0 * param_count * (active_batch_size * seq_len)) / (step_ms / 1000.0)) / (28.3e12) * 100.0;
+    double gpu_active_pct = (metal_bridge::accum_gpu_time_ms / step_ms) * 100.0;
 
     // 4. Log to metrics.csv
     std::ofstream out(config_.metrics_filepath, std::ios::app);
     if (out.is_open()) {
       out << step << ","
           << loss << ","
+          << tokens_per_sec << ","
           << lr << ","
+          << vram_gb << ","
+          << mfu_pct << ","
           << step_ms << ","
           << metal_bridge::count_gpu_calls << ","
           << metal_bridge::accum_gpu_time_ms << ","
           << metal_bridge::count_cpu_calls << ","
-          << metal_bridge::accum_cpu_time_ms << "\n";
+          << metal_bridge::accum_cpu_time_ms << ","
+          << gpu_active_pct << "\n";
       out.close();
     }
 
@@ -280,9 +333,10 @@ void Trainer::train() {
       std::cout << "  Step " << std::setw(4) << step 
                 << " | Loss: " << std::fixed << std::setprecision(5) << loss
                 << " | LR: " << std::scientific << std::setprecision(4) << lr
-                << " | Step Latency: " << std::fixed << std::setprecision(2) << step_ms << " ms"
-                << " [Profile] GPU GEMM: " << metal_bridge::count_gpu_calls << " calls (" << metal_bridge::accum_gpu_time_ms << " ms) | "
-                << "CPU GEMM: " << metal_bridge::count_cpu_calls << " calls (" << metal_bridge::accum_cpu_time_ms << " ms)"
+                << " | Latency: " << std::fixed << std::setprecision(2) << step_ms << " ms"
+                << " | MFU: " << std::fixed << std::setprecision(2) << mfu_pct << "%"
+                << " | GPU Active: " << std::fixed << std::setprecision(2) << gpu_active_pct << "%"
+                << " [Calls: " << metal_bridge::count_gpu_calls << " GPU / " << metal_bridge::count_cpu_calls << " CPU]"
                 << std::endl;
     }
     metal_bridge::reset_profile_stats();
