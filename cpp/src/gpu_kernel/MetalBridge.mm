@@ -1570,7 +1570,7 @@ void rope_forward(float *q, float *k,
 
   size_t total_pairs_q  = batch * q_heads * seq_len * half_dim;
   size_t total_pairs_k  = batch * kv_heads * seq_len * half_dim;
-  size_t max_pairs = (total_pairs_q > total_pairs_k) ? total_pairs_q : total_pairs_k;
+  size_t total_pairs = total_pairs_q + total_pairs_k;
 
   if (batchActive) {
     [activeEncoder setComputePipelineState:pipelineStateRoPEForward];
@@ -1583,7 +1583,7 @@ void rope_forward(float *q, float *k,
     [activeEncoder setBytes:&u_kvheads length:sizeof(uint) atIndex:6];
     [activeEncoder setBytes:&u_seqlen  length:sizeof(uint) atIndex:7];
     [activeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:8];
-    MTLSize grid = MTLSizeMake((max_pairs + 255) / 256, 1, 1);
+    MTLSize grid = MTLSizeMake((total_pairs + 255) / 256, 1, 1);
     MTLSize tg   = MTLSizeMake(256, 1, 1);
     [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
   } else {
@@ -1600,7 +1600,7 @@ void rope_forward(float *q, float *k,
       [computeEncoder setBytes:&u_kvheads length:sizeof(uint) atIndex:6];
       [computeEncoder setBytes:&u_seqlen  length:sizeof(uint) atIndex:7];
       [computeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:8];
-      MTLSize grid = MTLSizeMake((max_pairs + 255) / 256, 1, 1);
+      MTLSize grid = MTLSizeMake((total_pairs + 255) / 256, 1, 1);
       MTLSize tg   = MTLSizeMake(256, 1, 1);
       [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
       [computeEncoder endEncoding];
