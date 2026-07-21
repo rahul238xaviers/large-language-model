@@ -171,15 +171,15 @@ target_link_libraries(run_trainer PUBLIC
 find_program(XCRUN xcrun)
 
 # 2. Configure maximum sequence length for the GQA shader
-set(MAX_SEQ_LEN 2048 CACHE STRING "Maximum sequence length for GQA attention kernel")
+set(MAX_SEQ_LEN 1024 CACHE STRING "Maximum sequence length for GQA attention kernel")
 
 # Tiling configurations for GEMM kernels (can be customized at build time)
 set(FFN_TILE_M 64 CACHE STRING "FFN tile M dimension size")
 set(FFN_TILE_N 64 CACHE STRING "FFN tile N dimension size")
 set(FFN_TILE_K 32 CACHE STRING "FFN tile K dimension size")
 
-set(PROJ_TILE_M 64 CACHE STRING "Projection tile M dimension size")
-set(PROJ_TILE_N 64 CACHE STRING "Projection tile N dimension size")
+set(PROJ_TILE_M 128 CACHE STRING "Projection tile M dimension size")
+set(PROJ_TILE_N 128 CACHE STRING "Projection tile N dimension size")
 set(PROJ_TILE_K 32 CACHE STRING "Projection tile K dimension size")
 
 # 3. Add custom commands to compile our shaders
@@ -242,6 +242,9 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
             -o ${CMAKE_BINARY_DIR}/rope_forward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_scores.metal
+            -o ${CMAKE_BINARY_DIR}/gqa_scores.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
@@ -260,6 +263,7 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/reshape_4d.air
             ${CMAKE_BINARY_DIR}/reshape_3d.air
             ${CMAKE_BINARY_DIR}/rope_forward.air
+            ${CMAKE_BINARY_DIR}/gqa_scores.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
@@ -278,6 +282,7 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_4d.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_3d.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_scores.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)
@@ -289,6 +294,14 @@ add_executable(test_gpu_kernels
 )
 # Link it against our library
 target_link_libraries(test_gpu_kernels PUBLIC
+    data_ingestion
+)
+
+# 5. Per-block performance instrumentation
+add_executable(bench_blocks
+    cpp/tests/bench_blocks.cpp
+)
+target_link_libraries(bench_blocks PUBLIC
     data_ingestion
 )
 

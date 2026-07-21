@@ -370,37 +370,20 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *w_data = other.data().data();
     float *res_data = result.data().data();
 
-    const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
-    bool use_gpu = false;
-    if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
-      metal_bridge::initialize();
-      if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
-        use_gpu = true;
-      }
-    }
-
-    if (use_gpu) {
-      auto start = std::chrono::high_resolution_clock::now();
-      metal_bridge::gemm_proj(x_data, w_data, res_data, M, N, K);
-      auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_gpu_time_ms +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-              .count() /
-          1000.0;
-      metal_bridge::count_gpu_calls++;
-    } else {
-      auto start = std::chrono::high_resolution_clock::now();
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                  static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                  1.0f, x_data, static_cast<int>(K), w_data,
-                  static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
-      auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_cpu_time_ms +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-              .count() /
-          1000.0;
-      metal_bridge::count_cpu_calls++;
-    }
+    // Use Accelerate cblas_sgemm (AMX coprocessor) for standard matmuls.
+    // On M3 Ultra AMX achieves 10+ TFLOPS for these shapes — far beyond
+    // what custom Metal kernels can deliver.
+    auto start = std::chrono::high_resolution_clock::now();
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0f, x_data, static_cast<int>(K), w_data,
+                static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
+    auto end = std::chrono::high_resolution_clock::now();
+    metal_bridge::accum_cpu_time_ms +=
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count() /
+        1000.0;
+    metal_bridge::count_cpu_calls++;
 
     return result;
   }
@@ -451,30 +434,11 @@ Tensor Tensor::matmul(const Tensor &other) const {
   const float *b_data = other.data().data();
   float *c_data = result.data().data();
 
-  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
-  bool use_gpu = false;
-  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
-    metal_bridge::initialize();
-    if (metal_bridge::is_available() && (M % 8 == 0) && (N % 8 == 0)) {
-      use_gpu = true;
-    }
-  }
+    for (size_t b = 0; b < num_batches; ++b) {
+      const float *dataA = a_data + b * batch_offset_A;
+      const float *dataB = b_data + b * batch_offset_B;
+      float *dataC = c_data + b * batch_offset_C;
 
-  for (size_t b = 0; b < num_batches; ++b) {
-    const float *dataA = a_data + b * batch_offset_A;
-    const float *dataB = b_data + b * batch_offset_B;
-    float *dataC = c_data + b * batch_offset_C;
-
-    if (use_gpu) {
-      auto start = std::chrono::high_resolution_clock::now();
-      metal_bridge::gemm_proj(dataA, dataB, dataC, M, N, K);
-      auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_gpu_time_ms +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-              .count() /
-          1000.0;
-      metal_bridge::count_gpu_calls++;
-    } else {
       auto start = std::chrono::high_resolution_clock::now();
       cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
                   static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
@@ -487,7 +451,6 @@ Tensor Tensor::matmul(const Tensor &other) const {
           1000.0;
       metal_bridge::count_cpu_calls++;
     }
-  }
 
   return result;
 }

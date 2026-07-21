@@ -16,7 +16,7 @@ kernel void reshape_to_3d(
     uint tmp = gid;
     uint d = tmp % head_dim; tmp /= head_dim;
     uint s = tmp % seq_len;  tmp /= seq_len;
-    uint h = tmp % n_heads;
+    uint h = tmp % n_heads;  tmp /= n_heads;
     uint b = tmp;
 
     uint src_idx = (b * n_heads * seq_len + h * seq_len + s) * head_dim + d;

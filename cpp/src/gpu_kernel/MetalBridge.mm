@@ -11,6 +11,8 @@
  */
 
 #include "gpu_kernel/MetalBridge.hpp"
+#define ACCELERATE_NEW_LAPACK
+#import <Accelerate/Accelerate.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
@@ -49,6 +51,7 @@ static id<MTLComputePipelineState> pipelineStateGEMMProjTransB = nil;
 static id<MTLComputePipelineState> pipelineStateReshape4D = nil;
 static id<MTLComputePipelineState> pipelineStateReshape3D = nil;
 static id<MTLComputePipelineState> pipelineStateRoPEForward = nil;
+static id<MTLComputePipelineState> pipelineStateGQAScores = nil;
 
 static float last_step_loss = 0.0f;
 static bool initialized = false;
@@ -472,6 +475,19 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for 'rope_forward'!" << std::endl;
 
+  id<MTLFunction> gqaScoresFunc = [defaultLibrary newFunctionWithName:@"gqa_scores"];
+  if (!gqaScoresFunc) {
+    std::cerr << "Failed to find kernel function 'gqa_scores' in library!" << std::endl;
+    return;
+  }
+  pipelineStateGQAScores = [device newComputePipelineStateWithFunction:gqaScoresFunc error:&error];
+  if (!pipelineStateGQAScores) {
+    std::cerr << "Failed to compile pipeline state for 'gqa_scores'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'gqa_scores'!" << std::endl;
+
   initialized = true;
 }
 
@@ -540,66 +556,20 @@ void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c,
   }
 }
 
+// Use Accelerate cblas_sgemm for all standard GEMMs — runs on the AMX coprocessor
+// which delivers 10+ TFLOPS on M3 Ultra.  Custom Metal kernels are reserved for
+// fused/specialized operations (gemm_ffn, gemm_gqa) where AMX can't help.
+
 void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
                size_t K) {
-  if (M == 0 || N == 0 || K == 0)
-    return;
-
-  size_t bytesA = M * K * sizeof(float);
-  size_t bytesB = K * N * sizeof(float);
-  size_t bytesC = M * N * sizeof(float);
-
-  id<MTLBuffer> bufferA = get_or_create_buffer(a, bytesA);
-  id<MTLBuffer> bufferB = get_or_create_buffer(b, bytesB, false, true);
-  id<MTLBuffer> bufferC = get_or_create_buffer(c, bytesC, true);
-
-  if (!bufferA || !bufferB || !bufferC) {
-    std::cerr << "Failed to allocate Metal buffers for gemm_proj!" << std::endl;
-    return;
-  }
-
-  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
-
-  if (batchActive) {
-    [activeEncoder setComputePipelineState:pipelineStateProj];
-    [activeEncoder setBuffer:bufferA offset:0 atIndex:0];
-    [activeEncoder setBuffer:bufferB offset:0 atIndex:1];
-    [activeEncoder setBuffer:bufferC offset:0 atIndex:2];
-    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-
-    MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-    MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-
-    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                  threadsPerThreadgroup:threadsPerThreadgroup];
-  } else {
-    @autoreleasepool {
-      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
-      id<MTLComputeCommandEncoder> computeEncoder =
-          [cmdBuffer computeCommandEncoder];
-
-      [computeEncoder setComputePipelineState:pipelineStateProj];
-      [computeEncoder setBuffer:bufferA offset:0 atIndex:0];
-      [computeEncoder setBuffer:bufferB offset:0 atIndex:1];
-      [computeEncoder setBuffer:bufferC offset:0 atIndex:2];
-      [computeEncoder setBytes:&dimensions
-                        length:sizeof(simd::uint3)
-                       atIndex:3];
-
-      MTLSize threadgroupsPerGrid =
-          MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-
-      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                     threadsPerThreadgroup:threadsPerThreadgroup];
-      [computeEncoder endEncoding];
-
-      [cmdBuffer commit];
-      [cmdBuffer waitUntilCompleted];
-      run_copy_back_tasks();
-      bufferCache.clear();
-    }
-  }
+  if (M == 0 || N == 0 || K == 0) return;
+  auto start = std::chrono::high_resolution_clock::now();
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              (int)M, (int)N, (int)K,
+              1.0f, a, (int)K, b, (int)N, 0.0f, c, (int)N);
+  auto end = std::chrono::high_resolution_clock::now();
+  accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+  count_cpu_calls++;
 }
 
 void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
@@ -670,11 +640,13 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
     return nil;
 
   // 1. Persistent weight / optimizer-state / gradient-accumulator buffers
+  //    Note: we do NOT zero on reuse — each bridge function is responsible for
+  //    its own initialization (e.g. gemm_backward zeros its own C buffer before
+  //    encoding to ensure a clean accumulation slate).
   if (is_persistent) {
     auto it = weightCache.find(ptr);
     if (it != weightCache.end()) {
       if (is_write) {
-        memset([it->second contents], 0, bytes);
         copyBackQueue.push_back({const_cast<void *>(ptr), it->second, bytes});
       }
       return it->second;
@@ -704,10 +676,12 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
 
   auto step_it = stepCache.find(ptr);
   if (step_it != stepCache.end()) {
+    // Cache hit — buffer already has valid data from a previous GPU op in this step.
+    // For writes that modify in place (rope, residual_add), do NOT zero.
+    // For writes that fully overwrite (gemm_proj result, reshape result), skip zero
+    // since every element will be written by the GPU kernel.
+    // The copy-back ensures the CPU tensor stays in sync after GPU execution.
     if (is_write) {
-      // Reuse the cached buffer but zero it for fresh accumulation
-      memset([step_it->second contents], 0, bytes);
-      // Register a copy-back so the CPU tensor is updated after GPU execution
       copyBackQueue.push_back({const_cast<void *>(ptr), step_it->second, bytes});
     } else if (is_host_input) {
       // Host-input flag forces an upload even if cached (e.g., token IDs change each step)
@@ -733,17 +707,14 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
     activeAllocationsThisStep.push_back({bytes, buf});
 
     if (is_write) {
-      // GPU will fully overwrite this buffer; zero it first
-      memset([buf contents], 0, bytes);
-      // Register copy-back so the CPU tensor is updated after GPU executes
+      // Non-persistent writes fully overwrite the output (gemm_proj result,
+      // reshape output, embedding output, etc). No need to zero — the GPU
+      // kernel writes every element.
       copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
     } else if (is_host_input) {
-      // Upload CPU data to the new GPU buffer
       memcpy([buf contents], ptr, bytes);
     } else {
       // First GPU read of this tensor: upload current CPU contents
-      // This ensures the GPU sees the correct data even if the tensor
-      // was produced by CPU operations (reshape, transpose, add, etc.)
       memcpy([buf contents], ptr, bytes);
     }
     stepCache[ptr] = buf;
@@ -1015,16 +986,74 @@ void rope_backward(float *grad, const float *cos_table, const float *sin_table,
   }
 }
 
+void gqa_scores(const float *Q, const float *K, float *scores,
+                size_t batch, size_t n_heads, size_t n_kv,
+                size_t seq_len, size_t head_dim) {
+  size_t bytesQ = batch * n_heads * seq_len * head_dim * sizeof(float);
+  size_t bytesK = batch * n_kv * seq_len * head_dim * sizeof(float);
+  size_t bytesScores = batch * n_heads * seq_len * seq_len * sizeof(float);
+
+  id<MTLBuffer> bufQ = get_or_create_buffer(Q, bytesQ);
+  id<MTLBuffer> bufK = get_or_create_buffer(K, bytesK);
+  id<MTLBuffer> bufS = get_or_create_buffer(scores, bytesScores, true);
+
+  if (!bufQ || !bufK || !bufS) {
+    std::cerr << "[gqa_scores] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint u_batch = (uint)batch, u_nh = (uint)n_heads, u_nkv = (uint)n_kv;
+  uint u_seq = (uint)seq_len, u_hd = (uint)head_dim;
+
+  MTLSize grid = MTLSizeMake(batch, n_heads, seq_len * seq_len);
+  MTLSize tg = MTLSizeMake(1, 1, 256);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGQAScores];
+    [activeEncoder setBuffer:bufQ offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufK offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufS offset:0 atIndex:2];
+    [activeEncoder setBytes:&u_batch length:sizeof(uint) atIndex:3];
+    [activeEncoder setBytes:&u_nh    length:sizeof(uint) atIndex:4];
+    [activeEncoder setBytes:&u_nkv   length:sizeof(uint) atIndex:5];
+    [activeEncoder setBytes:&u_seq   length:sizeof(uint) atIndex:6];
+    [activeEncoder setBytes:&u_hd    length:sizeof(uint) atIndex:7];
+    [activeEncoder dispatchThreads:grid threadsPerThreadgroup:tg];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pipelineStateGQAScores];
+      [enc setBuffer:bufQ offset:0 atIndex:0];
+      [enc setBuffer:bufK offset:0 atIndex:1];
+      [enc setBuffer:bufS offset:0 atIndex:2];
+      [enc setBytes:&u_batch length:sizeof(uint) atIndex:3];
+      [enc setBytes:&u_nh    length:sizeof(uint) atIndex:4];
+      [enc setBytes:&u_nkv   length:sizeof(uint) atIndex:5];
+      [enc setBytes:&u_seq   length:sizeof(uint) atIndex:6];
+      [enc setBytes:&u_hd    length:sizeof(uint) atIndex:7];
+      [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
 void gqa_backward(const GQABackwardParams &params,
                   const float *Q, const float *K, const float *V,
                   const float *grad_attn_output,
-                  float *grad_Q, float *grad_K, float *grad_V) {
+                  float *grad_Q, float *grad_K, float *grad_V,
+                  const float *precomputed_scores) {
   size_t bytesQ = params.batch * params.n_q_heads * params.seq_len *
                   params.head_dim * sizeof(float);
   size_t bytesKV = params.batch * params.n_kv_heads * params.seq_len *
                    params.head_dim * sizeof(float);
   size_t bytesGradOut = params.batch * params.seq_len * params.n_q_heads *
                         params.head_dim * sizeof(float);
+  size_t bytesScores = params.batch * params.n_q_heads *
+                       params.seq_len * params.seq_len * sizeof(float);
 
   id<MTLBuffer> bufferQ = get_or_create_buffer(Q, bytesQ);
   id<MTLBuffer> bufferK = get_or_create_buffer(K, bytesKV);
@@ -1033,6 +1062,8 @@ void gqa_backward(const GQABackwardParams &params,
   id<MTLBuffer> bufferGradQ = get_or_create_buffer(grad_Q, bytesQ, true);
   id<MTLBuffer> bufferGradK = get_or_create_buffer(grad_K, bytesKV, true);
   id<MTLBuffer> bufferGradV = get_or_create_buffer(grad_V, bytesKV, true);
+  id<MTLBuffer> bufferScores = precomputed_scores ?
+      get_or_create_buffer(precomputed_scores, bytesScores) : nil;
 
   if (!bufferQ || !bufferK || !bufferV || !bufferGradOut ||
       !bufferGradQ || !bufferGradK || !bufferGradV) {
@@ -1041,8 +1072,6 @@ void gqa_backward(const GQABackwardParams &params,
     return;
   }
 
-  // WHAT: Metal shader expects the same struct layout as GQABackwardParams.
-  // We pass the C++ struct directly via setBytes since the layouts match.
   struct {
     uint32_t batch;
     uint32_t n_q_heads;
@@ -1054,7 +1083,8 @@ void gqa_backward(const GQABackwardParams &params,
 
   MTLSize threadsPerGrid =
       MTLSizeMake(params.batch, params.n_q_heads, params.seq_len);
-  MTLSize threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+  uint tg_size_z = 32;
+  MTLSize threadsPerThreadgroup = MTLSizeMake(1, 1, tg_size_z);
 
   if (batchActive) {
     [activeEncoder setComputePipelineState:pipelineStateGQABackward];
@@ -1066,6 +1096,8 @@ void gqa_backward(const GQABackwardParams &params,
     [activeEncoder setBuffer:bufferGradK offset:0 atIndex:5];
     [activeEncoder setBuffer:bufferGradV offset:0 atIndex:6];
     [activeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:7];
+    if (bufferScores)
+      [activeEncoder setBuffer:bufferScores offset:0 atIndex:8];
 
     [activeEncoder dispatchThreads:threadsPerGrid
              threadsPerThreadgroup:threadsPerThreadgroup];
@@ -1084,6 +1116,8 @@ void gqa_backward(const GQABackwardParams &params,
       [computeEncoder setBuffer:bufferGradK offset:0 atIndex:5];
       [computeEncoder setBuffer:bufferGradV offset:0 atIndex:6];
       [computeEncoder setBytes:&gpu_params length:sizeof(gpu_params) atIndex:7];
+      if (bufferScores)
+        [computeEncoder setBuffer:bufferScores offset:0 atIndex:8];
 
       [computeEncoder dispatchThreads:threadsPerGrid
                threadsPerThreadgroup:threadsPerThreadgroup];
@@ -1335,103 +1369,30 @@ void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out
 void gemm_backward(const float *a_transposed, const float *b, float *c,
                    size_t M, size_t N, size_t K) {
   if (M == 0 || N == 0 || K == 0) return;
-
-  size_t bytesA = K * M * sizeof(float); // A in memory is [K x M]
-  size_t bytesB = K * N * sizeof(float); // B in memory is [K x N]
-  size_t bytesC = M * N * sizeof(float); // C in memory is [M x N]
-
-  id<MTLBuffer> bufA = get_or_create_buffer(a_transposed, bytesA, false, false);
-  id<MTLBuffer> bufB = get_or_create_buffer(b,            bytesB, false, false);
-  id<MTLBuffer> bufC = get_or_create_buffer(c,            bytesC, true,  true);
-
-  if (!bufA || !bufB || !bufC) {
-    std::cerr << "[gemm_backward] Failed to allocate Metal buffers." << std::endl;
-    return;
-  }
-
-  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
-
-  if (batchActive) {
-    [activeEncoder setComputePipelineState:pipelineStateGEMMBackward];
-    [activeEncoder setBuffer:bufA offset:0 atIndex:0];
-    [activeEncoder setBuffer:bufB offset:0 atIndex:1];
-    [activeEncoder setBuffer:bufC offset:0 atIndex:2];
-    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-
-    MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-    MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                  threadsPerThreadgroup:threadsPerThreadgroup];
-  } else {
-    @autoreleasepool {
-      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
-      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
-      [computeEncoder setComputePipelineState:pipelineStateGEMMBackward];
-      [computeEncoder setBuffer:bufA offset:0 atIndex:0];
-      [computeEncoder setBuffer:bufB offset:0 atIndex:1];
-      [computeEncoder setBuffer:bufC offset:0 atIndex:2];
-      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-      MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                    threadsPerThreadgroup:threadsPerThreadgroup];
-      [computeEncoder endEncoding];
-      [cmdBuffer commit];
-      [cmdBuffer waitUntilCompleted];
-      run_copy_back_tasks();
-    }
-  }
+  // C += A^T @ B  via cblas_sgemm (AMX coprocessor, 10+ TFLOPS)
+  memset(c, 0, M * N * sizeof(float));
+  auto start = std::chrono::high_resolution_clock::now();
+  cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+              (int)M, (int)N, (int)K,
+              1.0f, a_transposed, (int)M, b, (int)N, 0.0f, c, (int)N);
+  auto end = std::chrono::high_resolution_clock::now();
+  accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+  count_cpu_calls++;
 }
 
 void gemm_proj_trans_b(const float *a, const float *b_transposed, float *c,
                        size_t M, size_t N, size_t K) {
   if (M == 0 || N == 0 || K == 0) return;
-
-  size_t bytesA = M * K * sizeof(float);
-  size_t bytesB = N * K * sizeof(float); // B in memory is [N x K]
-  size_t bytesC = M * N * sizeof(float);
-
-  id<MTLBuffer> bufA = get_or_create_buffer(a,            bytesA, false, false);
-  id<MTLBuffer> bufB = get_or_create_buffer(b_transposed, bytesB, false, true);
-  id<MTLBuffer> bufC = get_or_create_buffer(c,            bytesC, true,  false);
-
-  if (!bufA || !bufB || !bufC) {
-    std::cerr << "[gemm_proj_trans_b] Failed to allocate Metal buffers." << std::endl;
-    return;
-  }
-
-  simd::uint3 dimensions = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
-
-  if (batchActive) {
-    [activeEncoder setComputePipelineState:pipelineStateGEMMProjTransB];
-    [activeEncoder setBuffer:bufA offset:0 atIndex:0];
-    [activeEncoder setBuffer:bufB offset:0 atIndex:1];
-    [activeEncoder setBuffer:bufC offset:0 atIndex:2];
-    [activeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-
-    MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-    MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-    [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                  threadsPerThreadgroup:threadsPerThreadgroup];
-  } else {
-    @autoreleasepool {
-      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
-      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
-      [computeEncoder setComputePipelineState:pipelineStateGEMMProjTransB];
-      [computeEncoder setBuffer:bufA offset:0 atIndex:0];
-      [computeEncoder setBuffer:bufB offset:0 atIndex:1];
-      [computeEncoder setBuffer:bufC offset:0 atIndex:2];
-      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
-      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
-      MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
-      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
-                    threadsPerThreadgroup:threadsPerThreadgroup];
-      [computeEncoder endEncoding];
-      [cmdBuffer commit];
-      [cmdBuffer waitUntilCompleted];
-      run_copy_back_tasks();
-    }
-  }
+  // C = A @ B^T via cblas_sgemm (AMX coprocessor)
+  // B is stored as [N x K] in memory.  cblas_sgemm with CblasTrans on B:
+  // op(B) = B^T, so B is read as [K x N] which matches our storage.
+  auto start = std::chrono::high_resolution_clock::now();
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+              (int)M, (int)N, (int)K,
+              1.0f, a, (int)K, b_transposed, (int)K, 0.0f, c, (int)N);
+  auto end = std::chrono::high_resolution_clock::now();
+  accum_cpu_time_ms += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+  count_cpu_calls++;
 }
 
 void reshape_to_4d(const float *src, float *dst,

@@ -76,7 +76,12 @@ static void run_training_step(
     Tensor &grad_output_projection, float &loss_out) {
 
   auto t0 = std::chrono::high_resolution_clock::now();
+  // Batch the entire forward pass into a single GPU command buffer.
+  // All ops are GPU-native (rms_norm, embedding, gemm, reshape, rope,
+  // residual_add, gemm_ffn) — no CPU intercepts.
+  metal_bridge::start_batch();
   Tensor logits = model.forward(tokens);
+  metal_bridge::commit_batch();
   auto t1 = std::chrono::high_resolution_clock::now();
   
   CrossEntropyLoss loss_fn;

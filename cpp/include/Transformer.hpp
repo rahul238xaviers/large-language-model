@@ -62,6 +62,11 @@ public:
    * @return Tensor Logits tensor of shape [batch_size, seq_len, vocab_size].
    */
   Tensor forward(const Tensor &tokens, KVCache *cache = nullptr) const;
+  // Store intermediate hidden states during forward for reuse in backward.
+  // This eliminates the expensive run_forward_cache recomputation.
+  void clear_h_cache() const { h_cache_.clear(); }
+  const std::vector<Tensor> &h_cache() const { return h_cache_; }
+
   // Entire model backward pass
   Tensor backward(const Tensor &grad_logits, const Tensor &tokens,
                   std::vector<Tensor> &grad_w_gate,
@@ -90,4 +95,5 @@ private:
   RMSNorm final_norm_;
   Tensor output_projection_;
   RoPE rope_;
+  mutable std::vector<Tensor> h_cache_;
 };

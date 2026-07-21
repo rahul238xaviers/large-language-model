@@ -131,7 +131,8 @@ struct GQABackwardParams {
 void gqa_backward(const GQABackwardParams &params,
                   const float *Q, const float *K, const float *V,
                   const float *grad_attn_output,
-                  float *grad_Q, float *grad_K, float *grad_V);
+                  float *grad_Q, float *grad_K, float *grad_V,
+                  const float *precomputed_scores = nullptr);
 
 struct AdamWStepParams {
   float lr;
@@ -251,6 +252,15 @@ void reshape_to_4d(const float *src, float *dst,
  */
 void reshape_to_3d(const float *src, float *dst,
                    size_t batch, size_t n_heads, size_t seq_len, size_t head_dim);
+
+/**
+ * @brief Precompute Q·K^T attention scores with causal mask.
+ *        scores[B, nH, S, S] = Q[B, nH, S, HD] · K[B, nKV, S, HD]^T * scale.
+ *        Output is used by gqa_backward to avoid recomputing dot products.
+ */
+void gqa_scores(const float *Q, const float *K, float *scores,
+                size_t batch, size_t n_heads, size_t n_kv,
+                size_t seq_len, size_t head_dim);
 
 /**
  * @brief GPU-accelerated RoPE forward pass.

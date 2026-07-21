@@ -91,8 +91,13 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
     }
   }
 
+  h_cache_.clear();
+  h_cache_.reserve(layers_.size() + 1);
+  // Store embedding output as layer 0's input state
+  // (the backward pass uses h_states[l] as the INPUT to layer l)
+  h_cache_.push_back(h);
+
   for (const auto &layer : layers_) {
-    // 1. Attention Block with Residual
     Tensor attn_in = layer.attn_norm.forward(h);
     Tensor attn_out = layer.attn.forward(attn_in, rope_, cache);
     if (use_gpu) {
@@ -101,7 +106,6 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
       h.add_(attn_out);
     }
 
-    // 2. FFN Block (SwiGLU) with Residual
     Tensor ffn_in = layer.ffn_norm.forward(h);
     
     Tensor activated({batch_size, seq_len, config_.intermediate_dim}, 0.0f);
@@ -127,6 +131,9 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
     } else {
       h.add_(ffn_out);
     }
+
+    // Store post-layer hidden state for backward pass reuse
+    h_cache_.push_back(h);
   }
 
   // Final RMSNorm
@@ -511,8 +518,10 @@ Tensor Transformer::backward(
   std::cout << "[PROFILE-BWD] Starting Model Backward..." << std::endl;
   auto tbwd_start = std::chrono::high_resolution_clock::now();
 
-  // --- 1. Forward Pass Cache to store layer hidden states ---
-  std::vector<Tensor> h_states = run_forward_cache(*this, tokens, rope, hidden_dim);
+  // --- 1. Use cached hidden states from the forward pass ---
+  // h_cache_[l] is the hidden state AFTER layer l-1 (embedding output for l=0).
+  // This eliminates the expensive run_forward_cache recomputation (~2.8s).
+  const auto &h_states = h_cache_;
   Tensor final_h = final_norm_.forward(h_states.back());
 
   // --- 2. Output Projection Backward ---
