@@ -96,6 +96,28 @@ void RoPE::forward(Tensor &q, Tensor &k) const {
     throw std::invalid_argument("Head dimensions must match");
   }
 
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    size_t batch = q.shape()[0];
+    size_t q_heads = q.shape()[1];
+    size_t k_heads = k.shape()[1];
+    size_t seq_len = q.shape()[2];
+    size_t head_dim = q.shape()[3];
+
+    metal_bridge::rope_forward(q.data().data(), k.data().data(),
+                                cos_table_.data(), sin_table_.data(),
+                                batch, q_heads, k_heads, seq_len, head_dim);
+    return;
+  }
+
   auto result_t = [&](Tensor &t) {
     size_t batch_size = t.shape()[0];
     size_t head_count = t.shape()[1];

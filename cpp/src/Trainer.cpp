@@ -275,18 +275,16 @@ void Trainer::train() {
     float lr = get_scheduled_lr(step);
     float loss = 0.0f;
 
+    // Clear step cache so each step starts with clean GPU buffer mappings.
+    // Individual GPU ops execute synchronously (commit + wait per call),
+    // eliminating the stale-data bugs that plagued batched execution.
+    metal_bridge::reconcile_buffers();
+
     metal_bridge::execute_in_autoreleasepool([&]() {
-      metal_bridge::start_batch();
       run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
                         grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
                         grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
                         grad_output_projection, loss);
-      auto t_commit_start = std::chrono::high_resolution_clock::now();
-      metal_bridge::commit_batch();
-      loss = metal_bridge::get_last_loss();
-      auto t_commit_end = std::chrono::high_resolution_clock::now();
-      double ms_commit = std::chrono::duration_cast<std::chrono::microseconds>(t_commit_end - t_commit_start).count() / 1000.0;
-      std::cout << "[PROFILE] GPU Commit & Hardware Exec: " << ms_commit << " ms" << std::endl;
     });
 
     auto end_time = std::chrono::high_resolution_clock::now();

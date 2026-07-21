@@ -46,6 +46,9 @@ static id<MTLComputePipelineState> pipelineStateEmbeddingFwd = nil;
 static id<MTLComputePipelineState> pipelineStateCrossEntropy = nil;
 static id<MTLComputePipelineState> pipelineStateGEMMBackward = nil;
 static id<MTLComputePipelineState> pipelineStateGEMMProjTransB = nil;
+static id<MTLComputePipelineState> pipelineStateReshape4D = nil;
+static id<MTLComputePipelineState> pipelineStateReshape3D = nil;
+static id<MTLComputePipelineState> pipelineStateRoPEForward = nil;
 
 static float last_step_loss = 0.0f;
 static bool initialized = false;
@@ -54,13 +57,24 @@ static id<MTLCommandBuffer> activeCmdBuffer = nil;
 static id<MTLComputeCommandEncoder> activeEncoder = nil;
 static bool batchActive = false;
 
-// Address-to-Buffer cache mapping raw host pointers to persistent MTLBuffers
+// Legacy buffer cache (unused — kept for compatibility with existing clear() calls)
 struct CachedBuffer {
   id<MTLBuffer> buf;
   bool is_persistent;
 };
 static std::unordered_map<const void *, CachedBuffer> bufferCache;
-static std::unordered_map<size_t, std::vector<id<MTLBuffer>>> freePool;  // pool of deallocated buffers for reuse 
+
+// Size-bucketed pool for intermediate activation buffers (recycled step to step)
+static std::unordered_map<size_t, std::vector<id<MTLBuffer>>> sizePool;
+
+// persistent weight/optimizer state cache (lives forever)
+static std::unordered_map<const void *, id<MTLBuffer>> weightCache;
+
+// step-local activation cache (cleared each training step)
+static std::unordered_map<const void *, id<MTLBuffer>> stepCache;
+
+// buffers allocated during the current step (for recycling at step end)
+static std::vector<std::pair<size_t, id<MTLBuffer>>> activeAllocationsThisStep;
 
 struct CopyBackTask {
   void *dest;
@@ -419,6 +433,45 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for 'gemm_proj_trans_b'!" << std::endl;
 
+  id<MTLFunction> reshape4DFunc = [defaultLibrary newFunctionWithName:@"reshape_to_4d"];
+  if (!reshape4DFunc) {
+    std::cerr << "Failed to find kernel function 'reshape_to_4d' in library!" << std::endl;
+    return;
+  }
+  pipelineStateReshape4D = [device newComputePipelineStateWithFunction:reshape4DFunc error:&error];
+  if (!pipelineStateReshape4D) {
+    std::cerr << "Failed to compile pipeline state for 'reshape_to_4d'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'reshape_to_4d'!" << std::endl;
+
+  id<MTLFunction> reshape3DFunc = [defaultLibrary newFunctionWithName:@"reshape_to_3d"];
+  if (!reshape3DFunc) {
+    std::cerr << "Failed to find kernel function 'reshape_to_3d' in library!" << std::endl;
+    return;
+  }
+  pipelineStateReshape3D = [device newComputePipelineStateWithFunction:reshape3DFunc error:&error];
+  if (!pipelineStateReshape3D) {
+    std::cerr << "Failed to compile pipeline state for 'reshape_to_3d'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'reshape_to_3d'!" << std::endl;
+
+  id<MTLFunction> ropeForwardFunc = [defaultLibrary newFunctionWithName:@"rope_forward"];
+  if (!ropeForwardFunc) {
+    std::cerr << "Failed to find kernel function 'rope_forward' in library!" << std::endl;
+    return;
+  }
+  pipelineStateRoPEForward = [device newComputePipelineStateWithFunction:ropeForwardFunc error:&error];
+  if (!pipelineStateRoPEForward) {
+    std::cerr << "Failed to compile pipeline state for 'rope_forward'! Error: "
+              << [[error localizedDescription] UTF8String] << std::endl;
+    return;
+  }
+  std::cout << "Metal Pipeline State compiled successfully for 'rope_forward'!" << std::endl;
+
   initialized = true;
 }
 
@@ -609,11 +662,6 @@ void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
     }
   }
 }
-static std::vector<id<MTLBuffer>> activationPool;
-static size_t activationPoolIndex = 0;
-static std::unordered_map<const void *, id<MTLBuffer>> weightCache;
-static std::unordered_map<const void *, id<MTLBuffer>> stepCache;
-
 static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
                                           bool is_write,
                                           bool is_persistent,
@@ -621,11 +669,12 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
   if (ptr == nullptr || bytes == 0)
     return nil;
 
-  // 1. Persistent Weight / Optimizer state buffers
+  // 1. Persistent weight / optimizer-state / gradient-accumulator buffers
   if (is_persistent) {
     auto it = weightCache.find(ptr);
     if (it != weightCache.end()) {
       if (is_write) {
+        memset([it->second contents], 0, bytes);
         copyBackQueue.push_back({const_cast<void *>(ptr), it->second, bytes});
       }
       return it->second;
@@ -635,43 +684,68 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
       memcpy([buf contents], ptr, bytes);
     }
     if (buf && is_write) {
+      memset([buf contents], 0, bytes);
       copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
     }
     if (buf) {
+      CFRetain((__bridge CFTypeRef)buf);
       weightCache[ptr] = buf;
     }
     return buf;
   }
 
-  // 2. Check if tensor pointer already has a assigned activation buffer in current step
-  auto it = stepCache.find(ptr);
-  if (it != stepCache.end()) {
-    if (is_host_input) {
-      memcpy([it->second contents], ptr, bytes);
-    }
-    return it->second;
+  // 2. Check activation caches — weightCache first, then stepCache
+  auto weight_it = weightCache.find(ptr);
+  if (weight_it != weightCache.end()) {
+    stepCache[ptr] = weight_it->second;
+    // Even for read, the weight was uploaded at creation time
+    return weight_it->second;
   }
 
-  // 3. Assign next sequential pool buffer for new intermediate tensor in current step
+  auto step_it = stepCache.find(ptr);
+  if (step_it != stepCache.end()) {
+    if (is_write) {
+      // Reuse the cached buffer but zero it for fresh accumulation
+      memset([step_it->second contents], 0, bytes);
+      // Register a copy-back so the CPU tensor is updated after GPU execution
+      copyBackQueue.push_back({const_cast<void *>(ptr), step_it->second, bytes});
+    } else if (is_host_input) {
+      // Host-input flag forces an upload even if cached (e.g., token IDs change each step)
+      memcpy([step_it->second contents], ptr, bytes);
+    }
+    return step_it->second;
+  }
+
+  // 3. Allocate a buffer from the size pool (or create new)
   id<MTLBuffer> buf = nil;
-  if (activationPoolIndex < activationPool.size() &&
-      [activationPool[activationPoolIndex] length] >= bytes) {
-    buf = activationPool[activationPoolIndex++];
+  auto &bucket = sizePool[bytes];
+  if (!bucket.empty()) {
+    buf = bucket.back();
+    bucket.pop_back();
   } else {
     buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (activationPoolIndex < activationPool.size()) {
-      activationPool[activationPoolIndex] = buf;
-    } else {
-      activationPool.push_back(buf);
+    if (buf) {
+      CFRetain((__bridge CFTypeRef)buf);
     }
-    activationPoolIndex++;
-  }
-
-  if (buf && is_host_input) {
-    memcpy([buf contents], ptr, bytes);
   }
 
   if (buf) {
+    activeAllocationsThisStep.push_back({bytes, buf});
+
+    if (is_write) {
+      // GPU will fully overwrite this buffer; zero it first
+      memset([buf contents], 0, bytes);
+      // Register copy-back so the CPU tensor is updated after GPU executes
+      copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
+    } else if (is_host_input) {
+      // Upload CPU data to the new GPU buffer
+      memcpy([buf contents], ptr, bytes);
+    } else {
+      // First GPU read of this tensor: upload current CPU contents
+      // This ensures the GPU sees the correct data even if the tensor
+      // was produced by CPU operations (reshape, transpose, add, etc.)
+      memcpy([buf contents], ptr, bytes);
+    }
     stepCache[ptr] = buf;
   }
 
@@ -1031,7 +1105,7 @@ void adamw_step(float *param, const float *grad, float *m, float *v,
   size_t bytes = params.n * sizeof(float);
 
   id<MTLBuffer> bufferParam = get_or_create_buffer(param, bytes, true, true);
-  id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytes, false, true);
+  id<MTLBuffer> bufferGrad = get_or_create_buffer(grad, bytes, false, false);
   id<MTLBuffer> bufferM = get_or_create_buffer(m, bytes, true, true);
   id<MTLBuffer> bufferV = get_or_create_buffer(v, bytes, true, true);
 
@@ -1109,9 +1183,6 @@ void residual_add(float *a, const float *b, size_t n) {
   }
 
   if (batchActive) {
-    // WHAT: Encode into the active batched command encoder.
-    // WHY:  This keeps residual addition inside the single GPU command stream,
-    //       eliminating the need for a CPU readback between attn and FFN blocks.
     [activeEncoder setComputePipelineState:pipelineStateResidualAdd];
     [activeEncoder setBuffer:bufA offset:0 atIndex:0];
     [activeEncoder setBuffer:bufB offset:0 atIndex:1];
@@ -1120,6 +1191,22 @@ void residual_add(float *a, const float *b, size_t n) {
     MTLSize threads = MTLSizeMake(256, 1, 1);
     MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
     [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateResidualAdd];
+      [computeEncoder setBuffer:bufA offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufB offset:0 atIndex:1];
+      [computeEncoder setBytes:&un length:sizeof(uint32_t) atIndex:2];
+      MTLSize threads = MTLSizeMake(256, 1, 1);
+      MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
   }
 }
 
@@ -1157,11 +1244,27 @@ void embedding_forward(const uint32_t *token_ids, const float *embedding_table,
     [activeEncoder setBytes:&u_hidden length:sizeof(uint32_t) atIndex:3];
     [activeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:4];
 
-    // WHAT: 1D grid — one thread per float in the output tensor.
-    // WHY:  Threads are completely independent; no synchronization required.
     MTLSize threads = MTLSizeMake(256, 1, 1);
     MTLSize grid    = MTLSizeMake((n_threads + 255) / 256, 1, 1);
     [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateEmbeddingFwd];
+      [computeEncoder setBuffer:bufIds  offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufEmb  offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufOut  offset:0 atIndex:2];
+      [computeEncoder setBytes:&u_hidden length:sizeof(uint32_t) atIndex:3];
+      [computeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:4];
+      MTLSize threads = MTLSizeMake(256, 1, 1);
+      MTLSize grid    = MTLSizeMake((n_threads + 255) / 256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
   }
 }
 
@@ -1173,8 +1276,10 @@ void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out
   size_t bytes_targets = total_tokens * sizeof(uint32_t);
   size_t bytes_loss = sizeof(float);
 
+  // Use the static last_step_loss as the persistent write target (stable address,
+  // no stack-dangling risk). Sync back to the caller's loss_out after execution.
   last_step_loss = 0.0f;
-  id<MTLBuffer> bufLogits  = get_or_create_buffer(logits,          bytes_logits, false, false, false);
+  id<MTLBuffer> bufLogits  = get_or_create_buffer(logits,          bytes_logits,  false, false, false);
   id<MTLBuffer> bufTargets = get_or_create_buffer(targets,         bytes_targets, false, false, true);
   id<MTLBuffer> bufLoss    = get_or_create_buffer(&last_step_loss, bytes_loss,    true,  true,  false);
   id<MTLBuffer> bufGrad    = get_or_create_buffer(grad_logits,     bytes_logits,  true,  false, false);
@@ -1196,11 +1301,35 @@ void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out
     [activeEncoder setBytes:&u_vocab  length:sizeof(uint32_t) atIndex:4];
     [activeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:5];
 
-    // Grid: 256 threads per threadgroup (x), total_tokens threadgroups (y)
     MTLSize threadsPerTG = MTLSizeMake(256, 1, 1);
     MTLSize tgGrid       = MTLSizeMake(1, total_tokens, 1);
     [activeEncoder dispatchThreadgroups:tgGrid threadsPerThreadgroup:threadsPerTG];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+
+      [computeEncoder setComputePipelineState:pipelineStateCrossEntropy];
+      [computeEncoder setBuffer:bufLogits  offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufTargets offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufLoss    offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufGrad    offset:0 atIndex:3];
+      [computeEncoder setBytes:&u_vocab  length:sizeof(uint32_t) atIndex:4];
+      [computeEncoder setBytes:&u_tokens length:sizeof(uint32_t) atIndex:5];
+
+      MTLSize threadsPerTG = MTLSizeMake(256, 1, 1);
+      MTLSize tgGrid       = MTLSizeMake(1, total_tokens, 1);
+      [computeEncoder dispatchThreadgroups:tgGrid threadsPerThreadgroup:threadsPerTG];
+
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
   }
+
+  // Sync the CPU-side loss value to the caller's pointer
+  *loss_out = last_step_loss;
 }
 
 void gemm_backward(const float *a_transposed, const float *b, float *c,
@@ -1233,6 +1362,24 @@ void gemm_backward(const float *a_transposed, const float *b, float *c,
     MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
     [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
                   threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateGEMMBackward];
+      [computeEncoder setBuffer:bufA offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufB offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufC offset:0 atIndex:2];
+      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+      MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                    threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
   }
 }
 
@@ -1266,14 +1413,223 @@ void gemm_proj_trans_b(const float *a, const float *b_transposed, float *c,
     MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
     [activeEncoder dispatchThreadgroups:threadgroupsPerGrid
                   threadsPerThreadgroup:threadsPerThreadgroup];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateGEMMProjTransB];
+      [computeEncoder setBuffer:bufA offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufB offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufC offset:0 atIndex:2];
+      [computeEncoder setBytes:&dimensions length:sizeof(simd::uint3) atIndex:3];
+      MTLSize threadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+      MTLSize threadgroupsPerGrid = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
+      [computeEncoder dispatchThreadgroups:threadgroupsPerGrid
+                    threadsPerThreadgroup:threadsPerThreadgroup];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
   }
+}
+
+void reshape_to_4d(const float *src, float *dst,
+                   size_t batch, size_t n_heads, size_t seq_len, size_t head_dim) {
+  size_t total = batch * n_heads * seq_len * head_dim;
+  if (total == 0) return;
+
+  size_t bytesSrc = (batch * seq_len * n_heads * head_dim) * sizeof(float);
+  size_t bytesDst = total * sizeof(float);
+
+  id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+
+  if (!bufSrc || !bufDst) {
+    std::cerr << "[reshape_to_4d] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint u_batch   = (uint)batch;
+  uint u_n_heads = (uint)n_heads;
+  uint u_seq_len = (uint)seq_len;
+  uint u_hd      = (uint)head_dim;
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateReshape4D];
+    [activeEncoder setBuffer:bufSrc offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufDst offset:0 atIndex:1];
+    [activeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:2];
+    [activeEncoder setBytes:&u_n_heads length:sizeof(uint) atIndex:3];
+    [activeEncoder setBytes:&u_seq_len length:sizeof(uint) atIndex:4];
+    [activeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:5];
+    MTLSize grid = MTLSizeMake((total + 255) / 256, 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateReshape4D];
+      [computeEncoder setBuffer:bufSrc offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufDst offset:0 atIndex:1];
+      [computeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:2];
+      [computeEncoder setBytes:&u_n_heads length:sizeof(uint) atIndex:3];
+      [computeEncoder setBytes:&u_seq_len length:sizeof(uint) atIndex:4];
+      [computeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:5];
+      MTLSize grid = MTLSizeMake((total + 255) / 256, 1, 1);
+      MTLSize tg   = MTLSizeMake(256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+void reshape_to_3d(const float *src, float *dst,
+                   size_t batch, size_t n_heads, size_t seq_len, size_t head_dim) {
+  size_t total = batch * n_heads * seq_len * head_dim;
+  if (total == 0) return;
+
+  size_t bytesSrc = total * sizeof(float);
+  size_t bytesDst = (batch * seq_len * n_heads * head_dim) * sizeof(float);
+
+  id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+
+  if (!bufSrc || !bufDst) {
+    std::cerr << "[reshape_to_3d] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint u_batch   = (uint)batch;
+  uint u_n_heads = (uint)n_heads;
+  uint u_seq_len = (uint)seq_len;
+  uint u_hd      = (uint)head_dim;
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateReshape3D];
+    [activeEncoder setBuffer:bufSrc offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufDst offset:0 atIndex:1];
+    [activeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:2];
+    [activeEncoder setBytes:&u_n_heads length:sizeof(uint) atIndex:3];
+    [activeEncoder setBytes:&u_seq_len length:sizeof(uint) atIndex:4];
+    [activeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:5];
+    MTLSize grid = MTLSizeMake((total + 255) / 256, 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateReshape3D];
+      [computeEncoder setBuffer:bufSrc offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufDst offset:0 atIndex:1];
+      [computeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:2];
+      [computeEncoder setBytes:&u_n_heads length:sizeof(uint) atIndex:3];
+      [computeEncoder setBytes:&u_seq_len length:sizeof(uint) atIndex:4];
+      [computeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:5];
+      MTLSize grid = MTLSizeMake((total + 255) / 256, 1, 1);
+      MTLSize tg   = MTLSizeMake(256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+void rope_forward(float *q, float *k,
+                  const float *cos_table, const float *sin_table,
+                  size_t batch, size_t q_heads, size_t kv_heads,
+                  size_t seq_len, size_t head_dim) {
+  size_t half_dim = head_dim / 2;
+
+  size_t bytesQ  = batch * q_heads * seq_len * head_dim * sizeof(float);
+  size_t bytesK  = batch * kv_heads * seq_len * head_dim * sizeof(float);
+  size_t bytesT  = seq_len * half_dim * sizeof(float);
+
+  id<MTLBuffer> bufQ   = get_or_create_buffer(q,          bytesQ, true,  false, false);
+  id<MTLBuffer> bufK   = get_or_create_buffer(k,          bytesK, true,  false, false);
+  id<MTLBuffer> bufCos = get_or_create_buffer(cos_table,  bytesT, false, true,  false);
+  id<MTLBuffer> bufSin = get_or_create_buffer(sin_table,  bytesT, false, true,  false);
+
+  if (!bufQ || !bufK || !bufCos || !bufSin) {
+    std::cerr << "[rope_forward] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  uint u_batch   = (uint)batch;
+  uint u_qheads  = (uint)q_heads;
+  uint u_kvheads = (uint)kv_heads;
+  uint u_seqlen  = (uint)seq_len;
+  uint u_hd      = (uint)head_dim;
+
+  size_t total_pairs_q  = batch * q_heads * seq_len * half_dim;
+  size_t total_pairs_k  = batch * kv_heads * seq_len * half_dim;
+  size_t max_pairs = (total_pairs_q > total_pairs_k) ? total_pairs_q : total_pairs_k;
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateRoPEForward];
+    [activeEncoder setBuffer:bufQ   offset:0 atIndex:0];
+    [activeEncoder setBuffer:bufK   offset:0 atIndex:1];
+    [activeEncoder setBuffer:bufCos offset:0 atIndex:2];
+    [activeEncoder setBuffer:bufSin offset:0 atIndex:3];
+    [activeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:4];
+    [activeEncoder setBytes:&u_qheads  length:sizeof(uint) atIndex:5];
+    [activeEncoder setBytes:&u_kvheads length:sizeof(uint) atIndex:6];
+    [activeEncoder setBytes:&u_seqlen  length:sizeof(uint) atIndex:7];
+    [activeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:8];
+    MTLSize grid = MTLSizeMake((max_pairs + 255) / 256, 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cmdBuffer = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+      [computeEncoder setComputePipelineState:pipelineStateRoPEForward];
+      [computeEncoder setBuffer:bufQ   offset:0 atIndex:0];
+      [computeEncoder setBuffer:bufK   offset:0 atIndex:1];
+      [computeEncoder setBuffer:bufCos offset:0 atIndex:2];
+      [computeEncoder setBuffer:bufSin offset:0 atIndex:3];
+      [computeEncoder setBytes:&u_batch   length:sizeof(uint) atIndex:4];
+      [computeEncoder setBytes:&u_qheads  length:sizeof(uint) atIndex:5];
+      [computeEncoder setBytes:&u_kvheads length:sizeof(uint) atIndex:6];
+      [computeEncoder setBytes:&u_seqlen  length:sizeof(uint) atIndex:7];
+      [computeEncoder setBytes:&u_hd      length:sizeof(uint) atIndex:8];
+      MTLSize grid = MTLSizeMake((max_pairs + 255) / 256, 1, 1);
+      MTLSize tg   = MTLSizeMake(256, 1, 1);
+      [computeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [computeEncoder endEncoding];
+      [cmdBuffer commit];
+      [cmdBuffer waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+void clear_step_cache() {
+  // Return all buffers allocated this step to the size pool for reuse
+  for (const auto &pair : activeAllocationsThisStep) {
+    sizePool[pair.first].push_back(pair.second);
+  }
+  activeAllocationsThisStep.clear();
+  stepCache.clear();
+}
+
+void reconcile_buffers() {
+  run_copy_back_tasks();
+  clear_step_cache();
 }
 
 void start_batch() {
   if (batchActive)
     return;
-  activationPoolIndex = 0;
   stepCache.clear();
+  activeAllocationsThisStep.clear();
   activeCmdBuffer = [commandQueue commandBuffer];
   activeEncoder = [activeCmdBuffer computeCommandEncoder];
   batchActive = true;
@@ -1303,8 +1659,13 @@ void commit_batch() {
   // Run copy-back tasks for unaligned writes
   run_copy_back_tasks();
 
+  // Return all intermediate activation buffers from this step back to sizePool buckets
+  for (const auto &pair : activeAllocationsThisStep) {
+    sizePool[pair.first].push_back(pair.second);
+  }
+  activeAllocationsThisStep.clear();
+
   batchActive = false;
-  activationPoolIndex = 0;
   stepCache.clear();
 }
 

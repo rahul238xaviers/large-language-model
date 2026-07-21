@@ -233,6 +233,15 @@ add_custom_command(
             -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
             -o ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_4d.metal
+            -o ${CMAKE_BINARY_DIR}/reshape_4d.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_3d.metal
+            -o ${CMAKE_BINARY_DIR}/reshape_3d.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
+            -o ${CMAKE_BINARY_DIR}/rope_forward.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
@@ -248,6 +257,9 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/cross_entropy.air
             ${CMAKE_BINARY_DIR}/gemm_backward.air
             ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
+            ${CMAKE_BINARY_DIR}/reshape_4d.air
+            ${CMAKE_BINARY_DIR}/reshape_3d.air
+            ${CMAKE_BINARY_DIR}/rope_forward.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
@@ -263,6 +275,9 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/cross_entropy.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_4d.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_3d.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)

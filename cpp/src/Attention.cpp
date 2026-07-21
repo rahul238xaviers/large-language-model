@@ -69,8 +69,17 @@ Tensor reshape_to_4d(const Tensor &src, size_t n_heads, size_t head_dim) {
 
   Tensor dest({batch, n_heads, seq_len, head_dim}, 0.0f);
 
-  for (size_t b = 0; b < batch; ++b) {
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      metal_bridge::reshape_to_4d(src.data().data(), dest.data().data(),
+                                   batch, n_heads, seq_len, head_dim);
+      return dest;
+    }
+  }
 
+  for (size_t b = 0; b < batch; ++b) {
     for (size_t h = 0; h < n_heads; h++) {
       for (size_t s = 0; s < seq_len; ++s) {
         for (size_t d = 0; d < head_dim; ++d) {
@@ -107,8 +116,17 @@ Tensor reshape_to_3d(const Tensor &src) {
 
   Tensor dest({batch, seq_len, n_heads * head_dim}, 0.0f);
 
-  for (size_t b = 0; b < batch; ++b) {
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      metal_bridge::reshape_to_3d(src.data().data(), dest.data().data(),
+                                   batch, n_heads, seq_len, head_dim);
+      return dest;
+    }
+  }
 
+  for (size_t b = 0; b < batch; ++b) {
     for (size_t h = 0; h < n_heads; h++) {
       for (size_t s = 0; s < seq_len; ++s) {
         for (size_t d = 0; d < head_dim; ++d) {

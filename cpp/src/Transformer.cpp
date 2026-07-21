@@ -564,10 +564,8 @@ Tensor Transformer::backward(
 
   // --- 5. Embedding Lookup Backward ---
   std::cout << "[PROFILE-BWD]   4. Embedding Grad Accumulation..." << std::endl;
-  if (!use_gpu) {
-    accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h,
-                               grad_embeddings);
-  }
+  accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h,
+                             grad_embeddings);
 
   auto tbwd_end = std::chrono::high_resolution_clock::now();
   double ms_bwd_total = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tbwd_end - tbwd_start).count()) / 1000.0;

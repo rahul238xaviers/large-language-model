@@ -227,5 +227,40 @@ float get_last_loss();
 
 void execute_in_autoreleasepool(std::function<void()> func);
 
+/**
+ * @brief Clear the step-local activation buffer cache and return buffers to the pool.
+ *        Call this at the start of each training step (before any GPU ops) to ensure
+ *        clean state.
+ */
+void clear_step_cache();
+
+/**
+ * @brief Run pending copy-back tasks and clear step cache.
+ *        Equivalent to calling run_copy_back_tasks() + clear_step_cache().
+ */
+void reconcile_buffers();
+
+/**
+ * @brief GPU-accelerated reshape from [B, S, nH*HD] to [B, nH, S, HD].
+ */
+void reshape_to_4d(const float *src, float *dst,
+                   size_t batch, size_t n_heads, size_t seq_len, size_t head_dim);
+
+/**
+ * @brief GPU-accelerated reshape from [B, nH, S, HD] to [B, S, nH*HD].
+ */
+void reshape_to_3d(const float *src, float *dst,
+                   size_t batch, size_t n_heads, size_t seq_len, size_t head_dim);
+
+/**
+ * @brief GPU-accelerated RoPE forward pass.
+ *        Applies rotary position embeddings to Q and K in-place.
+ *        Q shape: [B, n_q_heads, S, HD]; K shape: [B, n_kv_heads, S, HD].
+ */
+void rope_forward(float *q, float *k,
+                  const float *cos_table, const float *sin_table,
+                  size_t batch, size_t q_heads, size_t kv_heads,
+                  size_t seq_len, size_t head_dim);
+
 
 } // namespace metal_bridge
