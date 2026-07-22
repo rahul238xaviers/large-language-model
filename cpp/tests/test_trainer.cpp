@@ -518,7 +518,7 @@ int main() {
       }
 
       // Populate random initial weights
-      std::vector<float> &emb_data = model_save.token_embeddings().data();
+      auto &emb_data = model_save.token_embeddings().data();
       for (size_t i = 0; i < emb_data.size(); ++i) {
         emb_data[i] = static_cast<float>(i) * 0.01f + 0.1f;
       }

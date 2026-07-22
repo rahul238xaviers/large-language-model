@@ -8,6 +8,9 @@ public:
   float forward(const Tensor &logits, const Tensor &targets);
   // Backward pass: computes gradient w.r.t logits
   Tensor backward(const Tensor &targets) const;
+  // Direct access to GPU gradient buffer (for async dispatch — avoid copy)
+  const Tensor &grad_logits() const { return grad_logits_; }
+  float loss_val() const { return loss_val_; }
 
 private:
   // Saved probabilities from the forward pass (CPU path)

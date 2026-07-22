@@ -8,7 +8,6 @@ project(LLM_Pipeline LANGUAGES CXX)
 # Set the C++20 standard
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 # Enable Release build type by default if not set
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
@@ -245,6 +244,21 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_scores.metal
             -o ${CMAKE_BINARY_DIR}/gqa_scores.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/attn_softmax.metal
+            -o ${CMAKE_BINARY_DIR}/attn_softmax.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/attn_backprop.metal
+            -o ${CMAKE_BINARY_DIR}/attn_backprop.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_forward.metal
+            -o ${CMAKE_BINARY_DIR}/swiglu_forward.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_attn_bwd.metal
+            -o ${CMAKE_BINARY_DIR}/fused_attn_bwd.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_bf16.air
     COMMAND ${XCRUN} -sdk macosx metallib
             ${CMAKE_BINARY_DIR}/gemm_ffn.air
             ${CMAKE_BINARY_DIR}/gemm_proj.air
@@ -264,6 +278,11 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/reshape_3d.air
             ${CMAKE_BINARY_DIR}/rope_forward.air
             ${CMAKE_BINARY_DIR}/gqa_scores.air
+            ${CMAKE_BINARY_DIR}/attn_softmax.air
+            ${CMAKE_BINARY_DIR}/attn_backprop.air
+            ${CMAKE_BINARY_DIR}/swiglu_forward.air
+            ${CMAKE_BINARY_DIR}/fused_attn_bwd.air
+            ${CMAKE_BINARY_DIR}/gemm_bf16.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
     DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
@@ -283,6 +302,11 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_3d.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gqa_scores.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/attn_softmax.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/attn_backprop.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_forward.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_attn_bwd.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16.metal
 )
 # 3. Add default.metallib to the target files so CMake knows it must build it
 add_custom_target(compile_shaders DEPENDS ${CMAKE_BINARY_DIR}/default.metallib)

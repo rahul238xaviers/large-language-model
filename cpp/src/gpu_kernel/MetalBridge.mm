@@ -11,6 +11,7 @@
  */
 
 #include "gpu_kernel/MetalBridge.hpp"
+#include "gemm_profiler.hpp"
 #define ACCELERATE_NEW_LAPACK
 #import <Accelerate/Accelerate.h>
 #import <Foundation/Foundation.h>
@@ -52,13 +53,19 @@ static id<MTLComputePipelineState> pipelineStateReshape4D = nil;
 static id<MTLComputePipelineState> pipelineStateReshape3D = nil;
 static id<MTLComputePipelineState> pipelineStateRoPEForward = nil;
 static id<MTLComputePipelineState> pipelineStateGQAScores = nil;
+static id<MTLComputePipelineState> pipelineStateAttnSoftmax = nil;
+static id<MTLComputePipelineState> pipelineStateAttnDS = nil;
+static id<MTLComputePipelineState> pipelineStateSwiGLUForward = nil;
+static id<MTLComputePipelineState> pipelineStateFusedAttnBwd = nil;
+static id<MTLComputePipelineState> pipelineStateGEMMBF16 = nil;
 
 static float last_step_loss = 0.0f;
 static bool initialized = false;
 
-static id<MTLCommandBuffer> activeCmdBuffer = nil;
-static id<MTLComputeCommandEncoder> activeEncoder = nil;
-static bool batchActive = false;
+// ── Global Metal state — already inside namespace metal_bridge from opening bracket ──
+__attribute__((used)) bool batchActive = false;
+__attribute__((used)) id activeCmdBuffer = nil;   // MTLCommandBuffer
+__attribute__((used)) id activeEncoder = nil;     // MTLComputeCommandEncoder
 
 // Legacy buffer cache (unused — kept for compatibility with existing clear() calls)
 struct CachedBuffer {
@@ -96,6 +103,29 @@ static void run_copy_back_tasks() {
 static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
                                           bool is_write = false, bool is_persistent = false,
                                           bool is_host_input = false);
+
+// ── Lazy encoder: called by every dispatch function before encoding ──
+// Creates the compute encoder on first use, ensuring it perfectly wraps
+// the actual commands and avoiding empty-buffer commits.
+static inline id<MTLComputeCommandEncoder> ensure_encoder() {
+  if (!batchActive || activeCmdBuffer == nil) return nil;
+  if (activeEncoder == nil) {
+    activeEncoder = [(id<MTLCommandBuffer>)activeCmdBuffer computeCommandEncoder];
+    // Retain: encoder is autoreleased.  Non-ARC file — must hold own reference
+    // across the @autoreleasepool that wraps the training step.
+    if (activeEncoder) CFRetain((__bridge CFTypeRef)activeEncoder);
+  }
+  return (id<MTLComputeCommandEncoder>)activeEncoder;
+}
+
+// Debug guard: if this fires, a kernel is encoding outside begin_scope().
+// In a correctly scoped step, all kernel encodes happen between begin_scope()
+// and end_scope().  Any else-block execution means a sync pipeline stall.
+#ifndef NDEBUG
+#define ASSERT_BATCHED(msg) if (!batchActive) { std::cerr << "[BATCH] " << msg << " outside scope — sync fallback!\n"; }
+#else
+#define ASSERT_BATCHED(msg)
+#endif
 
 // Profiling statistics definitions
 double accum_gpu_time_ms = 0.0;
@@ -488,6 +518,36 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for 'gqa_scores'!" << std::endl;
 
+  id<MTLFunction> attnSoftmaxFunc = [defaultLibrary newFunctionWithName:@"attn_softmax"];
+  if (!attnSoftmaxFunc) { std::cerr << "Failed to find 'attn_softmax'\n"; return; }
+  pipelineStateAttnSoftmax = [device newComputePipelineStateWithFunction:attnSoftmaxFunc error:&error];
+  if (!pipelineStateAttnSoftmax) { std::cerr << "Failed to compile 'attn_softmax'\n"; return; }
+  std::cout << "Compiled 'attn_softmax'!" << std::endl;
+
+  id<MTLFunction> attnDSFunc = [defaultLibrary newFunctionWithName:@"attn_ds"];
+  if (!attnDSFunc) { std::cerr << "Failed to find 'attn_ds'\n"; return; }
+  pipelineStateAttnDS = [device newComputePipelineStateWithFunction:attnDSFunc error:&error];
+  if (!pipelineStateAttnDS) { std::cerr << "Failed to compile 'attn_ds'\n"; return; }
+  std::cout << "Compiled 'attn_ds'!" << std::endl;
+
+  id<MTLFunction> swigluFwdFunc = [defaultLibrary newFunctionWithName:@"swiglu_forward"];
+  if (!swigluFwdFunc) { std::cerr << "Failed to find 'swiglu_forward'\n"; return; }
+  pipelineStateSwiGLUForward = [device newComputePipelineStateWithFunction:swigluFwdFunc error:&error];
+  if (!pipelineStateSwiGLUForward) { std::cerr << "Failed to compile 'swiglu_forward'\n"; return; }
+  std::cout << "Compiled 'swiglu_forward'!" << std::endl;
+
+  id<MTLFunction> fusedBwdFunc = [defaultLibrary newFunctionWithName:@"fused_attn_bwd"];
+  if (!fusedBwdFunc) { std::cerr << "Failed to find 'fused_attn_bwd'\n"; return; }
+  pipelineStateFusedAttnBwd = [device newComputePipelineStateWithFunction:fusedBwdFunc error:&error];
+  if (!pipelineStateFusedAttnBwd) { std::cerr << "Failed to compile 'fused_attn_bwd'\n"; return; }
+  std::cout << "Compiled 'fused_attn_bwd'!" << std::endl;
+
+  id<MTLFunction> gemmBF16Func = [defaultLibrary newFunctionWithName:@"gemm_bf16"];
+  if (!gemmBF16Func) { std::cerr << "Failed to find 'gemm_bf16'\n"; return; }
+  pipelineStateGEMMBF16 = [device newComputePipelineStateWithFunction:gemmBF16Func error:&error];
+  if (!pipelineStateGEMMBF16) { std::cerr << "Failed to compile 'gemm_bf16'\n"; return; }
+  std::cout << "Compiled 'gemm_bf16'!" << std::endl;
+
   initialized = true;
 }
 
@@ -690,16 +750,35 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
     return step_it->second;
   }
 
-  // 3. Allocate a buffer from the size pool (or create new)
+  // 3. Allocate a buffer — prefer zero-copy for page-aligned pointers
   id<MTLBuffer> buf = nil;
-  auto &bucket = sizePool[bytes];
-  if (!bucket.empty()) {
-    buf = bucket.back();
-    bucket.pop_back();
-  } else {
-    buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (buf) {
-      CFRetain((__bridge CFTypeRef)buf);
+  
+  // Check if the pointer is 16384-byte page aligned (set by PageAlignedAllocator)
+  bool is_page_aligned = (((uintptr_t)ptr) & 0x3FFF) == 0;
+  
+  if (is_page_aligned) {
+    // Zero-copy: wrap the existing memory. std::vector retains ownership,
+    // so we pass nil deallocator.  The buffer shares the page with the CPU.
+    if (bytes > 0) {
+      buf = [device newBufferWithBytesNoCopy:(void*)ptr
+                                      length:bytes
+                                     options:MTLResourceStorageModeShared
+                                 deallocator:nil];
+      if (buf) {
+        CFRetain((__bridge CFTypeRef)buf); // balance the eventual autorelease
+      }
+    }
+  }
+  
+  // Fallback: size pool (for non-aligned or zero-length edge cases)
+  if (!buf) {
+    auto &bucket = sizePool[bytes];
+    if (!bucket.empty()) {
+      buf = bucket.back();
+      bucket.pop_back();
+    } else {
+      buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+      if (buf) CFRetain((__bridge CFTypeRef)buf);
     }
   }
 
@@ -707,15 +786,24 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
     activeAllocationsThisStep.push_back({bytes, buf});
 
     if (is_write) {
-      // Non-persistent writes fully overwrite the output (gemm_proj result,
-      // reshape output, embedding output, etc). No need to zero — the GPU
-      // kernel writes every element.
-      copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
+      // Non-persistent writes fully overwrite: GPU writes every element.
+      // No need to zero or memcpy — zero-copy wraps the existing memory.
+      // But register copy-back so CPU sees the result when scope ends.
+      if (!is_page_aligned) {
+        copyBackQueue.push_back({const_cast<void *>(ptr), buf, bytes});
+      }
+      // For page-aligned: zero-copy — CPU sees GPU writes directly.
+      // No copy-back needed because MTLResourceStorageModeShared is coherent.
     } else if (is_host_input) {
-      memcpy([buf contents], ptr, bytes);
+      if (!is_page_aligned) {
+        memcpy([buf contents], ptr, bytes);
+      }
+      // For page-aligned: data is already at ptr — no upload needed.
     } else {
-      // First GPU read of this tensor: upload current CPU contents
-      memcpy([buf contents], ptr, bytes);
+      if (!is_page_aligned) {
+        memcpy([buf contents], ptr, bytes);
+      }
+      // For page-aligned: data is already at ptr — no upload needed.
     }
     stepCache[ptr] = buf;
   }
@@ -1041,6 +1129,187 @@ void gqa_scores(const float *Q, const float *K, float *scores,
   }
 }
 
+void attn_softmax(const float *scores, float *probs,
+                  size_t batch, size_t n_heads, size_t seq_len) {
+  size_t bytes = batch * n_heads * seq_len * seq_len * sizeof(float);
+  id<MTLBuffer> bufS = get_or_create_buffer(scores, bytes);
+  id<MTLBuffer> bufP = get_or_create_buffer(probs, bytes, true);
+  if (!bufS || !bufP) { std::cerr << "[attn_softmax] buffer alloc failed\n"; return; }
+  uint ub = (uint)batch, unh = (uint)n_heads, us = (uint)seq_len;
+  MTLSize grid = MTLSizeMake(batch, n_heads, seq_len);
+  MTLSize tg = MTLSizeMake(1, 1, 256);
+  auto enc = ^(id<MTLComputeCommandEncoder> e) {
+    [e setComputePipelineState:pipelineStateAttnSoftmax];
+    [e setBuffer:bufS offset:0 atIndex:0];
+    [e setBuffer:bufP offset:0 atIndex:1];
+    [e setBytes:&ub  length:sizeof(uint) atIndex:2];
+    [e setBytes:&unh length:sizeof(uint) atIndex:3];
+    [e setBytes:&us  length:sizeof(uint) atIndex:4];
+    [e dispatchThreads:grid threadsPerThreadgroup:tg];
+  };
+  if (batchActive) { enc(activeEncoder); }
+  else { @autoreleasepool {
+    id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    enc(e); [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    run_copy_back_tasks();
+  }}
+}
+
+void attn_ds(const float *probs, const float *dP_row, float *dS_out,
+             size_t batch, size_t n_heads, size_t seq_len) {
+  size_t bytes = batch * n_heads * seq_len * seq_len * sizeof(float);
+  id<MTLBuffer> bufP = get_or_create_buffer(probs, bytes);
+  id<MTLBuffer> bufD = get_or_create_buffer(dP_row, bytes);
+  id<MTLBuffer> bufO = get_or_create_buffer(dS_out, bytes, true);
+  if (!bufP || !bufD || !bufO) { std::cerr << "[attn_ds] buffer alloc failed\n"; return; }
+  uint ub=(uint)batch, unh=(uint)n_heads, us=(uint)seq_len;
+  MTLSize grid = MTLSizeMake(batch, n_heads, seq_len);
+  MTLSize tg = MTLSizeMake(1, 1, 256);
+  auto enc = ^(id<MTLComputeCommandEncoder> e) {
+    [e setComputePipelineState:pipelineStateAttnDS];
+    [e setBuffer:bufP offset:0 atIndex:0];
+    [e setBuffer:bufD offset:0 atIndex:1];
+    [e setBuffer:bufO offset:0 atIndex:2];
+    [e setBytes:&ub  length:sizeof(uint) atIndex:3];
+    [e setBytes:&unh length:sizeof(uint) atIndex:4];
+    [e setBytes:&us  length:sizeof(uint) atIndex:5];
+    [e dispatchThreads:grid threadsPerThreadgroup:tg];
+  };
+  if (batchActive) { enc(activeEncoder); }
+  else { @autoreleasepool {
+    id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    enc(e); [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    run_copy_back_tasks();
+  }}
+}
+
+void swiglu_forward(const float *gate, const float *up, float *out, size_t n) {
+  if (n == 0) return;
+  size_t bytes = n * sizeof(float);
+  id<MTLBuffer> bufG = get_or_create_buffer(gate, bytes);
+  id<MTLBuffer> bufU = get_or_create_buffer(up, bytes);
+  id<MTLBuffer> bufO = get_or_create_buffer(out, bytes, true);
+  if (!bufG || !bufU || !bufO) { std::cerr << "[swiglu_forward] buffer alloc failed\n"; return; }
+  uint un = (uint)n;
+  MTLSize grid = MTLSizeMake((n + 255) / 256, 1, 1);
+  MTLSize tg = MTLSizeMake(256, 1, 1);
+  auto enc = ^(id<MTLComputeCommandEncoder> e) {
+    [e setComputePipelineState:pipelineStateSwiGLUForward];
+    [e setBuffer:bufG offset:0 atIndex:0];
+    [e setBuffer:bufU offset:0 atIndex:1];
+    [e setBuffer:bufO offset:0 atIndex:2];
+    [e setBytes:&un length:sizeof(uint) atIndex:3];
+    [e dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  };
+  if (batchActive) { enc(activeEncoder); }
+  else { @autoreleasepool {
+    id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    enc(e); [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    run_copy_back_tasks();
+  }}
+}
+
+void fused_attn_bwd(const void *Q, const void *K, const void *V,
+                     const void *dO, void *dQ, void *dK, void *dV,
+                     size_t batch, size_t n_heads, size_t n_kv,
+                     size_t seq_len, size_t head_dim) {
+  size_t bytesQ = batch * n_heads * seq_len * head_dim * sizeof(float);
+  size_t bytesKV = batch * n_kv * seq_len * head_dim * sizeof(float);
+  size_t bytesDO = batch * seq_len * n_heads * head_dim * sizeof(float);
+
+  id<MTLBuffer> bQ = get_or_create_buffer(Q, bytesQ);
+  id<MTLBuffer> bK = get_or_create_buffer(K, bytesKV);
+  id<MTLBuffer> bV = get_or_create_buffer(V, bytesKV);
+  id<MTLBuffer> bdO = get_or_create_buffer(dO, bytesDO);
+  id<MTLBuffer> bdQ = get_or_create_buffer(dQ, bytesQ, true);
+  id<MTLBuffer> bdK = get_or_create_buffer(dK, bytesKV, true);
+  id<MTLBuffer> bdV = get_or_create_buffer(dV, bytesKV, true);
+  if (!bQ || !bK || !bV || !bdO || !bdQ || !bdK || !bdV) {
+    std::cerr << "[fused_attn_bwd] buffer alloc failed\n"; return;
+  }
+  MTLSize grid = MTLSizeMake(batch, n_heads, 1);
+  MTLSize tg = MTLSizeMake(256, 1, 1);
+  auto enc = ^(id<MTLComputeCommandEncoder> e) {
+    [e setComputePipelineState:pipelineStateFusedAttnBwd];
+    [e setBuffer:bQ offset:0 atIndex:0]; [e setBuffer:bK offset:0 atIndex:1];
+    [e setBuffer:bV offset:0 atIndex:2]; [e setBuffer:bdO offset:0 atIndex:3];
+    [e setBuffer:bdQ offset:0 atIndex:4]; [e setBuffer:bdK offset:0 atIndex:5];
+    [e setBuffer:bdV offset:0 atIndex:6];
+    [e dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  };
+  if (batchActive) { enc(activeEncoder); }
+  else { @autoreleasepool {
+    id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    enc(e); [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    run_copy_back_tasks();
+  }}
+}
+
+void gemm_bf16(const void *A, const void *B, void *C,
+                 size_t M, size_t N, size_t K,
+                 bool transA, bool transB, bool is_forward) {
+  auto prof_start = std::chrono::high_resolution_clock::now();
+
+  size_t bytesA = (transA ? K : M) * (transA ? M : K) * sizeof(float);
+  size_t bytesB = (transB ? N : K) * (transB ? K : N) * sizeof(float);
+  size_t bytesC = M * N * sizeof(float);
+
+  id<MTLBuffer> bA = get_or_create_buffer(A, bytesA);
+  id<MTLBuffer> bB = get_or_create_buffer(B, bytesB);
+  id<MTLBuffer> bC = get_or_create_buffer(C, bytesC, true);
+  if (!bA || !bB || !bC) { std::cerr << "[gemm_bf16] buffer alloc failed\n"; return; }
+
+  uint uM = (uint)M, uN = (uint)N, uK = (uint)K;
+  // BF16 → buffer expects bfloat. Tensor stores float.  The kernel casts.
+  // We pass the raw float pointers and the kernel reads as bfloat via cast.
+
+  MTLSize grid = MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
+  MTLSize tg  = MTLSizeMake(256, 1, 1);
+
+  if (batchActive) {
+    [activeEncoder setComputePipelineState:pipelineStateGEMMBF16];
+    [activeEncoder setBuffer:bA offset:0 atIndex:0];
+    [activeEncoder setBuffer:bB offset:0 atIndex:1];
+    [activeEncoder setBuffer:bC offset:0 atIndex:2];
+    [activeEncoder setBytes:&uM length:sizeof(uint) atIndex:3];
+    [activeEncoder setBytes:&uN length:sizeof(uint) atIndex:4];
+    [activeEncoder setBytes:&uK length:sizeof(uint) atIndex:5];
+    [activeEncoder setBytes:&transA length:sizeof(bool) atIndex:6];
+    [activeEncoder setBytes:&transB length:sizeof(bool) atIndex:7];
+    [activeEncoder setBytes:&is_forward length:sizeof(bool) atIndex:8];
+    [activeEncoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:pipelineStateGEMMBF16];
+      [enc setBuffer:bA offset:0 atIndex:0];
+      [enc setBuffer:bB offset:0 atIndex:1];
+      [enc setBuffer:bC offset:0 atIndex:2];
+      [enc setBytes:&uM length:sizeof(uint) atIndex:3];
+      [enc setBytes:&uN length:sizeof(uint) atIndex:4];
+      [enc setBytes:&uK length:sizeof(uint) atIndex:5];
+      [enc setBytes:&transA length:sizeof(bool) atIndex:6];
+      [enc setBytes:&transB length:sizeof(bool) atIndex:7];
+      [enc setBytes:&is_forward length:sizeof(bool) atIndex:8];
+      [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+
+  // Record profiling data
+  auto prof_end = std::chrono::high_resolution_clock::now();
+  double prof_ms = std::chrono::duration<double, std::milli>(prof_end - prof_start).count();
+  GemmProfiler::instance().record(M, N, K, transA, transB, prof_ms);
+}
+
 void gqa_backward(const GQABackwardParams &params,
                   const float *Q, const float *K, const float *V,
                   const float *grad_attn_output,
@@ -1323,6 +1592,12 @@ void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out
     return;
   }
 
+  // Explicitly zero the loss buffer — get_or_create_buffer for persistent
+  // writes does NOT zero on reuse (only on first creation).  Without this,
+  // the GPU's atomic_fetch_add would accumulate on top of stale loss data.
+  memset([bufLoss contents], 0, bytes_loss);
+
+
   uint32_t u_vocab  = static_cast<uint32_t>(vocab_size);
   uint32_t u_tokens = static_cast<uint32_t>(total_tokens);
 
@@ -1362,8 +1637,13 @@ void cross_entropy(const float *logits, const uint32_t *targets, float *loss_out
     }
   }
 
-  // Sync the CPU-side loss value to the caller's pointer
-  *loss_out = last_step_loss;
+  // IN BATCH MODE: GPU hasn't executed yet.  Do NOT write to *loss_out —
+  // that would store 0.  The caller reads get_last_loss() after end_scope().
+  // IN SYNC MODE: GPU already executed (waitUntilCompleted + run_copy_back_tasks
+  // above), so last_step_loss is valid.
+  if (!batchActive) {
+    *loss_out = last_step_loss;
+  }
 }
 
 void gemm_backward(const float *a_transposed, const float *b, float *c,
@@ -1586,27 +1866,78 @@ void reconcile_buffers() {
   clear_step_cache();
 }
 
-void start_batch() {
-  if (batchActive)
-    return;
+void begin_scope() {
+  // ── Release any dangling references from a previous failed scope ──
+  if (activeEncoder != nil) {
+    @try { [(id<MTLComputeCommandEncoder>)activeEncoder endEncoding]; } @catch (...) {}
+    CFRelease((__bridge CFTypeRef)activeEncoder);
+    activeEncoder = nil;
+  }
+  if (activeCmdBuffer != nil) {
+    CFRelease((__bridge CFTypeRef)activeCmdBuffer);
+    activeCmdBuffer = nil;
+  }
+  batchActive = false;
   stepCache.clear();
   activeAllocationsThisStep.clear();
+
+  // ── Create command buffer AND encoder immediately ──
   activeCmdBuffer = [commandQueue commandBuffer];
-  activeEncoder = [activeCmdBuffer computeCommandEncoder];
+  if (activeCmdBuffer) {
+    CFRetain((__bridge CFTypeRef)activeCmdBuffer);
+    activeEncoder = [(id<MTLCommandBuffer>)activeCmdBuffer computeCommandEncoder];
+    if (activeEncoder) CFRetain((__bridge CFTypeRef)activeEncoder);
+  }
   batchActive = true;
 }
 
-void commit_batch() {
-  if (!batchActive)
+void end_scope() {
+  if (!batchActive) return;
+
+  id cmdBuf = activeCmdBuffer;
+  id enc = activeEncoder;
+
+  // ── Step 1: End encoder (release before nil) ──
+  if (enc != nil) {
+    @try {
+      [(id<MTLComputeCommandEncoder>)enc endEncoding];
+    } @catch (NSException *e) {
+      std::cerr << "[end_scope] endEncoding failed: "
+                << [[e description] UTF8String] << std::endl;
+    }
+    CFRelease((__bridge CFTypeRef)enc);
+    activeEncoder = nil;
+  }
+
+  // ── Step 2: Release command buffer reference ──
+  // (committed or not, we no longer need our retain)
+  if (cmdBuf != nil) {
+    CFRelease((__bridge CFTypeRef)cmdBuf);
+  }
+  activeCmdBuffer = nil;
+  batchActive = false;
+
+  // ── Step 3: Check if anything was encoded ──
+  if (cmdBuf == nil || enc == nil) {
+    std::cerr << "[end_scope] empty scope (cmdBuf=" << cmdBuf << " enc=" << enc << ")" << std::endl;
+    stepCache.clear();
     return;
-  [activeEncoder endEncoding];
-  activeEncoder = nil;
+  }
+
+  // ── Step 4: Commit and wait ──
+  @try {
+    [(id<MTLCommandBuffer>)cmdBuf commit];
+  } @catch (NSException *e) {
+    std::cerr << "[end_scope] commit failed: "
+              << [[e description] UTF8String] << std::endl;
+    stepCache.clear();
+    return;
+  }
 
   std::cout << "[GPU-EXEC] Dispatched batch to Apple Silicon hardware... GPU executing..." << std::endl;
   auto start = std::chrono::high_resolution_clock::now();
 
-  [activeCmdBuffer commit];
-  [activeCmdBuffer waitUntilCompleted];
+  [(id<MTLCommandBuffer>)cmdBuf waitUntilCompleted];
 
   auto end = std::chrono::high_resolution_clock::now();
   double gpu_time = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
@@ -1615,23 +1946,33 @@ void commit_batch() {
 
   std::cout << "[GPU-EXEC] GPU Hardware finished execution in " << gpu_time << " ms." << std::endl;
 
-  activeCmdBuffer = nil;
+  // Force the loss value by reading from the persistent buffer
+  // The loss buffer was created with newBufferWithLength for &last_step_loss.
+  // After GPU execution + wait, shared memory is coherent.
+  // Find the persistent loss buffer and read directly.
+  auto loss_it = weightCache.find(&last_step_loss);
+  if (loss_it != weightCache.end()) {
+    last_step_loss = *(const float*)[loss_it->second contents];
+  }
 
-  // Run copy-back tasks for unaligned writes
   run_copy_back_tasks();
 
-  // Return all intermediate activation buffers from this step back to sizePool buckets
   for (const auto &pair : activeAllocationsThisStep) {
     sizePool[pair.first].push_back(pair.second);
   }
   activeAllocationsThisStep.clear();
 
-  batchActive = false;
   stepCache.clear();
 }
 
+// Backward compat aliases — don't call these directly (use begin_scope/end_scope)
+
 float get_last_loss() {
-  return last_step_loss;
+  // Read directly from the persistent loss buffer via copyBackQueue
+  // last_step_loss was updated by the last run_copy_back_tasks().
+  // If no copy-back ran (empty scope), return whatever is in last_step_loss.
+  float val = last_step_loss;
+  return val;
 }
 
 void execute_in_autoreleasepool(std::function<void()> func) {

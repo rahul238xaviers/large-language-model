@@ -7,6 +7,7 @@
 #include "Loss.hpp"
 #include "Checkpoint.hpp"
 #include "gpu_kernel/MetalBridge.hpp"
+#include "gemm_profiler.hpp"
 #include <cmath>
 #include <iostream>
 #include <chrono>
@@ -76,19 +77,18 @@ static void run_training_step(
     Tensor &grad_output_projection, float &loss_out) {
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  // Batch the entire forward pass into a single GPU command buffer.
-  // All ops are GPU-native (rms_norm, embedding, gemm, reshape, rope,
-  // residual_add, gemm_ffn) — no CPU intercepts.
-  metal_bridge::start_batch();
   Tensor logits = model.forward(tokens);
-  metal_bridge::commit_batch();
   auto t1 = std::chrono::high_resolution_clock::now();
   
   CrossEntropyLoss loss_fn;
-  loss_out = loss_fn.forward(logits, targets);
+  loss_out = loss_fn.forward(logits, targets);  // GPU encodes but doesn't execute yet
   auto t2 = std::chrono::high_resolution_clock::now();
   
-  Tensor grad_logits = loss_fn.backward(targets);
+  // IMPORTANT: Do NOT call loss_fn.backward() — that would COPY grad_logits_,
+  // creating a new Tensor with a different data pointer.  The GPU kernels
+  // inside model.backward() must read from the SAME buffer that cross_entropy
+  // wrote to.  Pass the loss function's internal gradient tensor directly.
+  const Tensor &grad_logits = loss_fn.grad_logits();
   auto t3 = std::chrono::high_resolution_clock::now();
 
   grad_embeddings.fill(0.0f);
@@ -280,17 +280,27 @@ void Trainer::train() {
     float lr = get_scheduled_lr(step);
     float loss = 0.0f;
 
-    // Clear step cache so each step starts with clean GPU buffer mappings.
-    // Individual GPU ops execute synchronously (commit + wait per call),
-    // eliminating the stale-data bugs that plagued batched execution.
+    // ── Single command buffer for the ENTIRE step ─────────────────────
+    // Forward, loss, backward, and optimizer all encode into one buffer.
+    // GPU executes continuously without waiting for CPU between phases.
+    // CPU cannot read the loss value until end_scope() completes.
+    metal_bridge::initialize();
     metal_bridge::reconcile_buffers();
 
-    metal_bridge::execute_in_autoreleasepool([&]() {
-      run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
-                        grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
-                        grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
-                        grad_output_projection, loss);
-    });
+    metal_bridge::begin_scope();
+
+    run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
+                      grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
+                      grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                      grad_output_projection, loss);
+
+    // loss inside run_training_step is from loss_fn.forward() which is
+    // garbage (GPU hasn't executed).  Overwrite after commit.
+
+    metal_bridge::end_scope();
+
+    // ── GPU has finished — read the real loss ─────────────────────────
+    loss = metal_bridge::get_last_loss();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count() / 1000.0;

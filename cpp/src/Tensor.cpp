@@ -24,38 +24,31 @@
 /**
  * @brief Construct a new empty Tensor object.
  */
-Tensor::Tensor() : shape_({}), strides_({}), data_({}) {}
+Tensor::Tensor() : shape_({}), strides_({}), data_({}), dtype_(DType::FP32) {}
 
-/**
- * @brief Helper to calculate the total flat size of a given shape.
- */
 static size_t get_total_size(const std::vector<size_t> &shape) {
-  if (shape.empty()) {
-    return 1;
-  }
+  if (shape.empty()) return 1;
   return std::accumulate(shape.begin(), shape.end(), 1ULL,
                          std::multiplies<size_t>());
 }
 
-/**
- * @brief Construct a new Tensor object with shape, zero-initialized.
- *
- * @param shape Vector containing dimension sizes.
- */
-Tensor::Tensor(const std::vector<size_t> &shape)
-    : shape_(shape), data_(get_total_size(shape), 0.0f) {
+Tensor::Tensor(const std::vector<size_t> &shape, DType dtype)
+    : shape_(shape), dtype_(dtype) {
+  if (dtype == DType::BF16) {
+    bf16_data_.resize(get_total_size(shape), (__bf16)0.0f);
+  } else {
+    data_.resize(get_total_size(shape), 0.0f);
+  }
   compute_strides();
 }
 
-/**
- * @brief Construct a new Tensor object with shape, initialized to a scalar
- * value.
- *
- * @param shape Vector containing dimension sizes.
- * @param val Scalar value to fill the tensor with.
- */
-Tensor::Tensor(const std::vector<size_t> &shape, float val)
-    : shape_(shape), data_(get_total_size(shape), val) {
+Tensor::Tensor(const std::vector<size_t> &shape, float val, DType dtype)
+    : shape_(shape), dtype_(dtype) {
+  if (dtype == DType::BF16) {
+    bf16_data_.resize(get_total_size(shape), (__bf16)val);
+  } else {
+    data_.resize(get_total_size(shape), val);
+  }
   compute_strides();
 }
 
@@ -167,8 +160,16 @@ const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const {
  * @param shape Shape of the new tensor.
  * @param data Flat vector of data values.
  */
-Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data)
-    : shape_(shape), data_(data) {
+Tensor::Tensor(const std::vector<size_t> &shape, const AlignedVector<float> &data, DType dtype)
+    : shape_(shape), data_(data), dtype_(dtype) {
+  compute_strides();
+  if (data_.size() != get_total_size(shape_)) {
+    throw std::invalid_argument("Data size does not match shape dimensions");
+  }
+}
+
+Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data, DType dtype)
+    : shape_(shape), data_(data.begin(), data.end()), dtype_(dtype) {
   compute_strides();
   if (data_.size() != get_total_size(shape_)) {
     throw std::invalid_argument("Data size does not match shape dimensions");
@@ -370,20 +371,22 @@ Tensor Tensor::matmul(const Tensor &other) const {
     const float *w_data = other.data().data();
     float *res_data = result.data().data();
 
-    // Use Accelerate cblas_sgemm (AMX coprocessor) for standard matmuls.
-    // On M3 Ultra AMX achieves 10+ TFLOPS for these shapes — far beyond
-    // what custom Metal kernels can deliver.
-    auto start = std::chrono::high_resolution_clock::now();
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                1.0f, x_data, static_cast<int>(K), w_data,
-                static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
-    auto end = std::chrono::high_resolution_clock::now();
-    metal_bridge::accum_cpu_time_ms +=
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-            .count() /
-        1000.0;
-    metal_bridge::count_cpu_calls++;
+    // GPU gemm_bf16 (FP32→BF16→FP32) inside a batch scope, AMX fallback otherwise.
+    if (metal_bridge::is_batch_active()) {
+      metal_bridge::gemm_bf16(x_data, w_data, res_data, M, N, K, false, false);
+    } else {
+      auto start = std::chrono::high_resolution_clock::now();
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                  static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                  1.0f, x_data, static_cast<int>(K), w_data,
+                  static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
+      auto end = std::chrono::high_resolution_clock::now();
+      metal_bridge::accum_cpu_time_ms +=
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+              .count() /
+          1000.0;
+      metal_bridge::count_cpu_calls++;
+    }
 
     return result;
   }
@@ -439,17 +442,21 @@ Tensor Tensor::matmul(const Tensor &other) const {
       const float *dataB = b_data + b * batch_offset_B;
       float *dataC = c_data + b * batch_offset_C;
 
-      auto start = std::chrono::high_resolution_clock::now();
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
-                  static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
-                  static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
-                  static_cast<int>(N));
-      auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_cpu_time_ms +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-              .count() /
-          1000.0;
-      metal_bridge::count_cpu_calls++;
+      if (metal_bridge::is_batch_active()) {
+        metal_bridge::gemm_bf16(dataA, dataB, dataC, M, N, K, false, false);
+      } else {
+        auto start = std::chrono::high_resolution_clock::now();
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
+                    static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
+                    static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
+                    static_cast<int>(N));
+        auto end = std::chrono::high_resolution_clock::now();
+        metal_bridge::accum_cpu_time_ms +=
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+                .count() /
+            1000.0;
+        metal_bridge::count_cpu_calls++;
+      }
     }
 
   return result;

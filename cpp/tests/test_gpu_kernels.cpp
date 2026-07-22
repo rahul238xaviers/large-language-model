@@ -33,18 +33,20 @@ void print_test_row(const std::string &id, const std::string &desc,
 }
 
 // Helper to calculate L2 relative error between CPU and GPU results
-float calculate_l2_relative_error(const std::vector<float> &cpu,
-                                  const std::vector<float> &gpu) {
+float calculate_l2_relative_error(const float *cpu, const float *gpu, size_t n) {
   double sum_sq_diff = 0.0;
   double sum_sq_cpu = 0.0;
-  for (size_t i = 0; i < cpu.size(); ++i) {
+  for (size_t i = 0; i < n; ++i) {
     double diff = cpu[i] - gpu[i];
     sum_sq_diff += diff * diff;
     sum_sq_cpu += cpu[i] * cpu[i];
   }
-  if (sum_sq_cpu == 0.0)
-    return 0.0f;
-  return std::sqrt(sum_sq_diff / sum_sq_cpu);
+  if (sum_sq_cpu == 0.0) return 0.0f;
+  return static_cast<float>(sqrt(sum_sq_diff / sum_sq_cpu));
+}
+float calculate_l2_relative_error(const std::vector<float> &cpu,
+                                  const std::vector<float> &gpu) {
+  return calculate_l2_relative_error(cpu.data(), gpu.data(), cpu.size());
 }
 
 // Helper to populate tensor with random normal floats
@@ -102,8 +104,8 @@ int main() {
 
     set_gpu_enabled(true);
     Tensor C_gpu = A.matmul(B);
+    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), C_gpu.data().data(), C_cpu.size());
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data());
     bool pass = (l2_error < 1e-4f);
     if (pass)
       passed_checks++;
@@ -140,7 +142,7 @@ int main() {
     metal_bridge::initialize();
     metal_bridge::gemm_ffn(dataA.data(), dataB_gate.data(), dataB_up.data(), dataC_gpu.data(), M, N, K);
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data(), dataC_gpu);
+    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), dataC_gpu.data(), C_cpu.size());
     bool pass = (l2_error < 1e-4f);
     if (pass)
       passed_checks++;
@@ -201,7 +203,7 @@ int main() {
     set_gpu_enabled(true); // Should fallback internally to CPU
     Tensor C_gpu = A.matmul(B);
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data());
+    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), C_gpu.data().data(), C_cpu.size());
     bool pass =
         (l2_error == 0.0f); // Fallback to CPU must yield identical results
     if (pass)
@@ -249,7 +251,7 @@ int main() {
     metal_bridge::reconcile_buffers();
     Tensor out_gpu = attn.forward(x, rope);
     
-    float l2_error = calculate_l2_relative_error(out_cpu.data(), out_gpu.data());
+    float l2_error = calculate_l2_relative_error(out_cpu.data().data(), out_gpu.data().data(), out_cpu.size());
     // Threshold: GPU uses online softmax (single-pass), CPU uses two-pass.
     // With AMX GEMMs now matching on both paths, the 0.2 L2 reflects only
     // the GQA softmax + reshape + RoPE implementation differences — this is

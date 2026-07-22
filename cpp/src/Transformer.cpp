@@ -109,19 +109,14 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
     Tensor ffn_in = layer.ffn_norm.forward(h);
     
     Tensor activated({batch_size, seq_len, config_.intermediate_dim}, 0.0f);
-    if (use_gpu && (batch_size * seq_len) % 8 == 0 && config_.intermediate_dim % 8 == 0) {
-      metal_bridge::gemm_ffn(
-          ffn_in.data().data(),
-          layer.w_gate.data().data(),
-          layer.w_up.data().data(),
-          activated.data().data(),
-          batch_size * seq_len,
-          config_.intermediate_dim,
-          config_.hidden_dim
-      );
+    // Use AMX cblas_sgemm (5,000+ GFLOPS) for gate/up projections + GPU SwiGLU
+    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
+    Tensor up_proj = ffn_in.matmul(layer.w_up);
+    if (use_gpu) {
+      metal_bridge::swiglu_forward(gate_proj.data().data(), up_proj.data().data(),
+                                    activated.data().data(),
+                                    batch_size * seq_len * config_.intermediate_dim);
     } else {
-      Tensor gate_proj = ffn_in.matmul(layer.w_gate);
-      Tensor up_proj = ffn_in.matmul(layer.w_up);
       activated = activatations::swiglu(gate_proj, up_proj);
     }
 
@@ -559,17 +554,16 @@ Tensor Transformer::backward(
                                        grad_final_norm_weight_dummy);
 
   // --- 4. Backprop through Stacked Layers (in reverse order) ---
-  std::cout << "[PROFILE-BWD]   3. Layer-by-Layer Backward (24 layers)..." << std::endl;
+  std::cout << "[PROFILE-BWD]   3. Layer-by-Layer Backward (" << config_.n_layers << " layers)..." << std::endl;
+  auto tl_start = std::chrono::high_resolution_clock::now();
   for (int l = static_cast<int>(config_.n_layers) - 1; l >= 0; --l) {
-    std::cout << "[PROFILE-BWD]     -> Layer " << l << " start" << std::endl;
-    auto tl_start = std::chrono::high_resolution_clock::now();
     grad_h = layers_[l].backward(grad_h, h_states[l], grad_w_gate[l],
                                  grad_w_up[l], grad_w_down[l], grad_Wq[l],
                                  grad_Wk[l], grad_Wv[l], grad_Wo[l], rope);
-    auto tl_end = std::chrono::high_resolution_clock::now();
-    double ms_layer = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tl_end - tl_start).count()) / 1000.0;
-    std::cout << "[PROFILE-BWD]     <- Layer " << l << " finished in " << ms_layer << " ms" << std::endl;
   }
+  auto tl_end = std::chrono::high_resolution_clock::now();
+  double ms_layers = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tl_end - tl_start).count()) / 1000.0;
+  std::cout << "[PROFILE-BWD]   3. All " << config_.n_layers << " layers finished in " << ms_layers << " ms" << std::endl;
 
   // --- 5. Embedding Lookup Backward ---
   std::cout << "[PROFILE-BWD]   4. Embedding Grad Accumulation..." << std::endl;
