@@ -26,16 +26,60 @@
 TransformerLayer::TransformerLayer(const ModelConfig &config)
     : attn_norm(config.hidden_dim, config.rms_norm_eps), attn(config),
       ffn_norm(config.hidden_dim, config.rms_norm_eps),
-      w_gate({config.hidden_dim, config.intermediate_dim}, 0.0f),
-      w_up({config.hidden_dim, config.intermediate_dim}, 0.0f),
-      w_down({config.intermediate_dim, config.hidden_dim}, 0.0f) {}
+      w_gate({config.hidden_dim, config.intermediate_dim}, 0.0f, DType::BF16),
+      w_up({config.hidden_dim, config.intermediate_dim}, 0.0f, DType::BF16),
+      w_down({config.intermediate_dim, config.hidden_dim}, 0.0f, DType::BF16),
+      cfg(config),
+      // Fused QKV: [H, nH*HD + 2*nKV*HD] = [1024, 2048]
+      w_qkv({config.hidden_dim, config.n_heads * config.head_dim + 2 * config.n_kv_heads * config.head_dim}, 0.0f, DType::BF16),
+      // Fused gate+up: [H, 2*I] = [1024, 5504]
+      w_gate_up({config.hidden_dim, 2 * config.intermediate_dim}, 0.0f, DType::BF16) {
+  // Copy individual weights into fused buffers
+  // w_qkv = [Wq | Wk | Wv] where Wq=[H,H], Wk=[H,512], Wv=[H,512]
+  // w_gate_up = [Wgate | Wup] where both are [H,I]
+  // (Weights are initialized separately — this just allocates the fused views)
+}
+
+// ── Fused QKV forward: single GEMM, slice output by pointer offset ──
+void TransformerLayer::fused_qkv_forward(const float* input, float* output,
+                                           size_t B, size_t S) const {
+  // input: [B*S, H], output: [B*S, 2048]
+  // w_qkv: [H, 2048]
+  // One GEMM call instead of three
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              (int)(B*S), 2048, (int)config().hidden_dim,
+              1.0f, input, (int)config().hidden_dim,
+              w_qkv.data(), 2048, 0.0f, output, 2048);
+  // Caller slices: Q at offset 0 (stride 1024), K at offset 1024 (stride 512),
+  // V at offset 1536 (stride 512)
+  // All three are in contiguous output[0..B*S*2048-1]
+}
+
+// ── Fused Gate+Up forward: single GEMM, two pointer views ──
+void TransformerLayer::fused_gate_up_forward(const float* input, float* gate_out,
+                                               float* up_out, size_t B, size_t S) const {
+  size_t M = B * S;
+  // input: [M, H], gate_out: [M, I], up_out: [M, I]
+  // w_gate_up: [H, 2*I]
+  // Allocate temp buffer for fused output
+  std::vector<float> fused(M * 2 * config().intermediate_dim);
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+              (int)M, (int)(2*config().intermediate_dim), (int)config().hidden_dim,
+              1.0f, input, (int)config().hidden_dim,
+              w_gate_up.data(), (int)(2*config().intermediate_dim),
+              0.0f, fused.data(), (int)(2*config().intermediate_dim));
+  // Slice: gate = fused[0..M*I-1], up = fused[M*I..2*M*I-1]
+  memcpy(gate_out, fused.data(), M * config().intermediate_dim * sizeof(float));
+  memcpy(up_out, fused.data() + M * config().intermediate_dim,
+         M * config().intermediate_dim * sizeof(float));
+}
 
 // Construct the complete Transformer model
 Transformer::Transformer(const ModelConfig &config)
     : config_(config),
-      token_embeddings_({config.vocab_size, config.hidden_dim}, 0.0f),
+      token_embeddings_({config.vocab_size, config.hidden_dim}, 0.0f, DType::BF16),
       final_norm_(config.hidden_dim, config.rms_norm_eps),
-      output_projection_({config.hidden_dim, config.vocab_size}, 0.0f),
+      output_projection_({config.hidden_dim, config.vocab_size}, 0.0f, DType::BF16),
       rope_(config.head_dim, config.max_seq_len, config.rope_base) {
 
   layers_.reserve(config.n_layers);
@@ -70,8 +114,8 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
     }
     metal_bridge::embedding_forward(
         tokens_uint32.data(),
-        token_embeddings_.data().data(),
-        h.data().data(),
+        token_embeddings_.data(),
+        h.data(),
         total_tokens,
         config_.hidden_dim,
         config_.vocab_size
@@ -97,33 +141,45 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
   // (the backward pass uses h_states[l] as the INPUT to layer l)
   h_cache_.push_back(h);
 
-  for (const auto &layer : layers_) {
+  // Per-layer forward loop
+  for (size_t li = 0; li < layers_.size(); ++li) {
+    const auto &layer = layers_[li];
     Tensor attn_in = layer.attn_norm.forward(h);
     Tensor attn_out = layer.attn.forward(attn_in, rope_, cache);
+
     if (use_gpu) {
-      metal_bridge::residual_add(h.data().data(), attn_out.data().data(), h.size());
+      // Fused: h += attn_out  (in-place for backward)  AND  ffn_in = rmsnorm(h)
+      // ffn_in stays FP32 for now (rms_norm_forward kernel writes float*)
+      Tensor ffn_in({batch_size, seq_len, config_.hidden_dim}, DType::BF16);
+      metal_bridge::fused_add_norm(h.data(), attn_out.data(),
+                                   layer.ffn_norm.weight().data(),
+                                   ffn_in.data(),
+                                   batch_size * seq_len,
+                                   config_.hidden_dim,
+                                   config_.rms_norm_eps);
+
+      Tensor activated({batch_size, seq_len, config_.intermediate_dim}, DType::BF16);
+      Tensor gate_proj = ffn_in.matmul(layer.w_gate);
+      Tensor up_proj = ffn_in.matmul(layer.w_up);
+      metal_bridge::swiglu_forward(gate_proj.data(), up_proj.data(),
+                                    activated.data(),
+                                    batch_size * seq_len * config_.intermediate_dim);
+      Tensor ffn_out = activated.matmul(layer.w_down);
+
+      // Fused: h += ffn_out  (in-place for backward)  AND  attn_in_next = rmsnorm(h)
+      // (attn_in_next used by next layer's attn_norm, but we still compute
+      //  attn_norm.forward separately at the top of the next iteration)
+      // Actually this fusion replaces the residual_add at the FFN output.
+      // The attn_norm.forward in the next iteration still needs to run separately.
+      // But we can fuse the add with a dummy output — the next iter's attn_norm.forward
+      // will recompute the rmsnorm. So we just do the in-place add here:
+      metal_bridge::residual_add(h.data(), ffn_out.data(), h.size());
     } else {
       h.add_(attn_out);
-    }
-
-    Tensor ffn_in = layer.ffn_norm.forward(h);
-    
-    Tensor activated({batch_size, seq_len, config_.intermediate_dim}, 0.0f);
-    // Use AMX cblas_sgemm (5,000+ GFLOPS) for gate/up projections + GPU SwiGLU
-    Tensor gate_proj = ffn_in.matmul(layer.w_gate);
-    Tensor up_proj = ffn_in.matmul(layer.w_up);
-    if (use_gpu) {
-      metal_bridge::swiglu_forward(gate_proj.data().data(), up_proj.data().data(),
-                                    activated.data().data(),
-                                    batch_size * seq_len * config_.intermediate_dim);
-    } else {
-      activated = activatations::swiglu(gate_proj, up_proj);
-    }
-
-    Tensor ffn_out = activated.matmul(layer.w_down);
-    if (use_gpu) {
-      metal_bridge::residual_add(h.data().data(), ffn_out.data().data(), h.size());
-    } else {
+      Tensor ffn_in = layer.ffn_norm.forward(h);
+      Tensor activated = activatations::swiglu(ffn_in.matmul(layer.w_gate),
+                                                ffn_in.matmul(layer.w_up));
+      Tensor ffn_out = activated.matmul(layer.w_down);
       h.add_(ffn_out);
     }
 
@@ -165,9 +221,9 @@ accumulate_ffn_down_grads(size_t batch, size_t seq_len, size_t intermediate_dim,
     metal_bridge::initialize();
     if (metal_bridge::is_available()) {
       metal_bridge::gemm_backward(
-          activated.data().data(),
-          grad_output.data().data(),
-          grad_w_down.data().data(),
+          activated.data(),
+          grad_output.data(),
+          grad_w_down.data(),
           intermediate_dim,
           hidden_dim,
           batch * seq_len
@@ -208,17 +264,17 @@ accumulate_ffn_gate_up_grads(size_t batch, size_t seq_len, size_t hidden_dim,
     metal_bridge::initialize();
     if (metal_bridge::is_available()) {
       metal_bridge::gemm_backward(
-          ffn_in.data().data(),
-          grad_gate.data().data(),
-          grad_w_gate.data().data(),
+          ffn_in.data(),
+          grad_gate.data(),
+          grad_w_gate.data(),
           hidden_dim,
           intermediate_dim,
           batch * seq_len
       );
       metal_bridge::gemm_backward(
-          ffn_in.data().data(),
-          grad_up.data().data(),
-          grad_w_up.data().data(),
+          ffn_in.data(),
+          grad_up.data(),
+          grad_w_up.data(),
           hidden_dim,
           intermediate_dim,
           batch * seq_len
@@ -312,7 +368,7 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
     }
   }
 
-  // --- A. Recompute Forward States ---
+  // --- A. Recompute Forward States (FP32 for norm output, BF16 for matmul results) ---
   Tensor attn_in = attn_norm.forward(h_in);
   Tensor attn_out = attn.forward(attn_in, rope, cache);
   Tensor h_mid = h_in.add(attn_out);
@@ -326,70 +382,93 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   accumulate_ffn_down_grads(batch, seq_len, intermediate_dim, hidden_dim,
                             activated, grad_output, grad_w_down);
 
-  Tensor grad_activated({batch, seq_len, intermediate_dim}, 0.0f);
+  // Reuse persistent storage — no allocation, no zeroing
+  grad_activated_.resize_storage({batch, seq_len, intermediate_dim});
   if (use_gpu) {
-    metal_bridge::gemm_proj_trans_b(grad_output.data().data(), w_down.data().data(),
-                                    grad_activated.data().data(), batch * seq_len,
+    metal_bridge::gemm_proj_trans_b(grad_output.data(), w_down.data(),
+                                    grad_activated_.data(), batch * seq_len,
                                     intermediate_dim, hidden_dim);
   } else {
     auto transpose_w = [](const Tensor &w) {
       size_t rows = w.shape()[0];
       size_t cols = w.shape()[1];
       Tensor transposed({cols, rows}, 0.0f);
-      vDSP_mtrans(w.data().data(), 1, transposed.data().data(), 1,
+      vDSP_mtrans(w.data(), 1, transposed.data(), 1,
                   static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
       return transposed;
     };
-    grad_activated = grad_output.matmul(transpose_w(w_down));
+    grad_activated_ = grad_output.matmul(transpose_w(w_down));
   }
 
   // --- C. SwiGLU & Projection Backwards ---
-  Tensor grad_gate(gate_proj.shape(), 0.0f);
-  Tensor grad_up(up_proj.shape(), 0.0f);
-  activatations::swiglu_backward(grad_activated, gate_proj, up_proj, grad_gate,
-                                 grad_up);
+  // Reuse persistent storage — no alloc, GPU-blit zero (async, tracked by FIFO)
+  grad_gate_.resize_storage(gate_proj.shape());
+  grad_up_.resize_storage(up_proj.shape());
+  if (use_gpu) {
+    metal_bridge::fill_zero_async(grad_gate_.data(), grad_gate_.raw_bytes());
+    metal_bridge::fill_zero_async(grad_up_.data(), grad_up_.raw_bytes());
+  }
+  activatations::swiglu_backward(grad_activated_, gate_proj, up_proj,
+                                  grad_gate_, grad_up_);
 
   accumulate_ffn_gate_up_grads(batch, seq_len, hidden_dim, intermediate_dim,
-                               ffn_in, grad_gate, grad_up, grad_w_gate,
+                               ffn_in, grad_gate_, grad_up_, grad_w_gate,
                                grad_w_up);
 
-  Tensor grad_ffn_in({batch, seq_len, hidden_dim}, 0.0f);
+  grad_ffn_in_.resize_storage({batch, seq_len, hidden_dim});
   if (use_gpu) {
-    metal_bridge::gemm_proj_trans_b(grad_gate.data().data(), w_gate.data().data(),
-                                    grad_ffn_in.data().data(), batch * seq_len,
+    metal_bridge::gemm_proj_trans_b(grad_gate_.data(), w_gate.data(),
+                                    grad_ffn_in_.data(), batch * seq_len,
                                     hidden_dim, intermediate_dim);
-    Tensor grad_up_in({batch, seq_len, hidden_dim}, 0.0f);
-    metal_bridge::gemm_proj_trans_b(grad_up.data().data(), w_up.data().data(),
-                                    grad_up_in.data().data(), batch * seq_len,
+    grad_up_in_.resize_storage({batch, seq_len, hidden_dim});
+    metal_bridge::gemm_proj_trans_b(grad_up_.data(), w_up.data(),
+                                    grad_up_in_.data(), batch * seq_len,
                                     hidden_dim, intermediate_dim);
-    metal_bridge::residual_add(grad_ffn_in.data().data(), grad_up_in.data().data(), grad_ffn_in.size());
+    metal_bridge::residual_add(grad_ffn_in_.data(), grad_up_in_.data(), grad_ffn_in_.size());
   } else {
     auto transpose_w = [](const Tensor &w) {
       size_t rows = w.shape()[0];
       size_t cols = w.shape()[1];
       Tensor transposed({cols, rows}, 0.0f);
-      vDSP_mtrans(w.data().data(), 1, transposed.data().data(), 1,
+      vDSP_mtrans(w.data(), 1, transposed.data(), 1,
                   static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
       return transposed;
     };
-    grad_ffn_in = grad_gate.matmul(transpose_w(w_gate));
-    grad_ffn_in.add_(grad_up.matmul(transpose_w(w_up)));
+    grad_ffn_in_ = grad_gate_.matmul(transpose_w(w_gate));
+    grad_ffn_in_.add_(grad_up_.matmul(transpose_w(w_up)));
   }
 
-  // --- D. FFN Norm & Residual Backward ---
-  Tensor grad_ffn_norm_weight_dummy({hidden_dim}, 0.0f);
-  Tensor grad_h_mid =
-      ffn_norm.backward(grad_ffn_in, h_mid, grad_ffn_norm_weight_dummy);
-  grad_h_mid.add_(grad_output);
+  // --- D. FFN Norm & Residual Backward (FUSED) ---
+  Tensor grad_h_mid({batch, seq_len, hidden_dim}, DType::BF16);
+  if (use_gpu) {
+    metal_bridge::fused_backward_add_norm(
+        grad_ffn_in_.raw_ptr(), h_mid.raw_ptr(),
+        ffn_norm.weight().raw_ptr(), grad_output.raw_ptr(),
+        grad_h_mid.raw_ptr(),
+        batch * seq_len, hidden_dim, cfg.rms_norm_eps);
+  } else {
+    Tensor grad_ffn_norm_weight_dummy({hidden_dim}, 0.0f);
+    grad_h_mid = ffn_norm.backward(grad_ffn_in_, h_mid, grad_ffn_norm_weight_dummy);
+    grad_h_mid.add_(grad_output);
+  }
 
   // --- E. Attention Layer & Norm & Residual Backward ---
   Tensor grad_attn_in = attn.backward(grad_h_mid, attn_in, rope, grad_Wq,
                                       grad_Wk, grad_Wv, grad_Wo, cache);
 
-  Tensor grad_attn_norm_weight_dummy({hidden_dim}, 0.0f);
-  Tensor grad_h_in =
-      attn_norm.backward(grad_attn_in, h_in, grad_attn_norm_weight_dummy);
-  grad_h_in.add_(grad_h_mid);
+  // --- F. Attention Norm & Residual Backward (FUSED) ---
+  Tensor grad_h_in({batch, seq_len, hidden_dim}, DType::BF16);
+  if (use_gpu) {
+    metal_bridge::fused_backward_add_norm(
+        grad_attn_in.raw_ptr(), h_in.raw_ptr(),
+        attn_norm.weight().raw_ptr(), grad_h_mid.raw_ptr(),
+        grad_h_in.raw_ptr(),
+        batch * seq_len, hidden_dim, cfg.rms_norm_eps);
+  } else {
+    Tensor grad_attn_norm_weight_dummy({hidden_dim}, 0.0f);
+    grad_h_in = attn_norm.backward(grad_attn_in, h_in, grad_attn_norm_weight_dummy);
+    grad_h_in.add_(grad_h_mid);
+  }
 
   return grad_h_in;
 }
@@ -528,9 +607,9 @@ Tensor Transformer::backward(
   Tensor grad_final_h({batch_size, seq_len, hidden_dim}, 0.0f);
   if (use_gpu) {
     metal_bridge::gemm_proj_trans_b(
-        grad_logits.data().data(),
-        output_projection_.data().data(),
-        grad_final_h.data().data(),
+        grad_logits.data(),
+        output_projection_.data(),
+        grad_final_h.data(),
         batch_size * seq_len,
         hidden_dim,
         vocab_size
@@ -540,7 +619,7 @@ Tensor Transformer::backward(
       size_t rows = w.shape()[0];
       size_t cols = w.shape()[1];
       Tensor transposed({cols, rows}, 0.0f);
-      vDSP_mtrans(w.data().data(), 1, transposed.data().data(), 1,
+      vDSP_mtrans(w.data(), 1, transposed.data(), 1,
                   static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
       return transposed;
     };

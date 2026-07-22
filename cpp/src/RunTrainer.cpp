@@ -73,13 +73,15 @@ static void initialize_gpt_weights(Transformer &model) {
   std::normal_distribution<float> dist(0.0f, stddev);
   std::normal_distribution<float> emb_dist(0.0f, 0.02f);
 
-  // Initialize embeddings
-  for (auto &val : model.token_embeddings().data()) {
-    val = emb_dist(gen);
+  // Initialize embeddings (BF16 storage)
+  {
+    uint16_t* w = (uint16_t*)model.token_embeddings().data_bf16();
+    for (size_t _i = 0; _i < model.token_embeddings().num_elements(); ++_i) w[_i] = float_to_bf16((float)emb_dist(gen));
   }
-  // Initialize output projection
-  for (auto &val : model.output_projection().data()) {
-    val = dist(gen);
+  // Initialize output projection (BF16 storage)
+  {
+    uint16_t* w = (uint16_t*)model.output_projection().data_bf16();
+    for (size_t _i = 0; _i < model.output_projection().num_elements(); ++_i) w[_i] = float_to_bf16((float)dist(gen));
   }
   // Initialize RMSNorm scales to 1.0
   model.final_norm().weight().fill(1.0f);
@@ -88,14 +90,17 @@ static void initialize_gpt_weights(Transformer &model) {
     layer.attn_norm.weight().fill(1.0f);
     layer.ffn_norm.weight().fill(1.0f);
 
-    for (auto &val : layer.w_gate.data()) val = dist(gen);
-    for (auto &val : layer.w_up.data()) val = dist(gen);
-    for (auto &val : layer.w_down.data()) val = dist(gen);
-
-    for (auto &val : layer.attn.Wq().data()) val = dist(gen);
-    for (auto &val : layer.attn.Wk().data()) val = dist(gen);
-    for (auto &val : layer.attn.Wv().data()) val = dist(gen);
-    for (auto &val : layer.attn.Wo().data()) val = dist(gen);
+    auto fill_bf16_weight = [](Tensor &t, std::mt19937 &g, std::normal_distribution<float> &d) {
+      uint16_t* w = (uint16_t*)t.data_bf16();
+      for (size_t i = 0; i < t.num_elements(); ++i) w[i] = float_to_bf16((float)d(g));
+    };
+    fill_bf16_weight(layer.w_gate, gen, dist);
+    fill_bf16_weight(layer.w_up, gen, dist);
+    fill_bf16_weight(layer.w_down, gen, dist);
+    fill_bf16_weight(layer.attn.Wq(), gen, dist);
+    fill_bf16_weight(layer.attn.Wk(), gen, dist);
+    fill_bf16_weight(layer.attn.Wv(), gen, dist);
+    fill_bf16_weight(layer.attn.Wo(), gen, dist);
   }
 }
 

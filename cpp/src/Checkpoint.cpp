@@ -321,7 +321,7 @@ static bool write_safetensors(
 
   for (size_t i = 0; i < tensors.size(); ++i) {
     const Tensor *t = tensors[i].second;
-    out.write(reinterpret_cast<const char *>(t->data().data()),
+    out.write(reinterpret_cast<const char *>(t->data()),
               t->size() * sizeof(float));
   }
 
@@ -377,7 +377,7 @@ static bool read_safetensors(const std::string &filepath,
       return false;
 
     // Direct read assuming float32
-    in.read(reinterpret_cast<char *>(t->data().data()),
+    in.read(reinterpret_cast<char *>(t->data()),
             t->size() * sizeof(float));
     if (!in.good())
       return false;
@@ -454,13 +454,13 @@ static bool load_python_tensor(std::ifstream &in, size_t payload_start, const st
       std::cerr << "[ERROR] Checkpoint | Transpose shape mismatch for '" << name << "'" << std::endl;
       return false;
     }
-    transpose_matrix(temp_buf.data(), dest.data().data(), shape[0], shape[1]);
+    transpose_matrix(temp_buf.data(), dest.data(), shape[0], shape[1]);
   } else {
     if (temp_buf.size() != dest.size()) {
       std::cerr << "[ERROR] Checkpoint | Shape mismatch for '" << name << "': expected size " << dest.size() << ", got " << temp_buf.size() << std::endl;
       return false;
     }
-    std::copy(temp_buf.begin(), temp_buf.end(), dest.data().begin());
+    std::copy(temp_buf.begin(), temp_buf.end(), dest.data());
   }
   return true;
 }
@@ -523,7 +523,7 @@ static bool load_python_fused_tensor(std::ifstream &in, size_t payload_start, co
       std::copy(temp_buf.begin() + global_row * cols, temp_buf.begin() + (global_row + 1) * cols, slice_buf.begin() + r * cols);
     }
     
-    transpose_matrix(slice_buf.data(), dest.data().data(), num_rows, cols);
+    transpose_matrix(slice_buf.data(), dest.data(), num_rows, cols);
   }
   return true;
 }
@@ -727,7 +727,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
     SavedTensor t;
     t.name = "tok_embeddings.weight";
     t.shape = model.token_embeddings().shape();
-    t.data = model.token_embeddings().data().data();
+    t.data = model.token_embeddings().data();
     t.size = model.token_embeddings().size();
     save_list.push_back(t);
   }
@@ -748,7 +748,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
     SavedTensor t;
     t.name = "norm.weight";
     t.shape = model.final_norm().weight().shape();
-    t.data = model.final_norm().weight().data().data();
+    t.data = model.final_norm().weight().data();
     t.size = model.final_norm().weight().size();
     save_list.push_back(t);
   }
@@ -763,7 +763,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       SavedTensor t;
       t.name = prefix + "attention_norm.weight";
       t.shape = layer.attn_norm.weight().shape();
-      t.data = layer.attn_norm.weight().data().data();
+      t.data = layer.attn_norm.weight().data();
       t.size = layer.attn_norm.weight().size();
       save_list.push_back(t);
     }
@@ -773,7 +773,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       SavedTensor t;
       t.name = prefix + "ffn_norm.weight";
       t.shape = layer.ffn_norm.weight().shape();
-      t.data = layer.ffn_norm.weight().data().data();
+      t.data = layer.ffn_norm.weight().data();
       t.size = layer.ffn_norm.weight().size();
       save_list.push_back(t);
     }
@@ -863,12 +863,12 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       SavedTensor t_m, t_v;
       t_m.name = "tok_embeddings.weight.m";
       t_m.shape = m_states[0].shape();
-      t_m.data = m_states[0].data().data();
+      t_m.data = m_states[0].data();
       t_m.size = m_states[0].size();
       
       t_v.name = "tok_embeddings.weight.v";
       t_v.shape = v_states[0].shape();
-      t_v.data = v_states[0].data().data();
+      t_v.data = v_states[0].data();
       t_v.size = v_states[0].size();
       
       opt_save_list.push_back(t_m);

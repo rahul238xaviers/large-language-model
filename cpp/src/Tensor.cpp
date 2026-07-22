@@ -1,486 +1,253 @@
-/**
- * @file Tensor.cpp
- * @brief Implementation of the multidimensional Tensor structure
- *
- * ============================================================================
- *                             PIPELINE FLOW & PURPOSE
- * ============================================================================
- * Implements index-flattening calculations (strides) and arithmetic
- * methods (add, mul, scale, matmul) for the Tensor class.
- */
-
 #include "Tensor.hpp"
 #define ACCELERATE_NEW_LAPACK
+
+void (*PagedBuffer::gpu_release_fn)(void*) = nullptr;
+
 #include "gpu_kernel/MetalBridge.hpp"
 #include <Accelerate/Accelerate.h>
 #include <algorithm>
-#include <chrono>
-#include <cstdlib>
-#include <functional>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 
-/**
- * @brief Construct a new empty Tensor object.
- */
-Tensor::Tensor() : shape_({}), strides_({}), data_({}), dtype_(DType::FP32) {}
+// ── Constructors ───────────────────────────────────────────────────────────
+Tensor::Tensor() : shape_(), dtype_(DType::FP32) {}
 
-static size_t get_total_size(const std::vector<size_t> &shape) {
-  if (shape.empty()) return 1;
-  return std::accumulate(shape.begin(), shape.end(), 1ULL,
-                         std::multiplies<size_t>());
+Tensor::Tensor(const Shape &shape, DType dtype)
+    : shape_(shape), dtype_(dtype) {
+  size_t n = compute_size(shape);
+  if (n > 0) { buf_ = std::make_shared<PagedBuffer>(); buf_->resize_raw(n, itemsize()); }
+  compute_strides();
 }
 
-Tensor::Tensor(const std::vector<size_t> &shape, DType dtype)
+Tensor::Tensor(const Shape &shape, float val, DType dtype)
     : shape_(shape), dtype_(dtype) {
-  if (dtype == DType::BF16) {
-    bf16_data_.resize(get_total_size(shape), (__bf16)0.0f);
-  } else {
-    data_.resize(get_total_size(shape), 0.0f);
+  size_t n = compute_size(shape);
+  if (n > 0) {
+    buf_ = std::make_shared<PagedBuffer>();
+    buf_->resize_fill_f32(n, val);
   }
   compute_strides();
 }
 
-Tensor::Tensor(const std::vector<size_t> &shape, float val, DType dtype)
+Tensor::Tensor(const Shape &shape, const PagedBuffer &data, DType dtype)
     : shape_(shape), dtype_(dtype) {
-  if (dtype == DType::BF16) {
-    bf16_data_.resize(get_total_size(shape), (__bf16)val);
-  } else {
-    data_.resize(get_total_size(shape), val);
-  }
+  buf_ = std::make_shared<PagedBuffer>(data);
   compute_strides();
 }
 
-/**
- * @brief Precomputes the row-major index offset multiplier (stride) for each
- * dimension.
- */
+Tensor::Tensor(const Shape &shape, const std::vector<float> &data, DType dtype)
+    : shape_(shape), dtype_(dtype) {
+  buf_ = std::make_shared<PagedBuffer>();
+  buf_->resize_store_f32(data.size(), data.data());
+  compute_strides();
+}
+
+// ── Element access (FP32 path; BF16 access via raw_ptr for hot paths) ─────
+float &Tensor::operator()(size_t i) { return buf_->data_float()[i]; }
+const float &Tensor::operator()(size_t i) const { return buf_->data_float()[i]; }
+float &Tensor::operator()(size_t i, size_t j) { return buf_->data_float()[i * strides_[0] + j]; }
+const float &Tensor::operator()(size_t i, size_t j) const { return buf_->data_float()[i * strides_[0] + j]; }
+float &Tensor::operator()(size_t i, size_t j, size_t k) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
+const float &Tensor::operator()(size_t i, size_t j, size_t k) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
+float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
+const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
+float &Tensor::operator()(const std::vector<size_t> &indices) { return buf_->data_float()[get_index(indices)]; }
+const float &Tensor::operator()(const std::vector<size_t> &indices) const { return buf_->data_float()[get_index(indices)]; }
+
+// ── Other methods ─────────────────────────────────────────────────────────
 void Tensor::compute_strides() {
-  strides_.resize(shape_.size(), 1);
-  if (shape_.empty())
-    return;
+  if (shape_.ndim == 0) return;
   size_t stride = 1;
-  for (int i = static_cast<int>(shape_.size()) - 1; i >= 0; --i) {
+  for (int i = static_cast<int>(shape_.ndim) - 1; i >= 0; --i) {
     strides_[i] = stride;
-    stride *= shape_[i];
+    stride *= shape_.dims[i];
   }
 }
 
-/**
- * @brief Flattens multi-dimensional indices into a single row-major 1D index
- * offset.
- *
- * @param indices Vector of indices per dimension.
- * @return size_t Flat index offset.
- */
 size_t Tensor::get_index(const std::vector<size_t> &indices) const {
-  if (indices.size() != shape_.size()) {
+  if (indices.size() != shape_.ndim)
     throw std::invalid_argument("Dimensionality mismatch");
-  }
   size_t idx = 0;
-  for (size_t i = 0; i < indices.size(); i++) {
-    if (indices[i] >= shape_[i]) {
+  for (size_t i = 0; i < indices.size(); ++i) {
+    if (indices[i] >= shape_.dims[i])
       throw std::out_of_range("Index out of bounds");
-    }
     idx += indices[i] * strides_[i];
   }
   return idx;
 }
 
-/**
- * @brief Access element at multi-dimensional coordinate vector (mutable).
- */
-float &Tensor::operator()(const std::vector<size_t> &indices) {
-  return data_[get_index(indices)];
-}
-
-/**
- * @brief Access element at multi-dimensional coordinate vector (read-only).
- */
-const float &Tensor::operator()(const std::vector<size_t> &indices) const {
-  return data_[get_index(indices)];
-}
-
-/**
- * @brief Access element at flat index (mutable).
- */
-float &Tensor::operator()(size_t i) { return data_[i]; }
-
-/**
- * @brief Access element at flat index (read-only).
- */
-const float &Tensor::operator()(size_t i) const { return data_[i]; }
-
-/**
- * @brief Access element at 2D coordinates (mutable).
- */
-float &Tensor::operator()(size_t i, size_t j) {
-  return data_[i * strides_[0] + j];
-}
-
-/**
- * @brief Access element at 2D coordinates (read-only).
- */
-const float &Tensor::operator()(size_t i, size_t j) const {
-  return data_[i * strides_[0] + j];
-}
-
-/**
- * @brief Access element at 3D coordinates (mutable).
- */
-float &Tensor::operator()(size_t i, size_t j, size_t k) {
-  return data_[i * strides_[0] + j * strides_[1] + k];
-}
-
-/**
- * @brief Access element at 3D coordinates (read-only).
- */
-const float &Tensor::operator()(size_t i, size_t j, size_t k) const {
-  return data_[i * strides_[0] + j * strides_[1] + k];
-}
-
-/**
- * @brief Access element at 4D coordinates (mutable).
- */
-float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) {
-  return data_[i * strides_[0] + j * strides_[1] + k * strides_[2] + l];
-}
-
-/**
- * @brief Access element at 4D coordinates (read-only).
- */
-const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const {
-  return data_[i * strides_[0] + j * strides_[1] + k * strides_[2] + l];
-}
-
-/**
- * @brief Construct a new Tensor object from an existing flat data vector.
- *
- * @param shape Shape of the new tensor.
- * @param data Flat vector of data values.
- */
-Tensor::Tensor(const std::vector<size_t> &shape, const AlignedVector<float> &data, DType dtype)
-    : shape_(shape), data_(data), dtype_(dtype) {
-  compute_strides();
-  if (data_.size() != get_total_size(shape_)) {
-    throw std::invalid_argument("Data size does not match shape dimensions");
-  }
-}
-
-Tensor::Tensor(const std::vector<size_t> &shape, const std::vector<float> &data, DType dtype)
-    : shape_(shape), data_(data.begin(), data.end()), dtype_(dtype) {
-  compute_strides();
-  if (data_.size() != get_total_size(shape_)) {
-    throw std::invalid_argument("Data size does not match shape dimensions");
-  }
-}
-
-/**
- * @brief Fills the tensor elements with a single scalar value.
- *
- * @param val Scalar value.
- */
 void Tensor::fill(const float val) {
-  std::fill(data_.begin(), data_.end(), val);
+  if (!buf_) return;
+  if (dtype_ == DType::BF16) {
+    // For BF16, fill with the 16-bit truncated value
+    uint16_t bf = float_to_bf16(val);
+    uint16_t* ptr = (uint16_t*)buf_->data();
+    size_t n = buf_->bytes() / 2;
+    std::fill(ptr, ptr + n, bf);
+  } else {
+    if (val == 0.0f && buf_->size_float() > 0)
+      buf_->resize_fill_f32(buf_->size_float(), 0.0f);
+    else
+      std::fill(buf_->data_float(), buf_->data_float() + buf_->size_float(), val);
+  }
 }
 
-/**
- * @brief Prints the shape and metadata values of the tensor to stdout.
- *
- * @param name Optional label to print before the shape.
- */
 void Tensor::print(const std::string &name) const {
-  if (!name.empty()) {
-    std::cout << name << " ";
-  }
+  if (!name.empty()) std::cout << name << " ";
   std::cout << "Tensor shape: [";
-  for (size_t i = 0; i < shape_.size(); ++i) {
-    std::cout << shape_[i] << (i == shape_.size() - 1 ? "" : ", ");
-  }
-  std::cout << "], size: " << data_.size() << "\n";
-
-  if (data_.empty()) {
-    std::cout << "  []\n";
-    return;
-  }
-
-  // Print first few elements (up to 20)
+  for (size_t i = 0; i < shape_.ndim; ++i)
+    std::cout << shape_.dims[i] << (i + 1 < shape_.ndim ? ", " : "");
+  std::cout << "], dtype=" << (dtype_ == DType::BF16 ? "BF16" : "FP32")
+            << ", size: " << size() << "\n";
+  if (!buf_ || buf_->empty()) { std::cout << "  []\n"; return; }
   std::cout << "  ";
-  for (size_t i = 0; i < std::min(data_.size(), size_t(20)); ++i) {
-    std::cout << data_[i] << " ";
+  size_t n = std::min(num_elements(), size_t(20));
+  for (size_t i = 0; i < n; ++i) {
+    float v;
+    if (dtype_ == DType::BF16) v = bf16_to_float(((uint16_t*)buf_->data())[i]);
+    else v = buf_->data_float()[i];
+    std::cout << v << " ";
   }
-  if (data_.size() > 20) {
-    std::cout << "...";
-  }
+  if (num_elements() > 20) std::cout << "...";
   std::cout << "\n";
 }
 
-/**
- * @brief Adds another tensor to this tensor in-place.
- *
- * Uses Apple vDSP for vectorized SIMD element-wise addition.
- *
- * @param other Tensor to add (must have matching shape).
- */
+// ── Arithmetic (always works on FP32 data) ─────────────────────────────────
 void Tensor::add_(const Tensor &other) {
-  if (shape_ != other.shape_) {
+  if (shape_ != other.shape_)
     throw std::invalid_argument("Shape mismatch for in-place addition");
+  // Both must be FP32 for vDSP. BF16 tensors should use GPU residual_add.
+  size_t n = buf_->size_float();
+  if (n > 262144 && metal_bridge::is_available()) {
+    metal_bridge::residual_add(buf_->data_float(), other.buf_->data_float(), n);
+    return;
   }
-  // vDSP_vadd: NEON-vectorized element-wise addition
-  vDSP_vadd(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
-            static_cast<vDSP_Length>(data_.size()));
+  vDSP_vadd(buf_->data_float(), 1, other.buf_->data_float(), 1,
+            buf_->data_float(), 1, static_cast<vDSP_Length>(n));
 }
 
-/**
- * @brief Multiplies another tensor with this tensor element-wise in-place.
- *
- * Uses Apple vDSP for vectorized SIMD element-wise multiplication.
- *
- * @param other Tensor to multiply (must have matching shape).
- */
 void Tensor::mul_(const Tensor &other) {
-  if (shape_ != other.shape_) {
+  if (shape_ != other.shape_)
     throw std::invalid_argument("Shape mismatch for in-place multiplication");
-  }
-  // vDSP_vmul: NEON-vectorized element-wise multiply
-  vDSP_vmul(data_.data(), 1, other.data_.data(), 1, data_.data(), 1,
-            static_cast<vDSP_Length>(data_.size()));
+  vDSP_vmul(buf_->data_float(), 1, other.buf_->data_float(), 1,
+            buf_->data_float(), 1,
+            static_cast<vDSP_Length>(buf_->size_float()));
 }
 
-/**
- * @brief Scales this tensor's elements by a scalar factor in-place.
- *
- * Uses Apple vDSP for vectorized SIMD scalar multiplication.
- *
- * @param factor Scalar scaling factor.
- */
 void Tensor::scale_(float factor) {
-  // vDSP_vsmul: NEON-vectorized scalar multiply
-  vDSP_vsmul(data_.data(), 1, &factor, data_.data(), 1,
-             static_cast<vDSP_Length>(data_.size()));
+  vDSP_vsmul(buf_->data_float(), 1, &factor, buf_->data_float(), 1,
+             static_cast<vDSP_Length>(buf_->size_float()));
 }
 
-/**
- * @brief Returns the element-wise sum of this tensor and another tensor.
- *
- * @param other Tensor to add.
- * @return Tensor New sum tensor.
- */
 Tensor Tensor::add(const Tensor &other) const {
-  Tensor result = *this;
+  Tensor result = clone();
   result.add_(other);
   return result;
 }
 
-/**
- * @brief Returns the element-wise product of this tensor and another tensor.
- *
- * @param other Tensor to multiply.
- * @return Tensor New product tensor.
- */
 Tensor Tensor::mul(const Tensor &other) const {
-  Tensor result = *this;
+  Tensor result = clone();
   result.mul_(other);
   return result;
 }
 
-/**
- * @brief Returns a scaled copy of this tensor.
- *
- * @param factor Scalar scaling factor.
- * @return Tensor New scaled tensor.
- */
 Tensor Tensor::scale(float factor) const {
-  Tensor result = *this;
+  Tensor result = clone();
   result.scale_(factor);
   return result;
 }
 
-/**
- * @brief Performs batched or 2D matrix multiplication between this tensor and
- * another.
- *
- * Preconditions:
- * 1. Both tensors must have at least 2 dimensions.
- * 2. Non-matrix dimensions (batch dimensions) must match exactly.
- * 3. Inner matrix dimensions must match: this->shape().back() ==
- * other.shape()[second_to_last].
- *
- * @param other Multiplier tensor.
- * @return Tensor Result tensor.
- */
-// Tensor::matmul — reviewed and fixed.
-//
-// Bugs fixed vs. the original:
-//   1. The "broadcast 2D weight across batch dims" fast path was dead code:
-//      it required shape_.size()==3 && other.shape().size()==2, but the
-//      strict rank-equality check just above it threw first, so that branch
-//      could never be reached. It is now a real, reachable code path, and
-//      generalized to work for ANY input rank (not just rank 3), since the
-//      broadcasting logic doesn't actually depend on rank.
-//   2. Inconsistent zero-initialization: one branch explicitly zero-filled
-//      the result tensor, the other didn't. Both paths now explicitly
-//      zero-initialize, since we accumulate with +=.
-//   3. Signed/unsigned loop counters (`int i` compared against
-//      `shape_.size() - 2`, a size_t) replaced with size_t throughout, and
-//      the loop bound rewritten as `i + 2 < rank` to avoid any risk of
-//      unsigned underflow if this code is ever reused with a smaller rank.
-//
-// Behavior preserved: same cache-friendly i-k-j loop order, same exception
-// messages/conditions for the still-supported error cases.
-
-Tensor Tensor::matmul(const Tensor &other) const {
-  // Matrix multiplication rules:
-  // 1. Both tensors must have at least 2 dimensions.
-  // 2. If `other` is exactly 2D, it's treated as a shared weight/projection
-  //    matrix and broadcast across every leading ("batch") dimension of
-  //    `this` — e.g. (B, S, K) @ (K, N) -> (B, S, N), or even
-  //    (B, S1, S2, K) @ (K, N) -> (B, S1, S2, N).
-  // 3. Otherwise, both tensors must have the same rank, matching leading
-  //    (batch) dimensions, and a matching inner dimension:
-  //    (..., M, K) @ (..., K, N) -> (..., M, N)
-
-  if (shape_.size() < 2 || other.shape().size() < 2) {
-    throw std::invalid_argument(
-        "Matmul not implemented for tensors with less than 2 dimensions");
-  }
-
-  // --- Case 1: broadcast a 2D weight matrix across all leading dimensions ---
-  // e.g. x:(B, S, K) @ W:(K, N) -> (B, S, N)
-  if (other.shape().size() == 2 && shape_.size() != 2) {
-    const size_t K = shape_.back();
-    const size_t N = other.shape()[1];
-
-    if (K != other.shape()[0]) {
-      throw std::invalid_argument("Inner dimensions must match for projection");
-    }
-
-    // Flatten every dimension except the last into a single "row" count.
-    // e.g. (B, S, K) -> M = B * S rows of length K.
-    size_t M = 1;
-    for (size_t i = 0; i + 1 < shape_.size(); ++i) {
-      M *= shape_[i];
-    }
-
-    std::vector<size_t> result_shape = shape_;
-    result_shape.back() = N;
-    Tensor result(result_shape, 0.0f);
-
-    const float *x_data = data_.data();
-    const float *w_data = other.data().data();
-    float *res_data = result.data().data();
-
-    // GPU gemm_bf16 (FP32→BF16→FP32) inside a batch scope, AMX fallback otherwise.
-    if (metal_bridge::is_batch_active()) {
-      metal_bridge::gemm_bf16(x_data, w_data, res_data, M, N, K, false, false);
+// ── Deep copy ──────────────────────────────────────────────────────────────
+Tensor Tensor::clone() const {
+  Tensor t(shape_, dtype_);
+  if (buf_ && buf_->bytes() > 0) {
+    size_t n = num_elements();
+    if (dtype_ == DType::BF16) {
+      // Copy raw bytes — no conversion needed
+      std::memcpy(t.buf_->data(), buf_->data(), buf_->bytes());
+      t.buf_->reshape(n, 2);
     } else {
-      auto start = std::chrono::high_resolution_clock::now();
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                  static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                  1.0f, x_data, static_cast<int>(K), w_data,
-                  static_cast<int>(N), 0.0f, res_data, static_cast<int>(N));
-      auto end = std::chrono::high_resolution_clock::now();
-      metal_bridge::accum_cpu_time_ms +=
-          std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-              .count() /
-          1000.0;
-      metal_bridge::count_cpu_calls++;
+      t.buf_->resize_store_f32(n, buf_->data_float());
     }
+  }
+  return t;
+}
 
+// ── Matmul ─────────────────────────────────────────────────────────────────
+Tensor Tensor::matmul(const Tensor &other) const {
+  if (shape_.ndim < 2 || other.shape_.ndim < 2)
+    throw std::invalid_argument("Matmul requires at least 2 dimensions");
+
+  if (other.shape_.ndim == 2 && shape_.ndim != 2) {
+    const size_t K = shape_.back();
+    const size_t N = other.shape_[1];
+    if (K != other.shape_[0])
+      throw std::invalid_argument("Inner dimensions must match for projection");
+
+    size_t M = 1;
+    for (size_t i = 0; i + 1 < shape_.ndim; ++i) M *= shape_.dims[i];
+
+    Shape result_shape = shape_;
+    result_shape.dims[shape_.ndim - 1] = N;
+    // Result inherits dtype from this tensor (will be BF16 if input is BF16)
+    Tensor result(result_shape, 0.0f, dtype_);
+
+    metal_bridge::gemm_bf16(buf_->data(), other.buf_->data(), result.buf_->data(),
+                            M, N, K, false, false);
     return result;
   }
 
-  // --- Case 2: standard batched matmul, both tensors share the same rank ---
-  if (shape_.size() != other.shape().size()) {
-    throw std::invalid_argument(
-        "Batch size must match for matrix multiplication");
-  }
+  if (shape_.ndim != other.shape_.ndim)
+    throw std::invalid_argument("Batch size must match for matrix multiplication");
 
-  const size_t rank = shape_.size();
+  size_t rank = shape_.ndim;
+  for (size_t i = 0; i + 2 < rank; ++i)
+    if (shape_.dims[i] != other.shape_.dims[i])
+      throw std::invalid_argument("Batch dimension must match for matmul");
 
-  for (size_t i = 0; i + 2 < rank; ++i) {
-    if (shape_[i] != other.shape()[i]) {
-      throw std::invalid_argument(
-          "Batch dimension must match for matrix multiplication");
-    }
-  }
+  if (shape_.dims[rank - 1] != other.shape_.dims[rank - 2])
+    throw std::invalid_argument("Inner dimensions must match for matmul");
 
-  if (shape_[rank - 1] != other.shape()[rank - 2]) {
-    throw std::invalid_argument(
-        "Inner dimensions must match for matrix multiplication");
-  }
+  Shape result_shape = shape_;
+  result_shape.dims[rank - 1] = other.shape_.back();
+  Tensor result(result_shape, 0.0f, dtype_);
 
-  // Result takes the shape of `this`, but with the trailing dimension
-  // replaced by the trailing dimension of `other`.
-  // e.g. A[3,4,5,6] @ B[3,4,6,7] -> result[3,4,5,7]
-  std::vector<size_t> result_shape = shape_;
-  result_shape.back() = other.shape().back();
-  Tensor result(result_shape, 0.0f);
-
-  // Every dimension except the trailing two is a batch dimension, since
-  // matmul only operates on the last two dimensions of each slice.
   size_t num_batches = 1;
-  for (size_t i = 0; i + 2 < rank; ++i) {
-    num_batches *= shape_[i];
-  }
+  for (size_t i = 0; i + 2 < rank; ++i) num_batches *= shape_.dims[i];
 
-  const size_t M = shape_[rank - 2];     // rows of A / rows of result
-  const size_t K = shape_[rank - 1];     // cols of A / rows of B
-  const size_t N = other.shape().back(); // cols of B / cols of result
+  const size_t M = shape_.dims[rank - 2];
+  const size_t K = shape_.dims[rank - 1];
+  const size_t N = other.shape_.back();
 
-  const size_t batch_offset_A = M * K;
-  const size_t batch_offset_B = K * N;
-  const size_t batch_offset_C = M * N;
-
-  const float *a_data = data_.data();
-  const float *b_data = other.data().data();
-  float *c_data = result.data().data();
-
-    for (size_t b = 0; b < num_batches; ++b) {
-      const float *dataA = a_data + b * batch_offset_A;
-      const float *dataB = b_data + b * batch_offset_B;
-      float *dataC = c_data + b * batch_offset_C;
-
-      if (metal_bridge::is_batch_active()) {
-        metal_bridge::gemm_bf16(dataA, dataB, dataC, M, N, K, false, false);
-      } else {
-        auto start = std::chrono::high_resolution_clock::now();
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(M),
-                    static_cast<int>(N), static_cast<int>(K), 1.0f, dataA,
-                    static_cast<int>(K), dataB, static_cast<int>(N), 0.0f, dataC,
-                    static_cast<int>(N));
-        auto end = std::chrono::high_resolution_clock::now();
-        metal_bridge::accum_cpu_time_ms +=
-            std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-                .count() /
-            1000.0;
-        metal_bridge::count_cpu_calls++;
-      }
-    }
+  const size_t elem = itemsize();
+  const size_t batchA = M * K * elem, batchB = K * N * elem, batchC = M * N * elem;
+  for (size_t b = 0; b < num_batches; ++b)
+    metal_bridge::gemm_bf16(
+        (const char*)buf_->data() + b * batchA,
+        (const char*)other.buf_->data() + b * batchB,
+        (char*)result.buf_->data() + b * batchC,
+        M, N, K, false, false);
 
   return result;
 }
 
 Tensor Tensor::transpose() const {
-  if (shape_.size() != 2) {
-    throw std::invalid_argument("Transpose is only supported for 2D tensors");
-  }
-  size_t rows = shape_[0];
-  size_t cols = shape_[1];
+  if (shape_.ndim != 2)
+    throw std::invalid_argument("Transpose only for 2D tensors");
+  size_t rows = shape_[0], cols = shape_[1];
   Tensor dest({cols, rows}, 0.0f);
-  vDSP_mtrans(data_.data(), 1, dest.data().data(), 1,
+  vDSP_mtrans(buf_->data_float(), 1, dest.buf_->data_float(), 1,
               static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
   return dest;
 }
 
 Tensor Tensor::reshape(const std::vector<size_t> &new_shape) const {
   size_t new_size = 1;
-  for (size_t d : new_shape) {
-    new_size *= d;
-  }
-  if (new_size != size()) {
+  for (auto d : new_shape) new_size *= d;
+  if (new_size != num_elements())
     throw std::invalid_argument("Total size must match for reshape");
-  }
-  return Tensor(new_shape, data_);
+  Tensor t(new_shape);
+  if (buf_) t.buf_->resize_store_f32(buf_->size_float(), buf_->data_float());
+  return t;
 }

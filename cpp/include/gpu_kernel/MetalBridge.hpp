@@ -14,11 +14,8 @@ typedef struct objc_object *id;
 namespace metal_bridge {
 
 // ── Global Metal state (extern — same instance across all translation units) ──
-extern bool batchActive;
-/// Returns true if we are inside an active begin_scope/end_scope batch.
-inline bool is_batch_active() { return batchActive; }
-extern id activeCmdBuffer;       // MTLCommandBuffer
-extern id activeEncoder;         // MTLComputeCommandEncoder
+/// Returns true if a batch command buffer is active (inside begin/end_scope).
+inline bool is_batch_active() { return false; }  // replaced by batchCommandBuffer
 
 void initialize();
 bool is_available();
@@ -44,6 +41,11 @@ void gemm_bf16(const void *A, const void *B, void *C,
                bool transA = false, bool transB = false,
                bool is_forward = false);
 
+// ── FlashAttention forward (fused QK^T→softmax→PV, no N×N intermediates) ──
+void flash_attn_fwd(const void *Q, const void *K, const void *V, void *O,
+                    size_t batch, size_t n_heads, size_t n_kv,
+                    size_t seq_len, size_t head_dim);
+
 // ── Fused attention backward ────────────────────────────────────────
 // Single kernel, no materialized intermediates.
 void fused_attn_bwd(const void *Q, const void *K, const void *V,
@@ -62,11 +64,26 @@ void swiglu_backward(const float *grad_output, const float *gate,
 void swiglu_forward(const float *gate, const float *up, float *out, size_t n);
 void rope_backward(float *grad, const float *cos_table, const float *sin_table,
                    size_t batch, size_t heads, size_t seq_len, size_t head_dim);
+// ── GPU wrapper registration (called from PagedBuffer on alloc/free) ──
+void register_gpu_wrapper(const float* ptr, void** wrapper_loc);
+void unregister_gpu_wrapper(const float* ptr);
+
+// ── GPU-native zero-fill and copy (MTLBlitCommandEncoder — no CPU memset) ──
+void fill_zero_async(float *data, size_t bytes);
+void copy_buffer_async(float *dst, size_t dst_bytes, const float *src, size_t src_bytes);
+
 void residual_add(float *a, const float *b, size_t n);
+void fused_add_norm(float *x_residual, const float *residual,
+                    const float *weight, float *output,
+                    size_t num_rows, size_t D, float eps);
+void fused_backward_add_norm(const void *grad_output, const void *input,
+                              const void *weight, const void *residual,
+                              void *grad_input,
+                              size_t num_rows, size_t D, float eps);
 void embedding_forward(const uint32_t *token_ids, const float *embedding_table,
                        float *output, size_t total_tokens, size_t hidden_dim,
                        size_t vocab_size);
-void cross_entropy(const float *logits, const uint32_t *targets,
+void cross_entropy(const void *logits, const uint32_t *targets,
                    float *loss_out, float *grad_logits,
                    size_t total_tokens, size_t vocab_size);
 struct AdamWStepParams {
@@ -115,6 +132,8 @@ void clear_step_cache();
 void reconcile_buffers();
 float get_last_loss();
 void execute_in_autoreleasepool(std::function<void()> func);
+void start_step_trace();
+void stop_step_trace();
 
 extern double accum_gpu_time_ms;
 extern double accum_cpu_time_ms;

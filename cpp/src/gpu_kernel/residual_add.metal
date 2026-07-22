@@ -13,8 +13,8 @@
 using namespace metal;
 
 kernel void residual_add(
-    device float*       a   [[buffer(0)]],  // WHAT: In-place accumulation target (h)
-    device const float* b   [[buffer(1)]],  // WHAT: Tensor to add (attn_out or ffn_out)
+    device bfloat*       a   [[buffer(0)]],  // WHAT: In-place accumulation target (h)
+    device const bfloat* b   [[buffer(1)]],  // WHAT: Tensor to add (attn_out or ffn_out)
     constant uint&      n   [[buffer(2)]],  // WHAT: Total number of float elements
     uint gid [[thread_position_in_grid]]
 ) {

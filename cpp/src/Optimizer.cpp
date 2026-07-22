@@ -54,8 +54,8 @@ void SGDOptimizer::step(float lr) {
   for (size_t i = 0; i < params_.size(); ++i) {
     Tensor &param = *params_[i];
     const Tensor &grad = *grads_[i];
-    float *p_data = param.data().data();
-    const float *g_data = grad.data().data();
+    float *p_data = param.data();
+    const float *g_data = grad.data();
     size_t n = param.size();
     for (size_t j = 0; j < n; ++j) {
       p_data[j] -= lr * g_data[j];
@@ -98,10 +98,10 @@ static void adamw_update_parameter(
     float lr, float beta1, float beta2, float eps, float weight_decay,
     float bias_correction1, float bias_correction2) {
   size_t n = param.size();
-  float *p_data = param.data().data();
-  const float *g_data = grad.data().data();
-  float *m_data = m.data().data();
-  float *v_data = v.data().data();
+  float *p_data = param.data();
+  const float *g_data = grad.data();
+  float *m_data = m.data();
+  float *v_data = v.data();
 
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;

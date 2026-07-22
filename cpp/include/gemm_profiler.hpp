@@ -22,92 +22,96 @@ public:
         return p;
     }
 
-    void begin_step() { records_.clear(); step_start_ = now(); }
+    void begin_step() { records_.clear(); }
 
     void record(size_t M, size_t N, size_t K, bool tA, bool tB, double ms) {
         records_.push_back({M, N, K, tA, tB, ms});
     }
 
-    void print_summary() {
-        // Build string key for grouping
+    void print_summary(double step_gpu_ms) {
         struct Agg { double total_ms = 0; int count = 0; };
         std::unordered_map<std::string, Agg> agg;
 
         for (auto &r : records_) {
-            char key[64];
-            snprintf(key, 64, "%zu_%zu_%zu_%d_%d", r.M, r.N, r.K, r.transA, r.transB);
+            char key[80];
+            snprintf(key, 80, "%zu_%zu_%zu_%d_%d", r.M, r.N, r.K, r.transA, r.transB);
             agg[key].total_ms += r.elapsed_ms;
             agg[key].count++;
         }
 
-        // Operation name lookup from dimensions
+        // Operation name mapped from dimensions + transpose flags
         auto op_name = [](size_t M, size_t N, size_t K, bool tA, bool tB) -> const char* {
-            size_t BS = 32768, H = 1024, I = 2752, V = 100352;
+            // Production shapes: B=32,S=1024 → BS=32768, H=1024, I=2752, V=100352
             if (!tA && !tB) {
-                if (N == H && K == H && M == BS) return "QKV_fwd";
-                if (N == I && K == H && M == BS) return "gate/up_fwd";
-                if (N == H && K == I && M == BS) return "down_fwd";
-                if (N == V && K == H && M == BS) return "output_proj_fwd";
-                if (M == H && K == BS) {
-                    if (N == H) return "Wq/Wo_grad";
-                    if (N == I) return "Wgate/up_grad";
+                if (M == 32768 && K == 1024) {
+                    if (N == 1024)  return "QKV_fwd_or_Wo_fwd";
+                    if (N == 2752)  return "gate/up_fwd";
+                    if (N == 100352) return "output_proj_fwd";
                 }
-                if (M == I && N == H && K == BS) return "Wdown_grad";
-            }
-            if (tB && !tA) {
-                if (N == H && K == H) return "grad_input (projT)";
-                if (N == H && K == I) return "grad_ffnin (projT)";
-                if (K == V) return "grad_output (projT)";
-            }
-            if (tA && !tB) {
-                if (M == H) {
-                    if (N == V) return "dWout";
-                    if (N == I) return "dWgate/up";
-                    if (N == H) return "dWq/Wo";
+                if (M == 1024 && K == 32768) {
+                    if (N == 1024)  return "Wq/Wo_grad_bwd";
+                    if (N == 2752)  return "Wgate/up_grad_bwd";
                 }
-                if (M == I && N == H) return "dWdown";
+                if (M == 2752 && K == 32768 && N == 1024) return "Wdown_grad_bwd";
+            }
+            if (tB && !tA) { // A @ B^T
+                if (M == 32768) {
+                    if (K == 1024 && N == 1024) return "grad_input_bwd (projT)";
+                    if (K == 2752 && N == 1024) return "grad_ffnin_bwd (projT)";
+                    if (K == 1024 && N == 2752) return "grad_ffnin_bwd (projT_up)";
+                    if (K == 100352) return "grad_output_bwd (projT)";
+                }
+            }
+            if (tA && !tB) { // A^T @ B
+                if (M == 1024 && N == 1024 && K == 32768) return "dWq/Wo_bwd";
+                if (M == 1024 && N == 2752 && K == 32768) return "dWgate/up_bwd";
+                if (M == 1024 && N == 100352 && K == 32768) return "dWout_bwd";
+                if (M == 2752 && N == 1024 && K == 32768) return "dWdown_bwd";
             }
             return "other";
         };
 
-        // Convert to sortable vector
+        // Convert to sortable
         std::vector<std::pair<std::string, Agg>> sorted(agg.begin(), agg.end());
         std::sort(sorted.begin(), sorted.end(),
             [](auto &a, auto &b) { return a.second.total_ms > b.second.total_ms; });
 
-        double grand_total = 0;
-        for (auto &[k, a] : sorted) grand_total += a.total_ms;
+        printf("\n══════════════════════════════════════════════════════════════════════════════\n");
+        printf("  GEMM PROFILER  (GPU time for this step: %.0f ms)\n", step_gpu_ms);
+        printf("══════════════════════════════════════════════════════════════════════════════\n");
+        printf("%-32s %4s %5s %5s  %5s %7s %7s\n",
+               "Operation", "M", "N", "K", "Calls", "Enc(ms)", "Est.GFLOPS");
+        printf("──────────────────────────────────────────────────────────────────────────────\n");
 
-        printf("\n══════════════════════════════════════════════════════════════════════════\n");
-        printf("  GEMM PROFILER (batch=32, seq=1024, step total=%.0f ms)\n", grand_total);
-        printf("══════════════════════════════════════════════════════════════════════════\n");
-        printf("%-24s %14s %5s %8s %8s %8s\n",
-               "Operation", "Shape", "Calls", "Tot(ms)", "%Time", "GFLOPS");
-        printf("──────────────────────────────────────────────────────────────────────────\n");
+        // Estimate GFLOPS based on total GPU time (encoding time is tiny)
+        // We compute per-call GFLOPS using: GFLOPS = 2*M*N*K / (GPU_time_per_call)
+        double encode_total = 0;
+        for (auto &[k_str, a] : sorted) encode_total += a.total_ms;
 
         for (auto &[key_str, a] : sorted) {
-            size_t M,N,K; bool tA,tB;
-            sscanf(key_str.c_str(), "%zu_%zu_%zu_%d_%d", &M, &N, &K, (int*)&tA, (int*)&tB);
-            auto name = op_name(M, N, K, tA, tB);
-            double flops = 2.0 * M * N * K * a.count;
-            double gflops = flops / (a.total_ms / 1000.0) / 1e9;
-            double pct = a.total_ms / grand_total * 100;
-            printf("%-24s %4zux%-6zu %4d %8.1f %7.1f%% %8.1f\n",
-                   name, M, N, a.count, a.total_ms, pct, gflops);
+            size_t M,N,K; int tAi, tBi;
+            sscanf(key_str.c_str(), "%zu_%zu_%zu_%d_%d", &M, &N, &K, &tAi, &tBi);
+            auto name = op_name(M, N, K, tAi, tBi);
+            double flops_total = 2.0 * static_cast<double>(M) * N * K * a.count;
+            // Estimate GPU time = call_fraction * step_gpu_ms
+            double call_fraction = a.count / (double)records_.size();
+            double est_gpu_ms = call_fraction * step_gpu_ms;
+            double est_gflops = flops_total / (est_gpu_ms / 1000.0) / 1e9;
+            printf("%-32s %4zu %5zu %5zu  %5d %7.2f %7.0f\n",
+                   name, M, N, K, a.count, a.total_ms, est_gflops);
         }
-        printf("──────────────────────────────────────────────────────────────────────────\n");
-        printf("%-24s %14s %4d %8.1f %7.1f%% %8s\n",
-               "TOTAL", "", (int)records_.size(), grand_total, 100.0, "");
-        printf("══════════════════════════════════════════════════════════════════════════\n\n");
+        printf("──────────────────────────────────────────────────────────────────────────────\n");
+        int total_calls = (int)records_.size();
+        printf("%-32s %4s %5s %5s  %5d %7.2f\n",
+               "TOTAL", "", "", "", total_calls, encode_total);
+        printf("══════════════════════════════════════════════════════════════════════════════\n");
+        printf("  NOTE: 'Enc(ms)' = CPU encoding overhead only. GPU exec time estimated from\n");
+        printf("  total step GPU time weighted by call count. True per-kernel GPU timing\n");
+        printf("  requires MTLCommandBuffer instrumentation (not yet available per-kernel).\n");
+        printf("══════════════════════════════════════════════════════════════════════════════\n\n");
         fflush(stdout);
     }
 
 private:
-    double now() {
-        return std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()
-        ).count() / 1000.0;
-    }
     std::vector<GemmRecord> records_;
-    double step_start_ = 0;
 };

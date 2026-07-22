@@ -30,7 +30,7 @@ namespace activatations {
  */
 void silu_(Tensor &x) {
   const int n = static_cast<int>(x.size());
-  float *ptr = x.data().data();
+  float *ptr = x.data();
 
   // Step 1: compute neg_x = -x using vDSP_vneg
   std::vector<float> neg_x(n);
@@ -96,11 +96,11 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
     throw std::invalid_argument("Dimension mismatch for SwiGLU backward pass");
   }
   const int n = static_cast<int>(gate.size());
-  const float *g_ptr = gate.data().data();
-  const float *u_ptr = up.data().data();
-  const float *dy_ptr = grad_output.data().data();
-  float *dg_ptr = grad_gate.data().data();
-  float *du_ptr = grad_up.data().data();
+  const float *g_ptr = gate.data();
+  const float *u_ptr = up.data();
+  const float *dy_ptr = grad_output.data();
+  float *dg_ptr = grad_gate.data();
+  float *du_ptr = grad_up.data();
 
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;

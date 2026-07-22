@@ -59,10 +59,10 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
       grad_logits_ = Tensor({batch, seq_len, vocab_size}, 0.0f);
 
       metal_bridge::cross_entropy(
-          logits.data().data(),
+          logits.data(),
           targets_uint32.data(),
           &loss_val_,
-          grad_logits_.data().data(),
+          grad_logits_.data(),
           total_tokens,
           vocab_size
       );

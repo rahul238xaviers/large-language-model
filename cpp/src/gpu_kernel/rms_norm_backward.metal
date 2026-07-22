@@ -26,11 +26,11 @@ inline float simd_sum(float val) {
 
 // Pass 1: Compute input gradient dx and accumulate weight gradient dw directly in a single pass
 kernel void rms_norm_backward_dx(
-    device const float* grad_output     [[buffer(0)]],
-    device const float* input           [[buffer(1)]],
-    device const float* weight          [[buffer(2)]],
-    device float*       grad_input      [[buffer(3)]],
-    device float*       grad_weight     [[buffer(4)]],
+    device const bfloat* grad_output     [[buffer(0)]],
+    device const bfloat* input           [[buffer(1)]],
+    device const bfloat* weight          [[buffer(2)]],
+    device bfloat*       grad_input      [[buffer(3)]],
+    device bfloat*       grad_weight     [[buffer(4)]],
     constant float&     eps             [[buffer(5)]],
     constant uint&      dims            [[buffer(6)]],
     uint                row_idx         [[threadgroup_position_in_grid]],
@@ -102,10 +102,10 @@ kernel void rms_norm_backward_dx(
         float xhat = input[idx] / rms;
         
         // grad_input calculation
-        grad_input[idx] = (1.0f / rms) * (grad_output[idx] * weight[col] - xhat * sum_g_w_xhat);
+        grad_input[idx] = (bfloat)((1.0f / rms) * ((float)grad_output[idx] * (float)weight[col] - xhat * sum_g_w_xhat));
         
         // Accumulate to global weight gradient directly using atomic floats
-        float dw_val = grad_output[idx] * xhat;
+        float dw_val = (float)grad_output[idx] * xhat;
         atomic_add_float((device atomic_uint*)&grad_weight[col], dw_val);
     }
 }

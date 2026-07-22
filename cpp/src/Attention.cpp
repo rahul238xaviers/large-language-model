@@ -34,10 +34,10 @@
  */
 Attention::Attention(const ModelConfig &config)
     : config_(config),
-      Wq_({config.hidden_dim, config.n_heads * config.head_dim}),
-      Wk_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
-      Wv_({config.hidden_dim, config.n_kv_heads * config.head_dim}),
-      Wo_({config.n_heads * config.head_dim, config.hidden_dim}) {
+      Wq_({config.hidden_dim, config.n_heads * config.head_dim}, DType::BF16),
+      Wk_({config.hidden_dim, config.n_kv_heads * config.head_dim}, DType::BF16),
+      Wv_({config.hidden_dim, config.n_kv_heads * config.head_dim}, DType::BF16),
+      Wo_({config.n_heads * config.head_dim, config.hidden_dim}, DType::BF16) {
 
   if (config.n_kv_heads > config.n_heads) {
     throw std::invalid_argument("n_kv_heads cannot be greater than n_heads");
@@ -79,7 +79,7 @@ Tensor reshape_to_4d(const Tensor &src, size_t n_heads, size_t head_dim) {
   }
 
   if (use_gpu) {
-    metal_bridge::reshape_to_4d(src.data().data(), dest.data().data(),
+    metal_bridge::reshape_to_4d(src.data(), dest.data(),
                                  batch, n_heads, seq_len, head_dim);
     return dest;
   }
@@ -131,7 +131,7 @@ Tensor reshape_to_3d(const Tensor &src) {
   }
 
   if (use_gpu) {
-    metal_bridge::reshape_to_3d(src.data().data(), dest.data().data(),
+    metal_bridge::reshape_to_3d(src.data(), dest.data(),
                                  batch, n_heads, seq_len, head_dim);
     return dest;
   }
@@ -210,26 +210,19 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
   // GCD-parallel dispatch over (batch × n_heads): each (b,h) pair writes to
   // non-overlapping output channels [h*head_dim, (h+1)*head_dim), so no mutex
   // needed.
-  const float *q4_ptr = q4.data().data();
-  const float *k4_ptr = k4.data().data();
-  const float *v4_ptr = v4.data().data();
-  float *out_ptr = attn_output.data().data();
+  const float *q4_ptr = q4.data();
+  const float *k4_ptr = k4.data();
+  const float *v4_ptr = v4.data();
+  float *out_ptr = attn_output.data();
 
   const size_t n_h = config_.n_heads;
   const size_t h_d = config_.head_dim;
   const size_t n_kv = config_.n_kv_heads;
 
   if (use_gpu) {
-
-    metal_bridge::GQAParams gqa_params = {
-        .batch = static_cast<uint32_t>(batch),
-        .n_q_heads = static_cast<uint32_t>(n_h),
-        .n_kv_heads = static_cast<uint32_t>(n_kv),
-        .seq_len = static_cast<uint32_t>(seq_len),
-        .head_dim = static_cast<uint32_t>(h_d),
-    };
     auto start = std::chrono::high_resolution_clock::now();
-    metal_bridge::gemm_gqa(gqa_params, q4_ptr, k4_ptr, v4_ptr, out_ptr);
+    metal_bridge::flash_attn_fwd(q4_ptr, k4_ptr, v4_ptr, out_ptr,
+                                  batch, n_h, n_kv, seq_len, h_d);
     auto end = std::chrono::high_resolution_clock::now();
     metal_bridge::accum_gpu_time_ms +=
         std::chrono::duration_cast<std::chrono::microseconds>(end - start)
@@ -423,12 +416,12 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
         .seq_len = static_cast<uint32_t>(seq_len),
         .head_dim = static_cast<uint32_t>(head_dim),
     };
-    metal_bridge::gemm_gqa(gqa_params, q4.data().data(), k4.data().data(), v4.data().data(), attn_output.data().data());
+    metal_bridge::gemm_gqa(gqa_params, q4.data(), k4.data(), v4.data(), attn_output.data());
   } else {
-    const float *q4_ptr = q4.data().data();
-    const float *k4_ptr = k4.data().data();
-    const float *v4_ptr = v4.data().data();
-    float *out_ptr = attn_output.data().data();
+    const float *q4_ptr = q4.data();
+    const float *k4_ptr = k4.data();
+    const float *v4_ptr = v4.data();
+    float *out_ptr = attn_output.data();
     const size_t n_h = n_heads;
     const size_t h_d = head_dim;
     const size_t n_kv = n_kv_heads;
@@ -477,9 +470,9 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // 2. grad_Wo[NH*HD, H] = attn_output[B*S, NH*HD].T @ grad_output[B*S, H]
   if (use_gpu) {
     metal_bridge::gemm_backward(
-        attn_output.data().data(),
-        grad_output.data().data(),
-        grad_Wo.data().data(),
+        attn_output.data(),
+        grad_output.data(),
+        grad_Wo.data(),
         hidden_dim,
         hidden_dim,
         batch * seq_len
@@ -492,9 +485,9 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_attn_output({batch, seq_len, hidden_dim}, 0.0f);
   if (use_gpu) {
     metal_bridge::gemm_proj_trans_b(
-        grad_output.data().data(),
-        Wo_.data().data(),
-        grad_attn_output.data().data(),
+        grad_output.data(),
+        Wo_.data(),
+        grad_attn_output.data(),
         batch * seq_len,
         hidden_dim,
         hidden_dim
@@ -512,9 +505,9 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // Single kernel call: computes dQ, dK, dV using tiled shared memory.
   // Eliminates the 2 GB intermediate score/probability/dS buffers entirely.
   if (use_gpu) {
-    metal_bridge::fused_attn_bwd(q4.data().data(), k4.data().data(), v4.data().data(),
-                                  grad_attn_output.data().data(),
-                                  grad_q4.data().data(), grad_k4.data().data(), grad_v4.data().data(),
+    metal_bridge::fused_attn_bwd(q4.data(), k4.data(), v4.data(),
+                                  grad_attn_output.data(),
+                                  grad_q4.data(), grad_k4.data(), grad_v4.data(),
                                   batch, n_heads, n_kv_heads, seq_len, head_dim);
   } else {
     for (size_t b = 0; b < batch; ++b) {
@@ -540,13 +533,13 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // 8. Parameter gradients for Wq, Wk, Wv
   if (use_gpu) {
     metal_bridge::gemm_backward(
-        x_norm.data().data(), grad_q_proj.data().data(), grad_Wq.data().data(),
+        x_norm.data(), grad_q_proj.data(), grad_Wq.data(),
         hidden_dim, n_heads * head_dim, batch * seq_len);
     metal_bridge::gemm_backward(
-        x_norm.data().data(), grad_k_proj.data().data(), grad_Wk.data().data(),
+        x_norm.data(), grad_k_proj.data(), grad_Wk.data(),
         hidden_dim, n_kv_heads * head_dim, batch * seq_len);
     metal_bridge::gemm_backward(
-        x_norm.data().data(), grad_v_proj.data().data(), grad_Wv.data().data(),
+        x_norm.data(), grad_v_proj.data(), grad_Wv.data(),
         hidden_dim, n_kv_heads * head_dim, batch * seq_len);
   } else {
     grad_Wq = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_q_proj.reshape({batch * seq_len, n_heads * head_dim}));
@@ -558,20 +551,20 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_x_norm({batch, seq_len, hidden_dim}, 0.0f);
   if (use_gpu) {
     metal_bridge::gemm_proj_trans_b(
-        grad_q_proj.data().data(), Wq_.data().data(), grad_x_norm.data().data(),
+        grad_q_proj.data(), Wq_.data(), grad_x_norm.data(),
         batch * seq_len, hidden_dim, n_heads * head_dim);
 
     Tensor grad_k_norm({batch, seq_len, hidden_dim}, 0.0f);
     metal_bridge::gemm_proj_trans_b(
-        grad_k_proj.data().data(), Wk_.data().data(), grad_k_norm.data().data(),
+        grad_k_proj.data(), Wk_.data(), grad_k_norm.data(),
         batch * seq_len, hidden_dim, n_kv_heads * head_dim);
-    metal_bridge::residual_add(grad_x_norm.data().data(), grad_k_norm.data().data(), grad_x_norm.size());
+    metal_bridge::residual_add(grad_x_norm.data(), grad_k_norm.data(), grad_x_norm.size());
 
     Tensor grad_v_norm({batch, seq_len, hidden_dim}, 0.0f);
     metal_bridge::gemm_proj_trans_b(
-        grad_v_proj.data().data(), Wv_.data().data(), grad_v_norm.data().data(),
+        grad_v_proj.data(), Wv_.data(), grad_v_norm.data(),
         batch * seq_len, hidden_dim, n_kv_heads * head_dim);
-    metal_bridge::residual_add(grad_x_norm.data().data(), grad_v_norm.data().data(), grad_x_norm.size());
+    metal_bridge::residual_add(grad_x_norm.data(), grad_v_norm.data(), grad_x_norm.size());
   } else {
     grad_x_norm = grad_q_proj.matmul(Wq_.transpose());
     grad_x_norm.add_(grad_k_proj.matmul(Wk_.transpose()));

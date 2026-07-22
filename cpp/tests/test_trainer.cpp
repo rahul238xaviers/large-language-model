@@ -518,8 +518,8 @@ int main() {
       }
 
       // Populate random initial weights
-      auto &emb_data = model_save.token_embeddings().data();
-      for (size_t i = 0; i < emb_data.size(); ++i) {
+      float *emb_data = model_save.token_embeddings().data();
+      for (size_t i = 0; i < model_save.token_embeddings().num_elements(); ++i) {
         emb_data[i] = static_cast<float>(i) * 0.01f + 0.1f;
       }
       // Put fake gradients to verify optimizer moments update
@@ -590,9 +590,9 @@ int main() {
       }
 
       // Verify model parameters match exactly
-      const auto &data_save = model_save.token_embeddings().data();
-      const auto &data_load = model_load.token_embeddings().data();
-      for (size_t i = 0; i < data_save.size(); ++i) {
+      const float *data_save = model_save.token_embeddings().data();
+      const float *data_load = model_load.token_embeddings().data();
+      for (size_t i = 0; i < model_save.token_embeddings().num_elements(); ++i) {
         if (data_save[i] != data_load[i]) {
           checkpoint_pass = false;
           std::cerr << "Model weights mismatch at index " << i
@@ -603,9 +603,9 @@ int main() {
       }
 
       // Verify optimizer moments match exactly
-      const auto &m_save = opt_save.m_states()[0].data();
-      const auto &m_load = opt_load.m_states()[0].data();
-      for (size_t i = 0; i < m_save.size(); ++i) {
+      const float *m_save = opt_save.m_states()[0].data();
+      const float *m_load = opt_load.m_states()[0].data();
+      for (size_t i = 0; i < opt_save.m_states()[0].num_elements(); ++i) {
         if (m_save[i] != m_load[i]) {
           checkpoint_pass = false;
           std::cerr << "Optimizer moment m mismatch at index " << i

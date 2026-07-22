@@ -89,8 +89,8 @@ int main() {
     Tensor t3({2, 2}, custom_data);
     {
         total_checks++;
-        bool pass = (t3.data().size() == custom_data.size()) && 
-                     std::equal(t3.data().begin(), t3.data().end(), custom_data.begin());
+        bool pass = (t3.num_elements() == custom_data.size()) && 
+                     std::equal(t3.data(), t3.data() + t3.num_elements(), custom_data.begin());
         if (pass) passed_checks++;
         print_test_row("TC-05", "Data constructor correctness", "4.00000 at [1,1]", 
                        std::to_string(t3.data()[3]), pass);
@@ -129,7 +129,7 @@ int main() {
         total_checks++;
         Tensor C = A.add(B);
         std::vector<float> expC({6.0f, 8.0f, 10.0f, 12.0f});
-        bool pass = std::equal(C.data().begin(), C.data().end(), expC.begin());
+        bool pass = std::equal(C.data(), C.data() + C.num_elements(), expC.begin());
         if (pass) passed_checks++;
         print_test_row("TC-08", "Out-of-place addition correctness", "12.00000 at idx 3", 
                        std::to_string(C.data()[3]), pass);
@@ -139,7 +139,7 @@ int main() {
         Tensor A_copy = A;
         A_copy.add_(B);
         std::vector<float> expAC({6.0f, 8.0f, 10.0f, 12.0f});
-        bool pass = std::equal(A_copy.data().begin(), A_copy.data().end(), expAC.begin());
+        bool pass = std::equal(A_copy.data(), A_copy.data() + A_copy.num_elements(), expAC.begin());
         if (pass) passed_checks++;
         print_test_row("TC-09", "In-place addition correctness", "12.00000 at idx 3", 
                        std::to_string(A_copy.data()[3]), pass);
@@ -148,7 +148,7 @@ int main() {
         total_checks++;
         Tensor D = A.mul(B);
         std::vector<float> expD({5.0f, 12.0f, 21.0f, 32.0f});
-        bool pass = std::equal(D.data().begin(), D.data().end(), expD.begin());
+        bool pass = std::equal(D.data(), D.data() + D.num_elements(), expD.begin());
         if (pass) passed_checks++;
         print_test_row("TC-10", "Out-of-place multiply correctness", "32.00000 at idx 3", 
                        std::to_string(D.data()[3]), pass);
@@ -157,7 +157,7 @@ int main() {
         total_checks++;
         Tensor E = A.scale(2.5f);
         std::vector<float> expE({2.5f, 5.0f, 7.5f, 10.0f});
-        bool pass = std::equal(E.data().begin(), E.data().end(), expE.begin());
+        bool pass = std::equal(E.data(), E.data() + E.num_elements(), expE.begin());
         if (pass) passed_checks++;
         print_test_row("TC-11", "Scalar scaling correctness", "10.00000 at idx 3", 
                        std::to_string(E.data()[3]), pass);

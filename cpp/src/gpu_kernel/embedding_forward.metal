@@ -19,8 +19,8 @@ using namespace metal;
 
 kernel void embedding_forward(
     device const uint*  token_ids       [[buffer(0)]],  // WHAT: Flat token ID array [B*S]
-    device const float* embedding_table [[buffer(1)]],  // WHAT: Weight matrix [vocab_size, hidden_dim]
-    device float*       output          [[buffer(2)]],  // WHAT: Output hidden states [B*S, hidden_dim]
+    device const bfloat* embedding_table [[buffer(1)]],  // WHAT: Weight matrix [vocab_size, hidden_dim]
+    device bfloat*       output          [[buffer(2)]],  // WHAT: Output hidden states [B*S, hidden_dim]
     constant uint&      hidden_dim      [[buffer(3)]],  // WHAT: Embedding / hidden dimension H
     constant uint&      total_tokens    [[buffer(4)]],  // WHAT: B * S (total token positions)
     uint gid [[thread_position_in_grid]]

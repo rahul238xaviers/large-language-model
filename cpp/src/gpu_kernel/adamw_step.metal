@@ -36,8 +36,8 @@ struct AdamWParams {
 };
 
 kernel void adamw_step(
-    device float*       param [[buffer(0)]],
-    device const float* grad  [[buffer(1)]],
+    device bfloat*      param [[buffer(0)]],
+    device const bfloat* grad  [[buffer(1)]],
     device float*       m     [[buffer(2)]],
     device float*       v     [[buffer(3)]],
     constant AdamWParams& p   [[buffer(4)]],
@@ -60,13 +60,10 @@ kernel void adamw_step(
     // WHY: AdamW separates weight decay from gradient-based updates to prevent
     //      the adaptive learning rate from interfering with regularization.
     if (p.weight_decay > 0.0f) {
-        param[idx] -= p.lr * p.weight_decay * param[idx];
+        param[idx] = (bfloat)((float)param[idx] - p.lr * p.weight_decay * (float)param[idx]);
     }
 
-    // WHAT: Compute bias-corrected moment estimates and update parameter.
-    // WHY: Early in training, moments are biased toward zero because they are
-    //      initialized to zero. Dividing by (1 - beta^t) corrects this bias.
     float m_hat = m[idx] / p.bias_correction1;
     float v_hat = v[idx] / p.bias_correction2;
-    param[idx] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
+    param[idx] = (bfloat)((float)param[idx] - p.lr * m_hat / (sqrt(v_hat) + p.eps));
 }

@@ -287,17 +287,38 @@ void Trainer::train() {
     metal_bridge::initialize();
     metal_bridge::reconcile_buffers();
 
+    if (step == 0) metal_bridge::start_step_trace();
+
     metal_bridge::begin_scope();
 
-    run_training_step(model_, optimizer_, rope_, tokens, targets, lr,
-                      grad_w_gate, grad_w_up, grad_w_down, grad_Wq,
-                      grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
-                      grad_output_projection, loss);
+    // Tensors must stay alive past end_scope() — GPU kernels execute
+    // asynchronously and read from their data.
+    Tensor logits = model_.forward(tokens);
+    CrossEntropyLoss lf;
+    loss = lf.forward(logits, targets);
+    const Tensor &grad_logits = lf.grad_logits();
 
-    // loss inside run_training_step is from loss_fn.forward() which is
-    // garbage (GPU hasn't executed).  Overwrite after commit.
+    // GPU-native blit zeroing — no CPU memset, no virtual-memory thrash
+    metal_bridge::fill_zero_async(grad_embeddings.data(), grad_embeddings.raw_bytes());
+    metal_bridge::fill_zero_async(grad_output_projection.data(), grad_output_projection.raw_bytes());
+    for (size_t l = 0; l < model_.layers().size(); ++l) {
+      metal_bridge::fill_zero_async(grad_w_gate[l].data(), grad_w_gate[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_w_up[l].data(),   grad_w_up[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_w_down[l].data(), grad_w_down[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_Wq[l].data(),     grad_Wq[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_Wk[l].data(),     grad_Wk[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_Wv[l].data(),     grad_Wv[l].raw_bytes());
+      metal_bridge::fill_zero_async(grad_Wo[l].data(),     grad_Wo[l].raw_bytes());
+    }
+
+    model_.backward(grad_logits, tokens, grad_w_gate, grad_w_up, grad_w_down,
+                     grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                     grad_output_projection, rope_);
+    optimizer_.step(lr);
 
     metal_bridge::end_scope();
+
+    if (step == 0) metal_bridge::stop_step_trace();
 
     // ── GPU has finished — read the real loss ─────────────────────────
     loss = metal_bridge::get_last_loss();

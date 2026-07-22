@@ -29,7 +29,7 @@
  * dimension).
  * @param eps Small epsilon to prevent division by zero (defaults to 1e-5f).
  */
-RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f), eps_(eps) {}
+RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f, DType::BF16), eps_(eps) {}
 
 /**
  * @brief Performs RMSNorm normalization on the input tensor in the forward
@@ -47,18 +47,17 @@ RMSNorm::RMSNorm(size_t dims, float eps) : weight_({dims}, 1.0f), eps_(eps) {}
  * @return Tensor Normalized tensor of the same shape as input x.
  */
 Tensor RMSNorm::forward(const Tensor &x) const {
-  const std::vector<size_t> &x_shape = x.shape();
   if (x.shape().size() < 2) {
     throw std::invalid_argument("Input tensor must have at least 2 dimensions");
   }
 
   size_t dims = weight_.shape()[0];
-  if (x_shape.back() != dims) {
+  if (x.shape().back() != dims) {
     throw std::invalid_argument(
         "Input tensor last dimension must match RMSNorm dims");
   }
 
-  Tensor result(x_shape);
+  Tensor result(x.shape(), 0.0f);
   size_t total_elements = x.size();
   size_t num_rows = total_elements / dims;
 
@@ -72,7 +71,7 @@ Tensor RMSNorm::forward(const Tensor &x) const {
   }
 
   if (use_gpu) {
-    metal_bridge::rms_norm_forward(x.data().data(), result.data().data(), weight_.data().data(),
+    metal_bridge::rms_norm_forward(x.data(), result.data(), weight_.data(),
                                    eps_, num_rows, dims);
     return result;
   }
@@ -90,9 +89,9 @@ Tensor RMSNorm::forward(const Tensor &x) const {
     if (start_row >= end_row) continue;
 
     workers.emplace_back([this, start_row, end_row, dims, &x, &result]() {
-      const float *x_data = x.data().data();
-      const float *w_data = weight_.data().data();
-      float *res_data = result.data().data();
+      const float *x_data = x.data();
+      const float *w_data = weight_.data();
+      float *res_data = result.data();
 
       for (size_t r = start_row; r < end_row; ++r) {
         size_t offset = r * dims;
@@ -148,13 +147,13 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   }
 
   if (use_gpu) {
-    metal_bridge::rms_norm_backward(grad_output.data().data(), input.data().data(), weight_.data().data(),
-                                    grad_input.data().data(), grad_weight.data().data(), eps_,
+    metal_bridge::rms_norm_backward(grad_output.data(), input.data(), weight_.data(),
+                                    grad_input.data(), grad_weight.data(), eps_,
                                     num_rows, dims);
     return grad_input;
   }
 
-  float *dw_data = grad_weight.data().data();
+  float *dw_data = grad_weight.data();
 
   unsigned int num_threads = std::thread::hardware_concurrency();
   if (num_threads == 0) num_threads = 4;
@@ -170,10 +169,10 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
     if (start_row >= end_row) continue;
 
     workers.emplace_back([this, start_row, end_row, dims, &input, &grad_output, &grad_input, &thread_dw, t]() {
-      const float *x_data = input.data().data();
-      const float *g_data = grad_output.data().data();
-      const float *w_data = weight_.data().data();
-      float *dx_data = grad_input.data().data();
+      const float *x_data = input.data();
+      const float *g_data = grad_output.data();
+      const float *w_data = weight_.data();
+      float *dx_data = grad_input.data();
       float *dw_local = thread_dw[t].data();
 
       for (size_t r = start_row; r < end_row; ++r) {

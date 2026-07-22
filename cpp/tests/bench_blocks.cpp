@@ -40,10 +40,47 @@ static constexpr int SAMP = 3; // samples for element-wise
 static constexpr int SAMP_GEMM = 3; // samples for GEMMs
 static constexpr int SAMP_HEAVY = 2; // samples for heavy GEMMs (large K)
 
+// ── Kernel call frequencies per training step (24-layer 1.6B model) ──────
+static constexpr int FREQ_EMBEDDING     = 1;    // embedding_forward
+static constexpr int FREQ_OUTPUT_PROJ   = 1;    // output projection forward
+static constexpr int FREQ_FINAL_NORM    = 1;    // final rms_norm_forward
+static constexpr int FREQ_PER_LAYER     = 24;
+static constexpr int FREQ_RMS_FWD       = 48;   // 2 per layer × 24
+static constexpr int FREQ_RMS_BWD       = 48;   // 2 per layer × 24
+static constexpr int FREQ_QKV_PROJ      = 24;   // 1 per layer
+static constexpr int FREQ_ATTN_FUSED_BWD= 24;   // 1 per layer
+static constexpr int FREQ_ROPE_FWD      = 24;   // 1 per layer
+static constexpr int FREQ_ROPE_BWD      = 24;   // 1 per layer
+static constexpr int FREQ_GATE_UP_PROJ  = 24;   // 1 per layer (fused)
+static constexpr int FREQ_SWIGLU_FWD    = 24;   // 1 per layer
+static constexpr int FREQ_SWIGLU_BWD    = 24;   // 1 per layer
+static constexpr int FREQ_DOWN_PROJ     = 24;   // 1 per layer
+static constexpr int FREQ_RESIDUAL_ADD  = 72;   // 3 per layer × 24 (2 fwd + 1 bwd)
+static constexpr int FREQ_ADAMW_PARAM   = 122;  // ~122 weight tensors
+// backward GEMMs per layer
+static constexpr int FREQ_GEMM_BWD_ATTN = 24;   // QKV weight grad (w_qkv fused)
+static constexpr int FREQ_GEMM_BWD_GATE = 24;   // w_gate grad
+static constexpr int FREQ_GEMM_BWD_UP   = 24;   // w_up grad
+static constexpr int FREQ_GEMM_BWD_DOWN = 24;   // w_down grad
+static constexpr int FREQ_GEMM_BWD_OUT  = 1;    // output_proj grad
+static constexpr int FREQ_GEMM_BWD_EMB  = 1;    // embedding grad
+static constexpr int FREQ_GEMM_PROJT_INPUT = 24;  // grad_input for attn (Wo^T)
+static constexpr int FREQ_GEMM_PROJT_DOWN  = 24;  // grad_input for down_proj
+static constexpr int FREQ_GEMM_PROJT_OUT   = 1;   // grad_input for output_proj
+static constexpr int FREQ_CROSS_ENTROPY = 1;
+
 // ── helpers ───────────────────────────────────────────────────────────────
 static void set_gpu(bool on) {
     setenv("GPU_ENABLED", on ? "1" : "0", 1);
 }
+
+struct LedgerEntry {
+    std::string name;
+    double ms_per_call;       // measured GPU time for one call
+    int calls_per_step;       // how many times per step
+    double total_ms;          // ms_per_call × calls_per_step
+    double bw_gbs;            // memory bandwidth
+};
 
 struct BenchResult {
     std::string label;
@@ -172,6 +209,35 @@ static BenchResult bench_gemm_proj(size_t N, const std::string &tag) {
     r.gflops = flops / (r.wall_ms / 1000.0) / 1e9;
 
     double bytes = (double)((M * H + H * N + M * N) * 4);
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 4b. gemm_proj with variable K: matmul [M,K] × [K,N] → [M,N]
+static BenchResult bench_gemm_proj_vark(size_t M_, size_t N_, size_t K_,
+                                        const std::string &tag) {
+    BenchResult r{"gemm_proj " + tag};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> A(M_ * K_, 0.5f);
+    std::vector<float> B(K_ * N_, 0.5f);
+    std::vector<float> C(M_ * N_, 0.0f);
+
+    int warmup = W, samples = SAMP_GEMM;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::gemm_proj(A.data(), B.data(), C.data(), M_, N_, K_);
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::gemm_proj(A.data(), B.data(), C.data(), M_, N_, K_);
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+
+    double flops = 2.0 * M_ * K_ * N_;
+    r.gflops = flops / (r.wall_ms / 1000.0) / 1e9;
+
+    double bytes = (double)((M_ * K_ + K_ * N_ + M_ * N_) * 4);
     r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
     return r;
 }
@@ -429,6 +495,263 @@ static BenchResult bench_gqa_bwd() {
     return r;
 }
 
+// 14. fused_attn_bwd: single-kernel GQA attention backward
+static BenchResult bench_fused_attn_bwd() {
+    BenchResult r{"fused_attn_bwd"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    size_t bytesQ   = B * nH * S * HD * sizeof(float);
+    size_t bytesKV  = B * nKV * S * HD * sizeof(float);
+    std::vector<float> Q(B * nH * S * HD, 0.1f);
+    std::vector<float> K(B * nKV * S * HD, 0.1f);
+    std::vector<float> V(B * nKV * S * HD, 0.1f);
+    std::vector<float> dO(B * nH * S * HD, 0.5f);
+    std::vector<float> dQ(B * nH * S * HD, 0.0f);
+    std::vector<float> dK(B * nKV * S * HD, 0.0f);
+    std::vector<float> dV(B * nKV * S * HD, 0.0f);
+
+    // Use begin_scope/end_scope for true GPU timing (no CPU overhead between)
+    int warmup = W, samples = SAMP_HEAVY;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::fused_attn_bwd(Q.data(), K.data(), V.data(), dO.data(),
+                                     dQ.data(), dK.data(), dV.data(),
+                                     B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::fused_attn_bwd(Q.data(), K.data(), V.data(), dO.data(),
+                                     dQ.data(), dK.data(), dV.data(),
+                                     B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+
+    double total_bytes = double(bytesQ * 2 + bytesKV * 4); // read: Q,K,V,dO; write: dQ,dK,dV
+    r.bw_gbs = total_bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 15. rope_forward
+static BenchResult bench_rope_fwd() {
+    BenchResult r{"rope_forward"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    size_t half_dim = HD / 2;
+    std::vector<float> Q(B * nH * S * HD, 0.1f);
+    std::vector<float> K(B * nKV * S * HD, 0.1f);
+    std::vector<float> cos_t(S * half_dim, 0.5f);
+    std::vector<float> sin_t(S * half_dim, 0.5f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::rope_forward(Q.data(), K.data(), cos_t.data(), sin_t.data(),
+                                   B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::rope_forward(Q.data(), K.data(), cos_t.data(), sin_t.data(),
+                                   B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = double(B * S * HD * 4) * 4; // Q+K+cos+sin read, Q+K write
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 16. rope_backward
+static BenchResult bench_rope_bwd() {
+    BenchResult r{"rope_backward"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> grad(B * nH * S * HD, 0.5f);
+    std::vector<float> cos_t(S * HD / 2, 0.5f);
+    std::vector<float> sin_t(S * HD / 2, 0.5f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::rope_backward(grad.data(), cos_t.data(), sin_t.data(),
+                                    B, nH, S, HD);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::rope_backward(grad.data(), cos_t.data(), sin_t.data(),
+                                    B, nH, S, HD);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = double(B * nH * S * HD * 4) * 3;
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 17. swiglu_forward
+static BenchResult bench_swiglu_fwd() {
+    BenchResult r{"swiglu_forward"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    size_t n = M * I;
+    std::vector<float> gate(n, 0.5f);
+    std::vector<float> up(n, 0.5f);
+    std::vector<float> out(n, 0.0f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::swiglu_forward(gate.data(), up.data(), out.data(), n);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::swiglu_forward(gate.data(), up.data(), out.data(), n);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = double(n * 4) * 3;
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 18. adamw_step for different size classes
+static BenchResult bench_adamw_size(size_t n, const std::string &tag) {
+    BenchResult r{"adamw_step " + tag};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> param(n, 0.1f);
+    std::vector<float> grad(n, 0.01f);
+    std::vector<float> m(n, 0.0f);
+    std::vector<float> v(n, 0.0f);
+    metal_bridge::AdamWStepParams p;
+    p.lr = 3e-4f; p.beta1 = 0.9f; p.beta2 = 0.999f; p.eps = 1e-8f;
+    p.weight_decay = 0.1f; p.bias_correction1 = 0.9f; p.bias_correction2 = 0.999f;
+    p.n = n;
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::adamw_step(param.data(), grad.data(), m.data(), v.data(), p);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::adamw_step(param.data(), grad.data(), m.data(), v.data(), p);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = double(n * 4) * 4; // param+grad+m+v
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 19. gqa_scores (attention score precomputation)
+static BenchResult bench_gqa_scores() {
+    BenchResult r{"gqa_scores"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> Q(B * nH * S * HD, 0.1f);
+    std::vector<float> K(B * nKV * S * HD, 0.1f);
+    std::vector<float> scores(B * nH * S * S, 0.0f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::gqa_scores(Q.data(), K.data(), scores.data(),
+                                 B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::gqa_scores(Q.data(), K.data(), scores.data(),
+                                 B, nH, nKV, S, HD);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = (B * nH * S * HD + B * nKV * S * HD + B * nH * S * S) * 4.0;
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 20. attn_softmax
+static BenchResult bench_attn_softmax() {
+    BenchResult r{"attn_softmax"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> scores(B * nH * S * S, 0.5f);
+    std::vector<float> probs(B * nH * S * S, 0.0f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::attn_softmax(scores.data(), probs.data(), B, nH, S);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::attn_softmax(scores.data(), probs.data(), B, nH, S);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = B * nH * S * S * 4.0 * 2;
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
+// 21. attn_ds
+static BenchResult bench_attn_ds() {
+    BenchResult r{"attn_ds"};
+    set_gpu(true);
+    metal_bridge::reconcile_buffers();
+
+    std::vector<float> probs(B * nH * S * S, 0.5f);
+    std::vector<float> dP_row(B * nH * S * S, 0.5f);
+    std::vector<float> dS_out(B * nH * S * S, 0.0f);
+
+    int warmup = W, samples = SAMP;
+    for (int i = 0; i < warmup; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::attn_ds(probs.data(), dP_row.data(), dS_out.data(), B, nH, S);
+        metal_bridge::end_scope();
+    }
+    double t0 = now_ms();
+    for (int i = 0; i < samples; i++) {
+        metal_bridge::begin_scope();
+        metal_bridge::attn_ds(probs.data(), dP_row.data(), dS_out.data(), B, nH, S);
+        metal_bridge::end_scope();
+    }
+    r.wall_ms = (now_ms() - t0) / samples;
+    r.gpu_ms = r.wall_ms;
+    double bytes = B * nH * S * S * 4.0 * 3;
+    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
+    return r;
+}
+
 // ── Layer-level forward pass ──────────────────────────────────────────────
 static BenchResult bench_layer_fwd() {
     BenchResult r{"one_layer_forward (full)"};
@@ -443,7 +766,7 @@ static BenchResult bench_layer_fwd() {
 
     TransformerLayer layer(cfg);
     // fill weights
-    auto fill = [](Tensor &t, float v) { for (auto &x : t.data()) x = v; };
+    auto fill = [](Tensor &t, float v) { for (size_t _i = 0; _i < t.num_elements(); _i++) t.data()[_i] = v; };
     fill(layer.w_gate, 0.02f); fill(layer.w_up, 0.02f); fill(layer.w_down, 0.02f);
     fill(layer.attn.Wq(), 0.02f); fill(layer.attn.Wk(), 0.02f);
     fill(layer.attn.Wv(), 0.02f); fill(layer.attn.Wo(), 0.02f);
@@ -496,7 +819,7 @@ static BenchResult bench_layer_bwd() {
     cfg.vocab_size = V; cfg.rms_norm_eps = 1e-5f;
 
     TransformerLayer layer(cfg);
-    auto fill = [](Tensor &t, float v) { for (auto &x : t.data()) x = v; };
+    auto fill = [](Tensor &t, float v) { for (size_t _i = 0; _i < t.num_elements(); _i++) t.data()[_i] = v; };
     fill(layer.w_gate, 0.02f); fill(layer.w_up, 0.02f); fill(layer.w_down, 0.02f);
     fill(layer.attn.Wq(), 0.02f); fill(layer.attn.Wk(), 0.02f);
     fill(layer.attn.Wv(), 0.02f); fill(layer.attn.Wo(), 0.02f);
@@ -575,9 +898,18 @@ int main() {
     results.push_back(bench_rmsnorm_bwd());
     results.push_back(bench_residual_add());
     results.push_back(bench_swiglu_bwd());
+    results.push_back(bench_swiglu_fwd());
     results.push_back(bench_adamw());
     results.push_back(bench_embedding());
     results.push_back(bench_cross_entropy());
+    results.push_back(bench_rope_fwd());
+    results.push_back(bench_rope_bwd());
+
+    // ── Attention-specific ──
+    results.push_back(bench_gqa_scores());
+    results.push_back(bench_attn_softmax());
+    results.push_back(bench_attn_ds());
+    results.push_back(bench_fused_attn_bwd());
 
     // ── GEMMs ──
     results.push_back(bench_gemm_proj(H,   "QKV (H=1024)"));      // 1024×1024
@@ -589,9 +921,15 @@ int main() {
     results.push_back(bench_gemm_bwd(H, H, M, "Wq/Wo grad (H,M)"));   // 1024×1024×32768
     results.push_back(bench_gemm_bwd(H, I, M, "Wgate/Wup grad (I,M)"));// 1024×2752×32768
     results.push_back(bench_gemm_bwd(I, H, M, "Wdown grad (I,M)"));    // 2752×1024×32768
+    results.push_back(bench_gemm_proj_vark(M, H, I, "down (M,I×H)"));  // down: (M×I)@(I×H)
     results.push_back(bench_gemm_proj_trans_b(M, H, H, "grad_input (M,H)")); // 32768×1024×1024
     results.push_back(bench_gemm_proj_trans_b(M, H, I, "grad_ffn_in (M,I)"));// 32768×1024×2752
     results.push_back(bench_gqa_bwd());
+
+    // ── AdamW for different parameter sizes ──
+    results.push_back(bench_adamw_size(H * H, "(H×H=1M)"));      // attn weights
+    results.push_back(bench_adamw_size(H * I, "(H×I=2.8M)"));   // FFN weights
+    results.push_back(bench_adamw_size(V * H, "(V×H=103M)"));   // embedding/output_proj
 
     // ── Layer-level ──
     results.push_back(bench_layer_fwd());
@@ -600,11 +938,7 @@ int main() {
     // ── Overhead ──
     results.push_back(bench_stepcache_overhead());
 
-    // ── Print table ──
-    // Target time per block: what this block needs to achieve for the 24-layer
-    // step to complete in 32.4s.  Derived as: 32.4s = 32400ms total for 24 layers.
-    // budget_ms = 32400 / 24 = 1350ms per-layer budget.
-    // Each block's target is proportional to its current fraction of the total.
+    // ── Print per-block table ──
     double total_fwd_bwd_ms = 0, total_fwd_bwd_target = 1350.0;
     for (auto &r : results) {
         if (r.label.find("one_layer") != std::string::npos || r.label == "stepCache+memcpy overhead")
@@ -625,40 +959,154 @@ int main() {
                             ? 0
                             : r.wall_ms / total_fwd_bwd_ms * total_fwd_bwd_target;
         std::cout << std::left << std::setw(30) << r.label
-                  << std::fixed << std::setprecision(3) << std::setw(14) << r.wall_ms
-                  << std::fixed << std::setprecision(3) << std::setw(14) << target
+                  << std::fixed << std::setprecision(2) << std::setw(14) << r.wall_ms
+                  << std::fixed << std::setprecision(2) << std::setw(14) << target
                   << std::fixed << std::setprecision(1) << std::setw(14) << r.gflops
                   << std::fixed << std::setprecision(1) << std::setw(14) << r.bw_gbs
                   << "\n";
     }
 
-    // ── Projected step time ──
-    std::cout << "\n══════════════════════════════════════════════════════════════\n";
-    std::cout << "  PROJECTED ONE-STEP TIME (24 layers)\n";
-    std::cout << "══════════════════════════════════════════════════════════════\n";
-    // Estimate: per layer cost × 24 + overhead
-    double layer_fwd = 0, layer_bwd = 0;
-    for (auto &r : results) {
-        if (r.label == "one_layer_forward (full)") layer_fwd = r.wall_ms;
-        if (r.label == "one_layer_backward (full)") layer_bwd = r.wall_ms;
-    }
-    double opt_ms = 0;
-    for (auto &r : results) {
-        if (r.label.find("adamw") != std::string::npos) opt_ms = r.wall_ms;
-    }
-    // Count: 1 forward + 1 backward per layer + optimizer for all params
-    // Parameters: embedding V×H + output_proj H×V + n_layers×(7 weight matrices)
-    size_t n_params = V * H + H * V + 24 * (H * I * 3 + H * H + H * nKV * HD * 2 + nH * HD * H);
-    double opt_total = opt_ms * n_params / (H * I); // approximate
+    // ── Bottleneck Ledger ─────────────────────────────────────────────────
+    std::cout << "\n══════════════════════════════════════════════════════════════════════\n";
+    std::cout << "  BOTTLENECK LEDGER — Extrapolated Step Cost (24 layers, 1.6B params)\n";
+    std::cout << "══════════════════════════════════════════════════════════════════════\n";
+    std::cout << std::left << std::setw(30) << "Kernel"
+              << std::right
+              << std::setw(16) << "ms/call"
+              << std::setw(14) << "Calls/step"
+              << std::setw(16) << "Total (ms)"
+              << std::setw(14) << "BW (GB/s)"
+              << "\n";
+    std::cout << std::string(90, '-') << "\n";
 
-    double total_ms = 24 * (layer_fwd + layer_bwd) + opt_total;
-    std::cout << "  Forward per layer:  " << layer_fwd << " ms\n";
-    std::cout << "  Backward per layer: " << layer_bwd << " ms\n";
-    std::cout << "  24-layer fwd:       " << 24 * layer_fwd << " ms\n";
-    std::cout << "  24-layer bwd:       " << 24 * layer_bwd << " ms\n";
-    std::cout << "  Optimizer (approx): " << opt_total << " ms\n";
-    std::cout << "  Total per step:     " << total_ms / 1000.0 << " s\n";
-    std::cout << "  Target:             < 32.4 s\n";
+    // Build ledger entries from measured results
+    auto find_ms = [&](const std::string &prefix) -> double {
+        for (auto &r : results)
+            if (r.label.find(prefix) == 0) return r.wall_ms;
+        return 0;
+    };
+
+    std::vector<LedgerEntry> ledger;
+
+    //embedding
+    ledger.push_back({"embedding_forward", find_ms("embedding_forward"), FREQ_EMBEDDING, 0, 0});
+    // rms_norm fwd (2 per layer)
+    ledger.push_back({"rms_norm_forward", find_ms("rms_norm_forward"), FREQ_RMS_FWD, 0, 0});
+    // rms_norm bwd (2 per layer)
+    ledger.push_back({"rms_norm_backward", find_ms("rms_norm_backward"), FREQ_RMS_BWD, 0, 0});
+    // QKV fwd gemm
+    ledger.push_back({"gemm_proj QKV", find_ms("gemm_proj QKV (H=1024)"), FREQ_QKV_PROJ, 0, 0});
+    // rope forward
+    ledger.push_back({"rope_forward", find_ms("rope_forward"), FREQ_ROPE_FWD, 0, 0});
+    // rope backward
+    ledger.push_back({"rope_backward", find_ms("rope_backward"), FREQ_ROPE_BWD, 0, 0});
+    // gqa_scores (attention fwd — QK^T)
+    ledger.push_back({"gqa_scores", find_ms("gqa_scores"), FREQ_PER_LAYER, 0, 0});
+    // attn_softmax
+    ledger.push_back({"attn_softmax", find_ms("attn_softmax"), FREQ_PER_LAYER, 0, 0});
+    // gemm_gqa (attention output — PV)
+    ledger.push_back({"gemm_gqa (attn_out)", find_ms("gemm_gqa"), FREQ_PER_LAYER, 0, 0});
+    // fused_attn_bwd
+    ledger.push_back({"fused_attn_bwd", find_ms("fused_attn_bwd"), FREQ_ATTN_FUSED_BWD, 0, 0});
+    // gate/up fwd gemm
+    ledger.push_back({"gemm_proj gate/up", find_ms("gemm_proj gate/up (I=2752)"), FREQ_GATE_UP_PROJ, 0, 0});
+    // swiglu forward
+    ledger.push_back({"swiglu_forward", find_ms("swiglu_forward"), FREQ_SWIGLU_FWD, 0, 0});
+    // swiglu backward
+    ledger.push_back({"swiglu_backward", find_ms("swiglu_bwd"), FREQ_SWIGLU_BWD, 0, 0});
+    // down proj fwd gemm
+    ledger.push_back({"gemm_proj down (M,I×H)", find_ms("gemm_proj down (M,I×H)"), FREQ_PER_LAYER, 0, 0});
+    // residual_add (3 per layer)
+    ledger.push_back({"residual_add", find_ms("residual_add (B,S,H)"), FREQ_RESIDUAL_ADD, 0, 0});
+    // backward GEMMs
+    ledger.push_back({"gemm_bwd Wq/Wo", find_ms("gemm_bwd Wq/Wo grad (H,M)"), FREQ_GEMM_BWD_ATTN, 0, 0});
+    ledger.push_back({"gemm_bwd Wgate/Wup", find_ms("gemm_bwd Wgate/Wup grad (I,M)"), FREQ_GEMM_BWD_GATE, 0, 0});
+    ledger.push_back({"gemm_bwd Wdown", find_ms("gemm_bwd Wdown grad (I,M)"), FREQ_GEMM_BWD_DOWN, 0, 0});
+    ledger.push_back({"gemm_projT grad_input", find_ms("gemm_projT grad_input (M,H)"), FREQ_GEMM_PROJT_INPUT, 0, 0});
+    // cross_entropy
+    ledger.push_back({"cross_entropy", find_ms("cross_entropy"), FREQ_CROSS_ENTROPY, 0, 0});
+
+    // Optimizer — weighted by parameter count
+    double adamw_HH = find_ms("adamw_step (H×H=1M)");
+    double adamw_HI = find_ms("adamw_step (H×I=2.8M)");
+    double adamw_VH = find_ms("adamw_step (V×H=103M)");
+    // Count params per size class
+    int n_attn_weights = 24 * 4; // Wq,WkV,Wv,Wo per layer — each H×H
+    int n_ffn_weights  = 24 * 3; // Wgate,Wup,Wdown per layer — each H×I
+    int n_emb_weights = 2;       // embedding + output_proj — each V×H
+    double opt_ms_HH = adamw_HH * n_attn_weights;
+    double opt_ms_HI = adamw_HI * n_ffn_weights;
+    double opt_ms_VH = adamw_VH * n_emb_weights;
+    // Per-size-class BW (GB/s): bytes = 4 params × 4 bytes × n
+    double bw_HH = (H * H * 4.0 * 4) / (adamw_HH * 1e-3) / 1e9;
+    double bw_HI = (H * I * 4.0 * 4) / (adamw_HI * 1e-3) / 1e9;
+    double bw_VH = (V * H * 4.0 * 4) / (adamw_VH * 1e-3) / 1e9;
+    ledger.push_back({"adamw_step (1024×1024,1M)", adamw_HH, n_attn_weights, 0, bw_HH});
+    ledger.push_back({"adamw_step (1024×2752,2.8M)", adamw_HI, n_ffn_weights, 0, bw_HI});
+    ledger.push_back({"adamw_step (100352×1024,103M)", adamw_VH, n_emb_weights, 0, bw_VH});
+
+    // Compute totals and print
+    double ledger_total = 0;
+    for (auto &e : ledger) {
+        e.total_ms = e.ms_per_call * e.calls_per_step;
+        // Use passed-in BW from measurement if available, else compute
+        for (auto &r : results) {
+            if (r.label.find(e.name) == 0 && r.bw_gbs > 0) {
+                e.bw_gbs = r.bw_gbs;
+                break;
+            }
+        }
+    }
+
+    // Sort by total_ms descending
+    std::sort(ledger.begin(), ledger.end(),
+        [](const LedgerEntry &a, const LedgerEntry &b) { return a.total_ms > b.total_ms; });
+
+    for (auto &e : ledger) {
+        ledger_total += e.total_ms;
+        std::cout << std::left << std::setw(30) << e.name
+                  << std::right
+                  << std::fixed << std::setprecision(3) << std::setw(16) << e.ms_per_call
+                  << std::setw(14) << e.calls_per_step
+                  << std::fixed << std::setprecision(1) << std::setw(16) << e.total_ms
+                  << std::fixed << std::setprecision(1) << std::setw(14) << e.bw_gbs
+                  << "\n";
+    }
+    std::cout << std::string(90, '-') << "\n";
+    std::cout << std::left << std::setw(30) << "TOTAL"
+              << std::right
+              << std::setw(16) << ""
+              << std::setw(14) << ""
+              << std::fixed << std::setprecision(1) << std::setw(16) << ledger_total
+              << std::setw(14) << ""
+              << "\n";
+
+    double step_budget = 32400.0; // 32.4s in ms
+    double over_budget = ledger_total - step_budget;
+    double pct_of_budget = ledger_total / step_budget * 100.0;
+    std::cout << "\n  Budget:   " << step_budget / 1000.0 << " s/step\n";
+    std::cout << "  Measured: " << ledger_total / 1000.0 << " s/step  (" << pct_of_budget << "% of budget)\n";
+    if (over_budget > 0) {
+        std::cout << "  OVER by:  " << over_budget / 1000.0 << " s\n";
+    } else {
+        std::cout << "  Under by: " << (-over_budget) / 1000.0 << " s  ✓\n";
+    }
+
+    // ── Top contributors to over-budget ──
+    std::cout << "\n── Top 5 over-budget contributors ──\n";
+    double accounted = 0;
+    int rank = 0;
+    for (auto &e : ledger) {
+        if (rank >= 5) break;
+        double fraction = e.total_ms / ledger_total * 100.0;
+        std::cout << "  " << (rank+1) << ". " << std::left << std::setw(28) << e.name
+                  << std::right << std::setw(8) << std::fixed << std::setprecision(1) << fraction << "%"
+                  << "  (" << e.total_ms/1000.0 << " s)\n";
+        accounted += e.total_ms;
+        rank++;
+    }
+    std::cout << "  Top 5 total: " << accounted / 1000.0 << " s  ("
+              << accounted / ledger_total * 100.0 << "% of total)\n";
     std::cout << "══════════════════════════════════════════════════════════════\n\n";
 
     return 0;

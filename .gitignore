@@ -64,6 +64,8 @@ Thumbs.db
 # *.txt
 *.csv
 # *.json
+*.metallib
+*.gputrace
 
 # Logs
 *.log

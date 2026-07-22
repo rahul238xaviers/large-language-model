@@ -45,7 +45,7 @@ inline float threadgroup_sum(float val, threadgroup float* shared_mem, uint tid)
 }
 
 kernel void cross_entropy(
-    device const float* logits      [[buffer(0)]],
+    device const bfloat* logits     [[buffer(0)]],
     device const uint*  targets     [[buffer(1)]],
     device atomic_float* loss_out   [[buffer(2)]],
     device float*       grad_logits [[buffer(3)]],
@@ -57,7 +57,7 @@ kernel void cross_entropy(
     if (t >= total_tokens) return;
 
     threadgroup float shared_mem[256];
-    device const float* token_logits = logits + t * vocab_size;
+    device const bfloat* token_logits = logits + t * vocab_size;
     device float* token_grads = grad_logits + t * vocab_size;
     uint target_id = targets[t];
 

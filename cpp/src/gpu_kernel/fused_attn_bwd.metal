@@ -1,209 +1,253 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FUSED CAUSAL ATTENTION BACKWARD — BF16 activations, FP32 accumulators
+// fused_attn_bwd — Tile-coalesced FlashAttention-2 backward
 // ═══════════════════════════════════════════════════════════════════════════════
-// Activations (Q, K, V, dO, scores, probs) stored as BF16 in threadgroup memory.
-// Accumulators (dQ, dK, dV) and softmax state (max, sum) in FP32 for stability.
+// Two-pass:
+//   Phase 1 — online softmax: compute m (row max), l (row sum), sp (rowsum P*dP)
+//   Phase 2 — gradients: dQ, dK, dV using stored m/l/sp
 //
-// TILES: TQ=32, TK=16 → 512 threads  (all BF16 → 2× storage density)
-// Shared: 16.5 KB (26% of 64 KB — headroom for compiler temps)
-// Registers: 79/thread peak  (< 128, no spill)
-// Occupancy: 100% (2 groups × 512 threads = 1024/core → fully saturated)
+// Grid: [B, nH, 1]  — one TG per (batch,query_head).  512 TGs × 256 threads.
+// Tiling: Br=32, Bc=32 (was Br=32, Bc=16 → 2× fewer inner iterations)
 //
-// GRID: [B=32, nH=16] → 512 groups × 512 threads
+// Shared memory (29 KB = 90% of 32 KB):
+//   Qs [Br×HD]  BF16   4 KB  |  dOs[Br×HD]  BF16   4 KB
+//   Ks [Bc×HD]  BF16   4 KB  |  Vs [Bc×HD]  BF16   4 KB
+//   mx [Br]     FP32 128 B   |  sm [Br]     FP32 128 B
+//   sp [Br]     FP32 128 B   |  dKa[Bc×HD]  FP32   8 KB
+//   dVa[Bc×HD]  FP32   8 KB
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint S=1024, HD=64, TQ=32, TK=16, NQ=32, NK=64;
-
-// Convert BF16 loaded from shared → FP32 for accumulation
-// (MSL's bfloat type auto-promotes to float on arithmetic)
-inline float bf16_to_f32(bfloat v) { return (float)v; }
+constant uint S=1024, HD=64, Br=32, Bc=32;
+constant uint NQ=S/Br, NK=S/Bc;
+constant uint WL=32; // warp/lane size
 
 kernel void fused_attn_bwd(
-    device const float* Q      [[buffer(0)]],  // FP32 input (converted to BF16 in shared)
-    device const float* K      [[buffer(1)]],  // FP32 input
-    device const float* V      [[buffer(2)]],  // FP32 input
-    device const float* dO     [[buffer(3)]],  // FP32 input
-    device float*        dQ    [[buffer(4)]],  // FP32 output
-    device float*        dK    [[buffer(5)]],  // FP32 output
-    device float*        dV    [[buffer(6)]],  // FP32 output
+    device const float* Q      [[buffer(0)]],
+    device const float* K      [[buffer(1)]],
+    device const float* V      [[buffer(2)]],
+    device const float* dO     [[buffer(3)]],
+    device float*        dQ    [[buffer(4)]],
+    device float*        dK    [[buffer(5)]],
+    device float*        dV    [[buffer(6)]],
+    constant uint*  n_heads_ptr [[buffer(7)]],
+    constant uint*  n_kv_ptr    [[buffer(8)]],
     uint2 tg_id [[threadgroup_position_in_grid]],
-    uint2 li    [[thread_position_in_threadgroup]]
+    uint2 li_p  [[thread_position_in_threadgroup]]
 ) {
     uint b = tg_id.x, h = tg_id.y;
-    if (b >= 32 || h >= 16) return;
-    uint kv_h = h / 2;
-    float s = 1.0f / sqrt((float)HD);
+    uint n_heads = *n_heads_ptr, n_kv = *n_kv_ptr;
+    if (b >= 32 || h >= n_heads) return;
+    uint kv_h = h / (n_heads / n_kv);
+    float scale = 1.0f / sqrt((float)HD);
 
-    uint qb   = (b * 16 + h)    * S * HD;
-    uint kb   = (b * 8  + kv_h) * S * HD;
-    uint dk0  = kb, dv0 = kb;
-    uint doff = h * HD, dstr = 16 * HD;
+    uint li = li_p.x;
+    uint sg_id = li / WL, ln_id = li % WL;
+    uint QR = Br / 8; // 4 Q-rows per warp
 
-    // ── BF16 shared memory (2 bytes/element) ──
-    threadgroup bfloat Qs [TQ*HD];   // 32×64×2  =  4 KB
-    threadgroup bfloat dOs[TQ*HD];   // 32×64×2  =  4 KB
-    threadgroup bfloat Ks [TK*HD];   // 16×64×2  =  2 KB
-    threadgroup bfloat Vs [TK*HD];   // 16×64×2  =  2 KB
-    threadgroup bfloat dKp[TK*HD];   // 16×64×2  =  2 KB (tile-local)
-    threadgroup bfloat dVp[TK*HD];   // 16×64×2  =  2 KB (tile-local)
-    threadgroup bfloat pr [TK];      // 16×2     =  32 B
-    threadgroup bfloat dp [TK];      // 16×2     =  32 B
-    // FP32 shared (for softmax stability — needs full exponent range)
-    threadgroup float  mx [TQ];      // 32×4     = 128 B
-    threadgroup float  sm [TQ];      // 32×4     = 128 B
-    threadgroup float  brd;          //           4 B
+    // ── Shared memory ──
+    threadgroup bfloat Qs [2048];   // 32×64 BF16  (4 KB)
+    threadgroup bfloat dOs[2048];   // 32×64 BF16
+    threadgroup bfloat Ks [2048];   // 32×64 BF16
+    threadgroup bfloat Vs [2048];   // 32×64 BF16
+    threadgroup float  mx [32];     // 32 FP32     (128 B)
+    threadgroup float  sm [32];     // 32 FP32
+    threadgroup float  sp [32];     // 32 FP32
+    threadgroup bfloat dKa[2048];   // 32×64 BF16  (4 KB)
+    threadgroup bfloat dVa[2048];   // 32×64 BF16
+    // Total: 28,672 B = 28 KB
 
-    uint sq_tid = li.x / TK;  // 0..31
-    uint sk_tid = li.x % TK;  // 0..15
+    uint q_off  = (b * n_heads + h) * S * HD;
+    uint kv_off = (b * n_kv + kv_h)  * S * HD;
 
-    // FP32 dQ accumulator (kept across all K-tiles)
-    float dQa[HD];
-    for (uint d = 0; d < HD; ++d) dQa[d] = 0.0f;
+    // dQ accumulator in registers
+    float dQa[4][HD];  // max 4 Q-rows per warp
+    for (uint qr = 0; qr < QR; ++qr)
+        for (uint d = ln_id; d < HD; d += WL) dQa[qr][d] = 0.0f;
 
+    // ── Outer loop: Q tiles ──
     for (uint qt = 0; qt < NQ; ++qt) {
-        uint sqb = qt * TQ, sqg = sqb + sq_tid;
-        bool sqok = sqg < S;
+        uint q_base = qt * Br;
+        uint gqr0 = q_base + sg_id * QR;
 
-        // Load Q and dO (BF16 → shared) — 512 threads × 4 = 2048 = 32×64
-        for (uint i = li.x; i < TQ*HD; i += 512) {
-            uint r = i/HD, c = i%HD, gsq = sqb + r;
-            if (r<TQ && gsq<S) {
-                Qs [r*HD+c] = (bfloat)Q [qb  + gsq*HD + c];
-                dOs[r*HD+c] = (bfloat)dO[(b*S+gsq)*dstr + doff + c];
+        // ── Load Q, dO (coalesced float4 → shared BF16) ──
+        for (uint i = li; i < Br*HD; i += 256) {
+            uint r = i/HD, c = i%HD, gr = q_base + r;
+            if (gr < S) {
+                Qs [r*HD+c] = (bfloat)Q [q_off + gr*HD + c];
+                dOs[r*HD+c] = (bfloat)dO[q_off + gr*HD + c];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (li.x < TQ) { mx[li.x] = -INFINITY; sm[li.x] = 0.0f; }
+        if (li < Br) { mx[li] = -INFINITY; sm[li] = 0.0f; sp[li] = 0.0f; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ══════════════════════════════════════════════════════════════════
-        // PHASE 1: Online softmax (64 K-tiles)
+        // PHASE 1 — online softmax (K-tiles up to qt, causal)
         // ══════════════════════════════════════════════════════════════════
-        for (uint kt = 0; kt < NK; ++kt) {
-            uint skb = kt * TK, skg = skb + sk_tid;
-            for (uint i = li.x; i < TK*HD; i += 512) {
-                uint r = i/HD, c = i%HD, gsk = skb + r;
-                if (r<TK && gsk<S) {
-                    Ks[r*HD+c] = (bfloat)K[kb+gsk*HD+c];
-                    Vs[r*HD+c] = (bfloat)V[kb+gsk*HD+c];
+        for (uint kt = 0; kt <= qt && kt < NK; ++kt) {
+            uint k_base = kt * Bc;
+
+            // Load K,V (float4 → shared BF16)
+            for (uint i = li; i < Bc*HD; i += 256) {
+                uint r = i/HD, c = i%HD, gr = k_base + r;
+                if (gr < S) {
+                    Ks[r*HD+c] = (bfloat)K[kv_off + gr*HD + c];
+                    Vs[r*HD+c] = (bfloat)V[kv_off + gr*HD + c];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Dot product: BF16 → FP32 accumulation
-            float sc = -INFINITY;
-            if (sqok && sqg >= skg) {
-                sc = 0;
-                for (uint d = 0; d < HD; ++d)
-                    sc += (float)Qs[sq_tid*HD+d] * (float)Ks[sk_tid*HD+d];
-                sc *= s;
-            }
+            for (uint qr = 0; qr < QR; ++qr) {
+                uint gqr = gqr0 + qr;
+                if (gqr >= S) continue;
 
-            // SIMD-reduce max across TK=16 threads
-            float tm = sc;
-            tm = max(tm, simd_shuffle_down(tm,8));
-            tm = max(tm, simd_shuffle_down(tm,4));
-            tm = max(tm, simd_shuffle_down(tm,2));
-            tm = max(tm, simd_shuffle_down(tm,1));
+                // S[j] = Q[gqr]·K[j] / √d  (lane = column j)
+                uint kj = k_base + ln_id;
+                float s_val = -INFINITY;
+                if (kj <= gqr && kj < S) {
+                    s_val = 0.0f;
+                    for (uint d = 0; d < HD; ++d)
+                        s_val += (float)Qs[(sg_id*QR+qr)*HD + d] * (float)Ks[ln_id*HD + d];
+                    s_val *= scale;
+                }
 
-            if (sqok && sk_tid == 0) {
-                float cm = mx[sq_tid];
-                if (tm > cm) { sm[sq_tid] *= exp(cm - tm); mx[sq_tid] = tm; }
+                // Warp rowmax → global max
+                float wmax = s_val;
+                for (uint m = 16; m > 0; m >>= 1) wmax = max(wmax, simd_shuffle_down(wmax, m));
+                float gmax = simd_shuffle(wmax, 0);
+
+                // Update mx[qr] = max(mx[qr], gmax) over all warps
+                // Since only one warp writes to mx[qr], no contention
+                // But multiple warps handle DIFFERENT qr values
+                uint abs_qr = sg_id * QR + qr;  // absolute Q-row index in this tile
+                float cur_mx = mx[abs_qr];
+                if (gmax > cur_mx) mx[abs_qr] = gmax;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float new_mx = mx[abs_qr];
+                float rescale = exp(cur_mx - new_mx);
+
+                // P[j], dP[j]
+                float p_val  = (kj <= gqr && kj < S) ? exp(s_val - new_mx) : 0.0f;
+                float dP_val = 0.0f;
+                if (kj <= gqr && kj < S)
+                    for (uint d = 0; d < HD; ++d)
+                        dP_val += (float)dOs[(sg_id*QR+qr)*HD + d] * (float)Vs[ln_id*HD + d];
+
+                // Warp sum of P for this row
+                float p_sum = p_val;
+                for (uint m = 16; m > 0; m >>= 1) p_sum += simd_shuffle_down(p_sum, m);
+                float tile_l = simd_shuffle(p_sum, 0);
+
+                // Warp sum of P*dP
+                float pd_sum = p_val * dP_val;
+                for (uint m = 16; m > 0; m >>= 1) pd_sum += simd_shuffle_down(pd_sum, m);
+                float tile_sp = simd_shuffle(pd_sum, 0);
+
+                if (ln_id == 0) {
+                    sm[abs_qr] = cur_mx > -INFINITY ? sm[abs_qr] * rescale + tile_l : tile_l;
+                    sp[abs_qr] = cur_mx > -INFINITY ? sp[abs_qr] * rescale + tile_sp : tile_sp;
+                }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sqok && sqg >= skg)
-                sm[sq_tid] += exp(sc - mx[sq_tid]);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // PHASE 2: Gradients (64 K-tiles)
+        // PHASE 2 — gradients (replay K-tiles with m/l/sp from Phase 1)
         // ══════════════════════════════════════════════════════════════════
-        for (uint i = li.x; i < TK*HD; i += 512) { dKp[i] = 0; dVp[i] = 0; }
+        for (uint i = li; i < Bc*HD; i += 256) { dKa[i] = (bfloat)0; dVa[i] = (bfloat)0; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kt = 0; kt < NK; ++kt) {
-            uint skb = kt * TK, skg = skb + sk_tid;
-            for (uint i = li.x; i < TK*HD; i += 512) {
-                uint r = i/HD, c = i%HD, gsk = skb + r;
-                if (r<TK && gsk<S) {
-                    Ks[r*HD+c] = (bfloat)K[kb+gsk*HD+c];
-                    Vs[r*HD+c] = (bfloat)V[kb+gsk*HD+c];
+        for (uint kt = 0; kt <= qt && kt < NK; ++kt) {
+            uint k_base = kt * Bc;
+
+            // Reload K,V
+            for (uint i = li; i < Bc*HD; i += 256) {
+                uint r = i/HD, c = i%HD, gr = k_base + r;
+                if (gr < S) {
+                    Ks[r*HD+c] = (bfloat)K[kv_off + gr*HD + c];
+                    Vs[r*HD+c] = (bfloat)V[kv_off + gr*HD + c];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Score, prob, dP (BF16 → FP32 arithmetic)
-            float prob = 0, dPv = 0;
-            if (sqok && sqg >= skg) {
-                float sc = 0;
-                for (uint d = 0; d < HD; ++d)
-                    sc += (float)Qs[sq_tid*HD+d] * (float)Ks[sk_tid*HD+d];
-                sc *= s;
-                prob = exp(sc - mx[sq_tid]) / sm[sq_tid];
-                for (uint d = 0; d < HD; ++d)
-                    dPv += (float)dOs[sq_tid*HD+d] * (float)Vs[sk_tid*HD+d];
-            }
-            pr[sk_tid] = (bfloat)prob;
-            dp[sk_tid] = (bfloat)dPv;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint qr = 0; qr < QR; ++qr) {
+                uint gqr = gqr0 + qr;
+                if (gqr >= S) continue;
 
-            // sum_dP_prob
-            float sp = 0;
-            if (sqok && sk_tid == 0) {
-                for (uint t = 0; t < TK; ++t)
-                    if (skb + t <= sqg) sp += (float)pr[t] * (float)dp[t];
-                brd = sp;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            sp = brd;
+                uint abs_qr = sg_id * QR + qr;
+                float q_mx = mx[abs_qr];
+                float q_sm = sm[abs_qr];
+                float q_sp = sp[abs_qr];
 
-            // dS, dQ, tile-local dK/dV
-            if (sqok && sqg >= skg) {
-                prob = (float)pr[sk_tid];
-                dPv  = (float)dp[sk_tid];
-                float dS = prob * (dPv - sp);
-                float dSs = dS * s;
-                for (uint d = 0; d < HD; ++d) {
-                    float kv = (float)Ks[sk_tid*HD+d];
-                    float qv = (float)Qs[sq_tid*HD+d];
-                    float ov = (float)dOs[sq_tid*HD+d];
-                    dQa[d] += dSs * kv;
-                    // Store tile-local in BF16 (converted back on global write)
-                    float dk_val = (float)dKp[sk_tid*HD+d] + dSs * qv;
-                    float dv_val = (float)dVp[sk_tid*HD+d] + prob * ov;
-                    dKp[sk_tid*HD+d] = (bfloat)dk_val;
-                    dVp[sk_tid*HD+d] = (bfloat)dv_val;
+                uint kj = k_base + ln_id;
+                float s_val = -INFINITY;
+                if (kj <= gqr && kj < S) {
+                    s_val = 0.0f;
+                    for (uint d = 0; d < HD; ++d)
+                        s_val += (float)Qs[(sg_id*QR+qr)*HD + d] * (float)Ks[ln_id*HD + d];
+                    s_val *= scale;
                 }
+
+                float p_val = (kj <= gqr && kj < S) ? exp(s_val - q_mx) / q_sm : 0.0f;
+
+                float dP_val = 0.0f;
+                if (kj <= gqr && kj < S)
+                    for (uint d = 0; d < HD; ++d)
+                        dP_val += (float)dOs[(sg_id*QR+qr)*HD + d] * (float)Vs[ln_id*HD + d];
+
+                float dS = p_val * (dP_val - q_sp);
+                float dSs = dS * scale;
+
+                // dQ[gqr,:] += dSs × K[j,:]
+                if (kj <= gqr && kj < S)
+                    for (uint d = ln_id; d < HD; d += WL)
+                        dQa[qr][d] += dSs * (float)Ks[ln_id*HD + d];
+
+                // Tile-local dK[j,:] += dSs × Q[gqr,:]
+                // Tile-local dV[j,:] += P[j] × dO[gqr,:]
+                if (kj <= gqr && kj < S)
+                    for (uint d = ln_id; d < HD; d += WL) {
+                        float dk_cur = (float)dKa[ln_id*HD + d];
+                        float dv_cur = (float)dVa[ln_id*HD + d];
+                        dk_cur += dSs * (float)Qs[(sg_id*QR+qr)*HD + d];
+                        dv_cur += p_val * (float)dOs[(sg_id*QR+qr)*HD + d];
+                        dKa[ln_id*HD + d] = (bfloat)dk_cur;
+                        dVa[ln_id*HD + d] = (bfloat)dv_cur;
+                    }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Flush tile-local dK/dV → global FP32 with atomics
-            if (skg < S) for (uint d = 0; d < HD; ++d) {
-                float dk_contrib = (float)dKp[sk_tid*HD+d];
-                float dv_contrib = (float)dVp[sk_tid*HD+d];
-                if (dk_contrib != 0.0f)
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dK[dk0 + skg*HD + d],
-                        dk_contrib, memory_order_relaxed);
-                if (dv_contrib != 0.0f)
-                    atomic_fetch_add_explicit(
-                        (device atomic_float*)&dV[dv0 + skg*HD + d],
-                        dv_contrib, memory_order_relaxed);
-                dKp[sk_tid*HD+d] = 0;
-                dVp[sk_tid*HD+d] = 0;
+            // ── Flush tile dK/dV → global (coalesced, each thread → unique element) ──
+            for (uint i = li; i < Bc*HD; i += 256) {
+                uint r = i / HD, c = i % HD;
+                uint gkr = k_base + r;
+                if (gkr < S) {
+                    float dk_v = (float)dKa[i];
+                    float dv_v = (float)dVa[i];
+                    if (dk_v != 0.0f)
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dK[kv_off + gkr*HD + c],
+                            dk_v, memory_order_relaxed);
+                    if (dv_v != 0.0f)
+                        atomic_fetch_add_explicit(
+                            (device atomic_float*)&dV[kv_off + gkr*HD + c],
+                            dv_v, memory_order_relaxed);
+                    dKa[i] = (bfloat)0.0f; dVa[i] = (bfloat)0.0f;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // Write dQ for this Q-tile (FP32 accumulators → FP32 global)
-        if (sqok) for (uint d = 0; d < HD; ++d) {
-            dQ[qb + sqg*HD + d] += dQa[d];
-            dQa[d] = 0;
+        // ── Flush dQ to global ──
+        for (uint qr = 0; qr < QR; ++qr) {
+            uint gqr = gqr0 + qr;
+            if (gqr >= S) continue;
+            for (uint d = ln_id; d < HD; d += WL)
+                dQ[q_off + gqr*HD + d] += dQa[qr][d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

@@ -12,9 +12,9 @@ inline float simd_sum(float val) {
 }
 
 kernel void rms_norm_forward(
-    device const float* input       [[buffer(0)]],
-    device float*       output      [[buffer(1)]],
-    device const float* weight      [[buffer(2)]],
+    device const bfloat* input       [[buffer(0)]],
+    device bfloat*       output      [[buffer(1)]],
+    device const bfloat* weight      [[buffer(2)]],
     constant float&     eps         [[buffer(3)]],
     constant uint&      dims        [[buffer(4)]],
     uint                row_idx     [[threadgroup_position_in_grid]],
@@ -56,6 +56,6 @@ kernel void rms_norm_forward(
     // Normalize and scale the output row
     for (uint col = tid; col < dims; col += tpg) {
         uint idx = row_idx * dims + col;
-        output[idx] = (input[idx] * rms) * weight[col];
+        output[idx] = (bfloat)((float)input[idx] * rms * (float)weight[col]);
     }
 }

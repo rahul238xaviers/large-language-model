@@ -103,8 +103,10 @@ int main() {
     Tensor C_cpu = A.matmul(B);
 
     set_gpu_enabled(true);
+    metal_bridge::begin_scope();
     Tensor C_gpu = A.matmul(B);
-    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), C_gpu.data().data(), C_cpu.size());
+    metal_bridge::end_scope();
+    float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data(), C_cpu.size());
 
     bool pass = (l2_error < 1e-4f);
     if (pass)
@@ -140,9 +142,11 @@ int main() {
 
     set_gpu_enabled(true);
     metal_bridge::initialize();
+    metal_bridge::begin_scope();
     metal_bridge::gemm_ffn(dataA.data(), dataB_gate.data(), dataB_up.data(), dataC_gpu.data(), M, N, K);
+    metal_bridge::end_scope();
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), dataC_gpu.data(), C_cpu.size());
+    float l2_error = calculate_l2_relative_error(C_cpu.data(), dataC_gpu.data(), C_cpu.size());
     bool pass = (l2_error < 1e-4f);
     if (pass)
       passed_checks++;
@@ -164,7 +168,9 @@ int main() {
     Tensor C_cpu = A.matmul(B);
 
     set_gpu_enabled(true);
+    metal_bridge::begin_scope();
     Tensor C_gpu = A.matmul(B);
+    metal_bridge::end_scope();
 
     float max_diff = 0.0f;
     for (size_t i = 0; i < C_gpu.size(); ++i) {
@@ -200,10 +206,12 @@ int main() {
     set_gpu_enabled(false);
     Tensor C_cpu = A.matmul(B);
 
-    set_gpu_enabled(true); // Should fallback internally to CPU
+    set_gpu_enabled(true);
+    metal_bridge::begin_scope();
     Tensor C_gpu = A.matmul(B);
+    metal_bridge::end_scope();
 
-    float l2_error = calculate_l2_relative_error(C_cpu.data().data(), C_gpu.data().data(), C_cpu.size());
+    float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data(), C_cpu.size());
     bool pass =
         (l2_error == 0.0f); // Fallback to CPU must yield identical results
     if (pass)
@@ -246,12 +254,12 @@ int main() {
     Tensor out_cpu = attn.forward(x, rope);
 
     set_gpu_enabled(true);
-    // The reshape_to_4d, reshape_to_3d, and rope_forward GPU paths are tested
-    // separately within the attention layer. Clear stepCache for clean state.
     metal_bridge::reconcile_buffers();
+    metal_bridge::begin_scope();
     Tensor out_gpu = attn.forward(x, rope);
+    metal_bridge::end_scope();
     
-    float l2_error = calculate_l2_relative_error(out_cpu.data().data(), out_gpu.data().data(), out_cpu.size());
+    float l2_error = calculate_l2_relative_error(out_cpu.data(), out_gpu.data(), out_cpu.size());
     // Threshold: GPU uses online softmax (single-pass), CPU uses two-pass.
     // With AMX GEMMs now matching on both paths, the 0.2 L2 reflects only
     // the GQA softmax + reshape + RoPE implementation differences — this is

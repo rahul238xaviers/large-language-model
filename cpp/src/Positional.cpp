@@ -112,7 +112,7 @@ void RoPE::forward(Tensor &q, Tensor &k) const {
     size_t seq_len = q.shape()[2];
     size_t head_dim = q.shape()[3];
 
-    metal_bridge::rope_forward(q.data().data(), k.data().data(),
+    metal_bridge::rope_forward(q.data(), k.data(),
                                 cos_table_.data(), sin_table_.data(),
                                 batch, q_heads, k_heads, seq_len, head_dim);
     return;
@@ -193,10 +193,10 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
     size_t seq_len = grad_q.shape()[2];
     size_t head_dim = grad_q.shape()[3];
 
-    metal_bridge::rope_backward(grad_q.data().data(), cos_table_.data(),
+    metal_bridge::rope_backward(grad_q.data(), cos_table_.data(),
                                 sin_table_.data(), batch, q_heads, seq_len,
                                 head_dim);
-    metal_bridge::rope_backward(grad_k.data().data(), cos_table_.data(),
+    metal_bridge::rope_backward(grad_k.data(), cos_table_.data(),
                                 sin_table_.data(), batch, k_heads, seq_len,
                                 head_dim);
     return;
