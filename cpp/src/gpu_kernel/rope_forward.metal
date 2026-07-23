@@ -2,8 +2,8 @@
 using namespace metal;
 
 kernel void rope_forward(
-    device float*       q         [[buffer(0)]],
-    device float*       k         [[buffer(1)]],
+    device bfloat*       q         [[buffer(0)]],
+    device bfloat*       k         [[buffer(1)]],
     device const float* cos_table [[buffer(2)]],
     device const float* sin_table [[buffer(3)]],
     constant uint&      batch     [[buffer(4)]],
@@ -36,8 +36,8 @@ kernel void rope_forward(
 
         float x0 = q[base + idx0];
         float x1 = q[base + idx1];
-        q[base + idx0] = x0 * cos_val - x1 * sin_val;
-        q[base + idx1] = x0 * sin_val + x1 * cos_val;
+        q[base + idx0] = (bfloat)(x0 * cos_val - x1 * sin_val);
+        q[base + idx1] = (bfloat)(x0 * sin_val + x1 * cos_val);
     } else {
         uint gid_k = gid - total_q;
         uint tmp = gid_k;
@@ -55,7 +55,7 @@ kernel void rope_forward(
 
         float x0 = k[base + idx0];
         float x1 = k[base + idx1];
-        k[base + idx0] = x0 * cos_val - x1 * sin_val;
-        k[base + idx1] = x0 * sin_val + x1 * cos_val;
+        k[base + idx0] = (bfloat)(x0 * cos_val - x1 * sin_val);
+        k[base + idx1] = (bfloat)(x0 * sin_val + x1 * cos_val);
     }
 }

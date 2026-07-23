@@ -115,71 +115,17 @@ static void adamw_update_parameter(
     }
   }
 
-  if (use_gpu) {
-    metal_bridge::AdamWStepParams p;
-    p.lr = lr;
-    p.beta1 = beta1;
-    p.beta2 = beta2;
-    p.eps = eps;
-    p.weight_decay = weight_decay;
-    p.bias_correction1 = bias_correction1;
-    p.bias_correction2 = bias_correction2;
-    p.n = static_cast<uint32_t>(n);
+  metal_bridge::AdamWStepParams p;
+  p.lr = lr;
+  p.beta1 = beta1;
+  p.beta2 = beta2;
+  p.eps = eps;
+  p.weight_decay = weight_decay;
+  p.bias_correction1 = bias_correction1;
+  p.bias_correction2 = bias_correction2;
+  p.n = static_cast<uint32_t>(n);
 
-    metal_bridge::adamw_step(p_data, g_data, m_data, v_data, p);
-    return;
-  }
-
-  unsigned int num_threads = std::thread::hardware_concurrency();
-  if (num_threads == 0) num_threads = 4;
-
-  // For very small parameters, don't spawn threads to avoid overhead
-  if (n < 65536) {
-    for (size_t j = 0; j < n; ++j) {
-      float g = g_data[j];
-      m_data[j] = beta1 * m_data[j] + (1.0f - beta1) * g;
-      v_data[j] = beta2 * v_data[j] + (1.0f - beta2) * g * g;
-
-      if (weight_decay > 0.0f) {
-        p_data[j] -= lr * weight_decay * p_data[j];
-      }
-
-      float m_hat = m_data[j] / bias_correction1;
-      float v_hat = v_data[j] / bias_correction2;
-      p_data[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
-    }
-    return;
-  }
-
-  std::vector<std::thread> workers;
-  size_t items_per_thread = (n + num_threads - 1) / num_threads;
-
-  for (unsigned int t = 0; t < num_threads; ++t) {
-    size_t start_idx = t * items_per_thread;
-    size_t end_idx = std::min(start_idx + items_per_thread, n);
-
-    if (start_idx >= end_idx) continue;
-
-    workers.emplace_back([=]() {
-      for (size_t j = start_idx; j < end_idx; ++j) {
-        float g = g_data[j];
-        m_data[j] = beta1 * m_data[j] + (1.0f - beta1) * g;
-        v_data[j] = beta2 * v_data[j] + (1.0f - beta2) * g * g;
-
-        if (weight_decay > 0.0f) {
-          p_data[j] -= lr * weight_decay * p_data[j];
-        }
-
-        float m_hat = m_data[j] / bias_correction1;
-        float v_hat = v_data[j] / bias_correction2;
-        p_data[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
-      }
-    });
-  }
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
+  metal_bridge::adamw_step(p_data, g_data, m_data, v_data, p);
 }
 
 /**

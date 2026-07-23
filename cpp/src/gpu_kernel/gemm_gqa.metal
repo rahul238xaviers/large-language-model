@@ -1,39 +1,7 @@
 // ==============================================================================
-// TECHNICAL SPECIFICATION & ARCHITECTURAL REFERENCE: GROUPED QUERY ATTENTION (GQA)
-// ==============================================================================
-//
-// 1. WHAT IS GQA?
-//    Grouped Query Attention (GQA) is an optimization that reduces memory bandwidth
-//    overhead during LLM generation. Instead of having equal numbers of Query, Key,
-//    and Value heads, multiple Query heads share a single Key and Value head.
-//
-// 2. DATA FLOW & ALGORITHMIC STEPS:
-//    For each Query vector Q[b, s_q, h]:
-//    - Step A (Dot Product): Multiply Q by all Keys K[b, s_k, h_kv] to get scores.
-//      `score[s_k] = sum(Q[d] * K[d])` for d in 0..head_dim-1, and s_k in 0..s_q.
-//    - Step B (Softmax): Convert scores into probabilities:
-//      `softmax_score[s_k] = exp(score[s_k] - max_score) / sum(exp(score - max_score))`
-//    - Step C (Weighted Sum): Multiply probabilities by Values V[b, s_k, h_kv]:
-//      `out[b, s_q, h, d] = sum(softmax_score[s_k] * V[d])` for s_k in 0..s_q.
-//
-// 3. TENSOR SHAPES & LAYOUTS:
-//    - Q (Query):    [batch, seq_len, n_q_heads,  head_dim]
-//    - K (Key):      [batch, seq_len, n_kv_heads, head_dim]
-//    - V (Value):    [batch, seq_len, n_kv_heads, head_dim]
-//    - out (Output): [batch, seq_len, n_q_heads,  head_dim]
-//
-// 4. THREAD GRID MAPPING:
-//    We launch a 3D grid of threads where each thread is responsible for computing
-//    the output vector of size `head_dim` for a single query head.
-//    - X-axis (thread_position_in_grid.x) -> Batch index `b` (0 .. batch-1)
-//    - Y-axis (thread_position_in_grid.y) -> Query Token index `s_q` (0 .. seq_len-1)
-//    - Z-axis (thread_position_in_grid.z) -> Query Head index `h` (0 .. n_q_heads-1)
-//
+// Grouped Query Attention (GQA) Fused Tiled Forward Kernel
 // ==============================================================================
 
-//Defined the max sequence length in case, it is not set at the build stage
-//This will cause a compile error if not set at the build stage, which is the desired be    havior
-//as it will force the user to set the max sequence length at the build stage
 #ifndef MAX_SEQ_LEN
 #define MAX_SEQ_LEN 2048
 #endif
@@ -49,85 +17,144 @@ struct GQAParams {
   uint head_dim;
 };
 
-
 kernel void gemm_gqa(
-    device const float* Q    [[buffer(0)]],
-    device const float* K    [[buffer(1)]],
-    device const float* V    [[buffer(2)]],
-    device float*       out  [[buffer(3)]],
-    constant GQAParams& gqa  [[buffer(4)]],
-    uint3 tg_id   [[thread_position_in_grid]]
+    device const bfloat* Q      [[buffer(0)]],
+    device const bfloat* K      [[buffer(1)]],
+    device const bfloat* V      [[buffer(2)]],
+    device bfloat*       out    [[buffer(3)]],
+    device float*        L_out  [[buffer(4)]],
+    constant GQAParams&  gqa    [[buffer(5)]],
+    uint3                tg_id  [[threadgroup_position_in_grid]],
+    uint3                ti     [[thread_position_in_threadgroup]]
 ) {
-    // We pass this as 3-D grid because we wanted to process Q, K and V as 3-D arrays
-    // The b is for the batch dimension, s_q is the sequence length, h is the query head index
-    // The size of the grid is [gqa.batch, gqa.seq_len, gqa.n_q_heads]   
-    uint b = tg_id.x;
-    uint s_q = tg_id.y;
+    uint li = ti.x;
+    // Threadgroup mapping:
+    // - tg_id.x -> Sequence block index (each block computes 32 query tokens)
+    // - tg_id.y -> Batch index
+    // - tg_id.z -> Query head index
+    uint block_y = tg_id.x;
+    uint b = tg_id.y;
     uint h = tg_id.z;
+
+    uint s_q = block_y * 32 + li;
 
     uint group_size = gqa.n_q_heads / gqa.n_kv_heads;
     uint h_kv = h / group_size;
 
-    device const float* q_ptr = Q + (b * gqa.n_q_heads * gqa.seq_len + h * gqa.seq_len + s_q) * gqa.head_dim;
-    device float* out_ptr =  out + (b * gqa.seq_len * gqa.n_q_heads + s_q * gqa.n_q_heads + h) * gqa.head_dim;
-  
-    // the shape of K and V is [B, H_KV, S, D] and indices are batch = b, token index = 0, key head index = h_kv
-    uint kv_common_factor = (b * gqa.n_kv_heads * gqa.seq_len + h_kv * gqa.seq_len) * gqa.head_dim;
-    device const float* k_base = K + kv_common_factor;
-    device const float* v_base = V + kv_common_factor;
-
     float scale = 1.0f / sqrt((float)gqa.head_dim);
 
-    // Initialize online softmax with s_k = 0
-    device const float* k_ptr_0 = k_base;
-    float sum_0 = 0.0f;
-    for (uint d = 0; d < gqa.head_dim; d++) {
-        sum_0 += q_ptr[d] * k_ptr_0[d];
-    }
-    float max_val = sum_0 * scale;
-    float sum_exp = 1.0f;
+    // Q pointer for this thread's token
+    device const bfloat* q_ptr = Q + (b * gqa.n_q_heads * gqa.seq_len + h * gqa.seq_len + s_q) * gqa.head_dim;
 
-    device const float* v_ptr_0 = v_base;
-    float accum_val[128];
-    for (uint d = 0; d < gqa.head_dim; d++) {
-        accum_val[d] = v_ptr_0[d];
-    }
-
-    // Process remaining keys s_k from 1 to s_q
-    for (uint s_k = 1; s_k <= s_q; s_k++) {
-        device const float* k_ptr = k_base + s_k * gqa.head_dim;
-
-        // 1. Compute dot product Q * K
-        float sum = 0.0f;
-        for (uint d = 0; d < gqa.head_dim; d++) {
-            sum += q_ptr[d] * k_ptr[d];
+    // Cache Q in thread registers (enforce zero-spill constraint for HD=64)
+    float thread_q[64];
+    if (s_q < gqa.seq_len) {
+        for (uint d = 0; d < 64; d += 4) {
+            bfloat4 q_val = *((device const bfloat4*)(q_ptr + d));
+            thread_q[d + 0] = (float)q_val[0];
+            thread_q[d + 1] = (float)q_val[1];
+            thread_q[d + 2] = (float)q_val[2];
+            thread_q[d + 3] = (float)q_val[3];
         }
-        float score = sum * scale;
+    }
 
-        // 2. Online softmax update
-        float m_old = max_val;
-        if (score > max_val) {
-            max_val = score;
-            float exp_scale = exp(m_old - max_val);
-            sum_exp = sum_exp * exp_scale + 1.0f;
+    // Allocate threadgroup shared memory for K and V tiles
+    // Tile size = 32 sequence tokens * 64 head_dim
+    threadgroup float shared_K[32 * 64];
+    threadgroup float shared_V[32 * 64];
 
-            device const float* v_ptr = v_base + s_k * gqa.head_dim;
-            for (uint d = 0; d < gqa.head_dim; d++) {
-                accum_val[d] = accum_val[d] * exp_scale + v_ptr[d];
+    // Base pointers for K and V heads
+    uint kv_common_factor = (b * gqa.n_kv_heads * gqa.seq_len + h_kv * gqa.seq_len) * gqa.head_dim;
+    device const bfloat* k_base = K + kv_common_factor;
+    device const bfloat* v_base = V + kv_common_factor;
+
+    // Initialize online softmax
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    float accum_val[64];
+    for (uint d = 0; d < 64; d++) {
+        accum_val[d] = 0.0f;
+    }
+
+    // The maximum active sequence token processed in this threadgroup
+    uint seq_len_limit = min((block_y + 1) * 32 - 1, gqa.seq_len - 1);
+
+    // Loop through keys/values in blocks of 32
+    for (uint tile_k = 0; tile_k <= seq_len_limit / 32; tile_k++) {
+        uint s_k_base = tile_k * 32;
+        uint global_s_k = s_k_base + li;
+
+        // Cooperatively load a tile of K and V into shared memory using vectorized float4 reads
+        if (global_s_k < gqa.seq_len) {
+            device const bfloat* k_ptr = k_base + global_s_k * gqa.head_dim;
+            device const bfloat* v_ptr = v_base + global_s_k * gqa.head_dim;
+            for (uint d = 0; d < 64; d += 4) {
+                bfloat4 k_val = *((device const bfloat4*)(k_ptr + d));
+                bfloat4 v_val = *((device const bfloat4*)(v_ptr + d));
+                shared_K[li * 64 + d + 0] = (float)k_val[0];
+                shared_K[li * 64 + d + 1] = (float)k_val[1];
+                shared_K[li * 64 + d + 2] = (float)k_val[2];
+                shared_K[li * 64 + d + 3] = (float)k_val[3];
+                shared_V[li * 64 + d + 0] = (float)v_val[0];
+                shared_V[li * 64 + d + 1] = (float)v_val[1];
+                shared_V[li * 64 + d + 2] = (float)v_val[2];
+                shared_V[li * 64 + d + 3] = (float)v_val[3];
             }
         } else {
-            float exp_term = exp(score - max_val);
-            sum_exp += exp_term;
-
-            device const float* v_ptr = v_base + s_k * gqa.head_dim;
-            for (uint d = 0; d < gqa.head_dim; d++) {
-                accum_val[d] += exp_term * v_ptr[d];
+            for (uint d = 0; d < 64; d++) {
+                shared_K[li * 64 + d] = 0.0f;
+                shared_V[li * 64 + d] = 0.0f;
             }
         }
+
+        // Synchronize threads so all loads into shared memory are complete
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Process keys in this tile
+        if (s_q < gqa.seq_len) {
+            uint max_k_in_tile = min(uint(32), s_q - s_k_base + 1);
+            for (uint k_idx = 0; k_idx < max_k_in_tile; k_idx++) {
+                // Compute dot product Q * K
+                float sum = 0.0f;
+                for (uint d = 0; d < 64; d++) {
+                    sum += thread_q[d] * shared_K[k_idx * 64 + d];
+                }
+                float score = sum * scale;
+
+                // Online softmax update
+                float m_old = max_val;
+                if (score > max_val) {
+                    max_val = score;
+                    float exp_scale = exp(m_old - max_val);
+                    sum_exp = sum_exp * exp_scale + 1.0f;
+                    for (uint d = 0; d < 64; d++) {
+                        accum_val[d] = accum_val[d] * exp_scale + shared_V[k_idx * 64 + d];
+                    }
+                } else {
+                    float exp_term = exp(score - max_val);
+                    sum_exp += exp_term;
+                    for (uint d = 0; d < 64; d++) {
+                        accum_val[d] += exp_term * shared_V[k_idx * 64 + d];
+                    }
+                }
+            }
+        }
+
+        // Synchronize again before the next tile overwrites shared memory
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // 3. Normalize and write to VRAM
-    for (uint d = 0; d < gqa.head_dim; ++d) {
-        out_ptr[d] = accum_val[d] / sum_exp;
+    // Write the normalized result to VRAM
+    if (s_q < gqa.seq_len) {
+        device bfloat* out_ptr = out + (b * gqa.seq_len * gqa.n_q_heads + s_q * gqa.n_q_heads + h) * gqa.head_dim;
+        for (uint d = 0; d < 64; d += 4) {
+            bfloat4 out_val;
+            out_val[0] = (bfloat)(accum_val[d + 0] / sum_exp);
+            out_val[1] = (bfloat)(accum_val[d + 1] / sum_exp);
+            out_val[2] = (bfloat)(accum_val[d + 2] / sum_exp);
+            out_val[3] = (bfloat)(accum_val[d + 3] / sum_exp);
+            *((device bfloat4*)(out_ptr + d)) = out_val;
+        }
+        L_out[b * gqa.n_q_heads * gqa.seq_len + h * gqa.seq_len + s_q] = max_val + log(sum_exp);
     }
 }

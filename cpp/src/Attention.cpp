@@ -18,6 +18,9 @@
 #include <Accelerate/Accelerate.h>
 #include <cmath>
 #include <cstddef>
+#include <chrono>
+#include <string>
+#include <iostream>
 #include <dispatch/dispatch.h>
 #include <stdexcept>
 #include <vector>
@@ -407,7 +410,6 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
     }
   }
 
-  // --- Run the backward recomputed forward pass ---
   if (use_gpu) {
     metal_bridge::GQAParams gqa_params = {
         .batch = static_cast<uint32_t>(batch),
@@ -505,10 +507,26 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // Single kernel call: computes dQ, dK, dV using tiled shared memory.
   // Eliminates the 2 GB intermediate score/probability/dS buffers entirely.
   if (use_gpu) {
-    metal_bridge::fused_attn_bwd(q4.data(), k4.data(), v4.data(),
-                                  grad_attn_output.data(),
-                                  grad_q4.data(), grad_k4.data(), grad_v4.data(),
-                                  batch, n_heads, n_kv_heads, seq_len, head_dim);
+    struct ProfileBlock {
+        std::string name;
+        std::chrono::high_resolution_clock::time_point start;
+        ProfileBlock(std::string name) : name(name), start(std::chrono::high_resolution_clock::now()) {}
+        ~ProfileBlock() {
+            auto end = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+            std::cout << "[PROFILE-BWD]   " << name << " took " << ms << " ms" << std::endl;
+        }
+    };
+
+    Tensor dS_mat({batch, n_heads, seq_len, seq_len}, 0.0f);  // reused for profiling, allocated for compat
+
+    {
+        ProfileBlock p("fused_attn_bwd");
+        metal_bridge::fused_attn_bwd(q4.data(), k4.data(), v4.data(),
+                                     grad_attn_output.data(),
+                                     grad_q4.data(), grad_k4.data(), grad_v4.data(),
+                                     batch, n_heads, n_kv_heads, seq_len, head_dim);
+    }
   } else {
     for (size_t b = 0; b < batch; ++b) {
       for (size_t h = 0; h < n_heads; ++h) {

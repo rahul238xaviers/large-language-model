@@ -32,8 +32,8 @@ kernel void rope_backward(device float* grad [[buffer(0)]],
     float x0_new = x0 * cos_val + x1 * sin_val;
     float x1_new = x1 * cos_val - x0 * sin_val; 
 
-    grad[idx_0] = x0_new;
-    grad[idx_1] = x1_new;
+    grad[idx_0] = (bfloat)x0_new;
+    grad[idx_1] = (bfloat)x1_new;
 
 }
     

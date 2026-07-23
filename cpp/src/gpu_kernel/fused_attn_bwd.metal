@@ -24,13 +24,13 @@ constant uint NQ=S/Br, NK=S/Bc;
 constant uint WL=32; // warp/lane size
 
 kernel void fused_attn_bwd(
-    device const float* Q      [[buffer(0)]],
-    device const float* K      [[buffer(1)]],
-    device const float* V      [[buffer(2)]],
-    device const float* dO     [[buffer(3)]],
-    device float*        dQ    [[buffer(4)]],
-    device float*        dK    [[buffer(5)]],
-    device float*        dV    [[buffer(6)]],
+    device const bfloat* Q      [[buffer(0)]],
+    device const bfloat* K      [[buffer(1)]],
+    device const bfloat* V      [[buffer(2)]],
+    device const bfloat* dO     [[buffer(3)]],
+    device bfloat*        dQ    [[buffer(4)]],
+    device bfloat*        dK    [[buffer(5)]],
+    device bfloat*        dV    [[buffer(6)]],
     constant uint*  n_heads_ptr [[buffer(7)]],
     constant uint*  n_kv_ptr    [[buffer(8)]],
     uint2 tg_id [[threadgroup_position_in_grid]],
@@ -247,7 +247,7 @@ kernel void fused_attn_bwd(
             uint gqr = gqr0 + qr;
             if (gqr >= S) continue;
             for (uint d = ln_id; d < HD; d += WL)
-                dQ[q_off + gqr*HD + d] += dQa[qr][d];
+                dQ[q_off + gqr*HD + d] += (bfloat)dQa[qr][d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

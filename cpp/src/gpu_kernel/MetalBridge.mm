@@ -65,6 +65,7 @@ static id<MTLComputePipelineState> pipelineStateFusedAttnBwd = nil;
 static id<MTLComputePipelineState> pipelineStateGEMMBF16 = nil;
 static id<MTLComputePipelineState> pipelineStateFusedAddNorm = nil;
 static id<MTLComputePipelineState> pipelineStateFusedBackwardAddNorm = nil;
+static id<MTLComputePipelineState> pipelineStateFusedSwiGLUGEMM = nil;
 
 static float last_step_loss = 0.0f;
 static bool initialized = false;
@@ -165,7 +166,8 @@ bool is_available() {
          (pipelineStateProj != nil) && (pipelineStateGQA != nil) &&
          (pipelineStateFusedAttnBwd != nil) && (pipelineStateFlashAttnFwd != nil) &&
          (pipelineStateFusedAddNorm != nil) &&
-         (pipelineStateFusedBackwardAddNorm != nil);
+         (pipelineStateFusedBackwardAddNorm != nil) &&
+         (pipelineStateFusedSwiGLUGEMM != nil);
 }
 
 /**
@@ -384,25 +386,7 @@ void initialize() {
                "'rope_backward'!"
             << std::endl;
 
-  id<MTLFunction> gqaBackwardFunc =
-      [defaultLibrary newFunctionWithName:@"gqa_backward"];
-  if (!gqaBackwardFunc) {
-    std::cerr << "Failed to find kernel function 'gqa_backward' in library!"
-              << std::endl;
-    return;
-  }
-  pipelineStateGQABackward =
-      [device newComputePipelineStateWithFunction:gqaBackwardFunc
-                                            error:&error];
-  if (!pipelineStateGQABackward) {
-    std::cerr << "Failed to compile pipeline state for 'gqa_backward'! "
-                 "Error: "
-              << [[error localizedDescription] UTF8String] << std::endl;
-    return;
-  }
-  std::cout << "Metal Pipeline State compiled successfully for "
-               "'gqa_backward'!"
-            << std::endl;
+  // gqa_backward removed
 
   id<MTLFunction> adamwFunc =
       [defaultLibrary newFunctionWithName:@"adamw_step"];
@@ -541,30 +525,11 @@ void initialize() {
   }
   std::cout << "Metal Pipeline State compiled successfully for 'rope_forward'!" << std::endl;
 
-  id<MTLFunction> gqaScoresFunc = [defaultLibrary newFunctionWithName:@"gqa_scores"];
-  if (!gqaScoresFunc) {
-    std::cerr << "Failed to find kernel function 'gqa_scores' in library!" << std::endl;
-    return;
-  }
-  pipelineStateGQAScores = [device newComputePipelineStateWithFunction:gqaScoresFunc error:&error];
-  if (!pipelineStateGQAScores) {
-    std::cerr << "Failed to compile pipeline state for 'gqa_scores'! Error: "
-              << [[error localizedDescription] UTF8String] << std::endl;
-    return;
-  }
-  std::cout << "Metal Pipeline State compiled successfully for 'gqa_scores'!" << std::endl;
+  // gqa_scores removed
 
-  id<MTLFunction> attnSoftmaxFunc = [defaultLibrary newFunctionWithName:@"attn_softmax"];
-  if (!attnSoftmaxFunc) { std::cerr << "Failed to find 'attn_softmax'\n"; return; }
-  pipelineStateAttnSoftmax = [device newComputePipelineStateWithFunction:attnSoftmaxFunc error:&error];
-  if (!pipelineStateAttnSoftmax) { std::cerr << "Failed to compile 'attn_softmax'\n"; return; }
-  std::cout << "Compiled 'attn_softmax'!" << std::endl;
+  // attn_softmax removed
 
-  id<MTLFunction> attnDSFunc = [defaultLibrary newFunctionWithName:@"attn_ds"];
-  if (!attnDSFunc) { std::cerr << "Failed to find 'attn_ds'\n"; return; }
-  pipelineStateAttnDS = [device newComputePipelineStateWithFunction:attnDSFunc error:&error];
-  if (!pipelineStateAttnDS) { std::cerr << "Failed to compile 'attn_ds'\n"; return; }
-  std::cout << "Compiled 'attn_ds'!" << std::endl;
+  // attn_ds removed
 
   id<MTLFunction> swigluFwdFunc = [defaultLibrary newFunctionWithName:@"swiglu_forward"];
   if (!swigluFwdFunc) { std::cerr << "Failed to find 'swiglu_forward'\n"; return; }
@@ -605,6 +570,12 @@ void initialize() {
   if (!pipelineStateFusedBackwardAddNorm) { std::cerr << "Failed to compile 'fused_backward_add_norm'\n"; return; }
   std::cout << "Compiled 'fused_backward_add_norm'!" << std::endl;
 
+  id<MTLFunction> fusedSwiGLUFunc = [defaultLibrary newFunctionWithName:@"fused_swiglu_gemm"];
+  if (!fusedSwiGLUFunc) { std::cerr << "Failed to find 'fused_swiglu_gemm'\n"; return; }
+  pipelineStateFusedSwiGLUGEMM = [device newComputePipelineStateWithFunction:fusedSwiGLUFunc error:&error];
+  if (!pipelineStateFusedSwiGLUGEMM) { std::cerr << "Failed to compile 'fused_swiglu_gemm'\n"; return; }
+  std::cout << "Compiled 'fused_swiglu_gemm'!" << std::endl;
+
   // Wire up the gpu_wrapper release function so PagedBuffer destructors
   // can call CFRelease without including ObjC headers.
   PagedBuffer::gpu_release_fn = [](void* wrapper) {
@@ -637,11 +608,6 @@ void initialize() {
     print_pipeline(pipelineStateRoPEBackward,"rope_backward");
     print_pipeline(pipelineStateCrossEntropy,"cross_entropy");
     print_pipeline(pipelineStateEmbeddingFwd,"embedding_forward");
-    print_pipeline(pipelineStateGQABackward, "gqa_backward");
-    print_pipeline(pipelineStateGQAScores,   "gqa_scores");
-    print_pipeline(pipelineStateAttnSoftmax, "attn_softmax");
-    print_pipeline(pipelineStateAttnDS,      "attn_ds");
-    print_pipeline(pipelineStateGEMMBackward,"gemm_backward");
     print_pipeline(pipelineStateGEMMProjTransB,"gemm_proj_trans_b");
     print_pipeline(pipelineStateReshape4D,   "reshape_to_4d");
     print_pipeline(pipelineStateReshape3D,   "reshape_to_3d");
@@ -735,7 +701,7 @@ void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N,
 }
 
 void gemm_gqa(const GQAParams &gqa_params, const float *q, const float *k,
-              const float *v, float *out_gqa) {
+              const float *v, float *out_gqa, float *L_out) {
 
   size_t bytesQ = gqa_params.batch * gqa_params.seq_len * gqa_params.n_q_heads *
                   gqa_params.head_dim * sizeof(__bf16);
@@ -1443,6 +1409,57 @@ void gemm_bf16(const void *A, const void *B, void *C,
   auto prof_end = std::chrono::high_resolution_clock::now();
   double prof_ms = std::chrono::duration<double, std::milli>(prof_end - prof_start).count();
   GemmProfiler::instance().record(M, N, K, transA, transB, prof_ms);
+}
+
+void fused_swiglu_gemm(const void *gate_proj, const void *up_proj,
+                        const void *B, void *C,
+                        size_t M, size_t N, size_t K) {
+  if (M == 0 || N == 0 || K == 0) return;
+  size_t bytesA = M * K * sizeof(__bf16);
+  size_t bytesB = K * N * sizeof(__bf16);
+  size_t bytesC = M * N * sizeof(__bf16);
+
+  id<MTLBuffer> bGate = get_or_create_buffer(gate_proj, bytesA);
+  id<MTLBuffer> bUp   = get_or_create_buffer(up_proj,   bytesA);
+  id<MTLBuffer> bB    = get_or_create_buffer(B,          bytesB);
+  id<MTLBuffer> bC    = get_or_create_buffer(C,          bytesC, true);
+  if (!bGate || !bUp || !bB || !bC) { std::cerr << "[fused_swiglu_gemm] buffer alloc failed\n"; return; }
+
+  uint32_t uM = (uint32_t)M, uN = (uint32_t)N, uK = (uint32_t)K;
+  MTLSize grid = MTLSizeMake((N + 127) / 128, (M + 127) / 128, 1);
+  MTLSize tg  = MTLSizeMake(256, 1, 1);
+
+  id<MTLCommandBuffer> cb__ = batchCommandBuffer;
+  if (cb__) {
+    id<MTLComputeCommandEncoder> e__ = [cb__ computeCommandEncoder];
+    [e__ setComputePipelineState:pipelineStateFusedSwiGLUGEMM];
+    [e__ setBuffer:bGate offset:0 atIndex:0];
+    [e__ setBuffer:bUp   offset:0 atIndex:1];
+    [e__ setBuffer:bB    offset:0 atIndex:2];
+    [e__ setBuffer:bC    offset:0 atIndex:3];
+    [e__ setBytes:&uM length:sizeof(uint32_t) atIndex:4];
+    [e__ setBytes:&uN length:sizeof(uint32_t) atIndex:5];
+    [e__ setBytes:&uK length:sizeof(uint32_t) atIndex:6];
+    [e__ dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    [e__ endEncoding];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb2__ = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> e__ = [cb2__ computeCommandEncoder];
+      [e__ setComputePipelineState:pipelineStateFusedSwiGLUGEMM];
+      [e__ setBuffer:bGate offset:0 atIndex:0];
+      [e__ setBuffer:bUp   offset:0 atIndex:1];
+      [e__ setBuffer:bB    offset:0 atIndex:2];
+      [e__ setBuffer:bC    offset:0 atIndex:3];
+      [e__ setBytes:&uM length:sizeof(uint32_t) atIndex:4];
+      [e__ setBytes:&uN length:sizeof(uint32_t) atIndex:5];
+      [e__ setBytes:&uK length:sizeof(uint32_t) atIndex:6];
+      [e__ dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [e__ endEncoding];
+      [cb2__ commit];
+      [cb2__ waitUntilCompleted];
+    }
+  }
 }
 
 void gqa_backward(const GQABackwardParams &params,

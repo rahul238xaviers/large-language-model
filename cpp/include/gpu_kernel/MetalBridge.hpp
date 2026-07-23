@@ -41,13 +41,16 @@ void gemm_bf16(const void *A, const void *B, void *C,
                bool transA = false, bool transB = false,
                bool is_forward = false);
 
+void fused_swiglu_gemm(const void *gate_proj, const void *up_proj,
+                       const void *B, void *C,
+                       size_t M, size_t N, size_t K);
+
 // ── FlashAttention forward (fused QK^T→softmax→PV, no N×N intermediates) ──
 void flash_attn_fwd(const void *Q, const void *K, const void *V, void *O,
                     size_t batch, size_t n_heads, size_t n_kv,
                     size_t seq_len, size_t head_dim);
 
-// ── Fused attention backward ────────────────────────────────────────
-// Single kernel, no materialized intermediates.
+// ── Fused attention backward (single kernel, no materialized intermediates) ──
 void fused_attn_bwd(const void *Q, const void *K, const void *V,
                     const void *dO, void *dQ, void *dK, void *dV,
                     size_t batch, size_t n_heads, size_t n_kv,
@@ -104,7 +107,7 @@ struct GQAParams { uint32_t batch, n_q_heads, n_kv_heads, seq_len, head_dim; };
 struct GQABackwardParams { uint32_t batch, n_q_heads, n_kv_heads, seq_len, head_dim; };
 
 void gemm_gqa(const GQAParams &params, const float *q, const float *k,
-              const float *v, float *out_gqa);
+              const float *v, float *out_gqa, float *L_out = nullptr);
 void gqa_backward(const GQABackwardParams &params,
                   const float *Q, const float *K, const float *V,
                   const float *grad_attn_output,

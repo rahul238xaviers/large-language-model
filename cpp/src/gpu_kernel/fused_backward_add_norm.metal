@@ -1,5 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// fused_backward_add_norm — BF16 gradients, FP32 weight
+// fused_backward_add_norm — fused RMSNorm backward + residual gradient add
+// ═══════════════════════════════════════════════════════════════════════════════
+// BF16 DRAM (all pointers), FP32 internal math.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #include <metal_stdlib>
@@ -15,11 +17,11 @@ inline float simd_sum_f(float v) {
 }
 
 kernel void fused_backward_add_norm(
-    device const bfloat* grad_output [[buffer(0)]],  // BF16 (128 MB, halved)
-    device const bfloat* input       [[buffer(1)]],  // BF16 (h_mid, 128 MB)
-    device const float*  weight      [[buffer(2)]],  // FP32 (4 KB, not worth converting)
-    device const bfloat* residual    [[buffer(3)]],  // FP32 (grad_output, 128 MB)
-    device bfloat*       grad_input  [[buffer(4)]],  // FP32 output (kept FP32 for now)
+    device const bfloat* grad_output [[buffer(0)]],
+    device const bfloat* input       [[buffer(1)]],
+    device const float*  weight      [[buffer(2)]],
+    device const bfloat* residual    [[buffer(3)]],
+    device bfloat*       grad_input  [[buffer(4)]],
     constant uint&       D           [[buffer(5)]],
     constant float&      eps         [[buffer(6)]],
     uint row_idx [[threadgroup_position_in_grid]],

@@ -158,13 +158,13 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
                                    config_.hidden_dim,
                                    config_.rms_norm_eps);
 
-      Tensor activated({batch_size, seq_len, config_.intermediate_dim}, DType::BF16);
       Tensor gate_proj = ffn_in.matmul(layer.w_gate);
       Tensor up_proj = ffn_in.matmul(layer.w_up);
-      metal_bridge::swiglu_forward(gate_proj.data(), up_proj.data(),
-                                    activated.data(),
-                                    batch_size * seq_len * config_.intermediate_dim);
-      Tensor ffn_out = activated.matmul(layer.w_down);
+      Tensor ffn_out({batch_size, seq_len, config_.hidden_dim}, DType::BF16);
+      metal_bridge::fused_swiglu_gemm(
+          gate_proj.data(), up_proj.data(), layer.w_down.data(),
+          ffn_out.data(),
+          batch_size * seq_len, config_.hidden_dim, config_.intermediate_dim);
 
       // Fused: h += ffn_out  (in-place for backward)  AND  attn_in_next = rmsnorm(h)
       // (attn_in_next used by next layer's attn_norm, but we still compute

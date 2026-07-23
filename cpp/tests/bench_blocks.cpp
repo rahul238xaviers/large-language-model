@@ -459,41 +459,6 @@ static BenchResult bench_swiglu_bwd() {
     return r;
 }
 
-// 13. gqa_backward
-static BenchResult bench_gqa_bwd() {
-    BenchResult r{"gqa_backward"};
-    set_gpu(true);
-    metal_bridge::reconcile_buffers();
-
-    std::vector<float> Q(B * nH * S * HD, 0.1f);
-    std::vector<float> K(B * nKV * S * HD, 0.1f);
-    std::vector<float> V(B * nKV * S * HD, 0.1f);
-    std::vector<float> grad_out(B * S * nH * HD, 0.5f);
-    std::vector<float> grad_Q(B * nH * S * HD, 0.0f);
-    std::vector<float> grad_K(B * nKV * S * HD, 0.0f);
-    std::vector<float> grad_V(B * nKV * S * HD, 0.0f);
-
-    metal_bridge::GQABackwardParams bp;
-    bp.batch = B; bp.n_q_heads = nH; bp.n_kv_heads = nKV;
-    bp.seq_len = S; bp.head_dim = HD;
-
-    int warmup = W, samples = SAMP_HEAVY;
-    for (int i = 0; i < warmup; i++) {
-        metal_bridge::gqa_backward(bp, Q.data(), K.data(), V.data(),
-                                    grad_out.data(),
-                                    grad_Q.data(), grad_K.data(), grad_V.data());
-    }
-    double t0 = now_ms();
-    for (int i = 0; i < samples; i++) {
-        metal_bridge::gqa_backward(bp, Q.data(), K.data(), V.data(),
-                                    grad_out.data(),
-                                    grad_Q.data(), grad_K.data(), grad_V.data());
-    }
-    r.wall_ms = (now_ms() - t0) / samples;
-    double flops = 2.0 * B * nH * S * S * HD * 2;
-    r.gflops = flops / (r.wall_ms / 1000.0) / 1e9;
-    return r;
-}
 
 // 14. fused_attn_bwd: single-kernel GQA attention backward
 static BenchResult bench_fused_attn_bwd() {
@@ -511,7 +476,6 @@ static BenchResult bench_fused_attn_bwd() {
     std::vector<float> dK(B * nKV * S * HD, 0.0f);
     std::vector<float> dV(B * nKV * S * HD, 0.0f);
 
-    // Use begin_scope/end_scope for true GPU timing (no CPU overhead between)
     int warmup = W, samples = SAMP_HEAVY;
     for (int i = 0; i < warmup; i++) {
         metal_bridge::begin_scope();
@@ -664,93 +628,7 @@ static BenchResult bench_adamw_size(size_t n, const std::string &tag) {
     return r;
 }
 
-// 19. gqa_scores (attention score precomputation)
-static BenchResult bench_gqa_scores() {
-    BenchResult r{"gqa_scores"};
-    set_gpu(true);
-    metal_bridge::reconcile_buffers();
 
-    std::vector<float> Q(B * nH * S * HD, 0.1f);
-    std::vector<float> K(B * nKV * S * HD, 0.1f);
-    std::vector<float> scores(B * nH * S * S, 0.0f);
-
-    int warmup = W, samples = SAMP;
-    for (int i = 0; i < warmup; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::gqa_scores(Q.data(), K.data(), scores.data(),
-                                 B, nH, nKV, S, HD);
-        metal_bridge::end_scope();
-    }
-    double t0 = now_ms();
-    for (int i = 0; i < samples; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::gqa_scores(Q.data(), K.data(), scores.data(),
-                                 B, nH, nKV, S, HD);
-        metal_bridge::end_scope();
-    }
-    r.wall_ms = (now_ms() - t0) / samples;
-    r.gpu_ms = r.wall_ms;
-    double bytes = (B * nH * S * HD + B * nKV * S * HD + B * nH * S * S) * 4.0;
-    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
-    return r;
-}
-
-// 20. attn_softmax
-static BenchResult bench_attn_softmax() {
-    BenchResult r{"attn_softmax"};
-    set_gpu(true);
-    metal_bridge::reconcile_buffers();
-
-    std::vector<float> scores(B * nH * S * S, 0.5f);
-    std::vector<float> probs(B * nH * S * S, 0.0f);
-
-    int warmup = W, samples = SAMP;
-    for (int i = 0; i < warmup; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::attn_softmax(scores.data(), probs.data(), B, nH, S);
-        metal_bridge::end_scope();
-    }
-    double t0 = now_ms();
-    for (int i = 0; i < samples; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::attn_softmax(scores.data(), probs.data(), B, nH, S);
-        metal_bridge::end_scope();
-    }
-    r.wall_ms = (now_ms() - t0) / samples;
-    r.gpu_ms = r.wall_ms;
-    double bytes = B * nH * S * S * 4.0 * 2;
-    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
-    return r;
-}
-
-// 21. attn_ds
-static BenchResult bench_attn_ds() {
-    BenchResult r{"attn_ds"};
-    set_gpu(true);
-    metal_bridge::reconcile_buffers();
-
-    std::vector<float> probs(B * nH * S * S, 0.5f);
-    std::vector<float> dP_row(B * nH * S * S, 0.5f);
-    std::vector<float> dS_out(B * nH * S * S, 0.0f);
-
-    int warmup = W, samples = SAMP;
-    for (int i = 0; i < warmup; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::attn_ds(probs.data(), dP_row.data(), dS_out.data(), B, nH, S);
-        metal_bridge::end_scope();
-    }
-    double t0 = now_ms();
-    for (int i = 0; i < samples; i++) {
-        metal_bridge::begin_scope();
-        metal_bridge::attn_ds(probs.data(), dP_row.data(), dS_out.data(), B, nH, S);
-        metal_bridge::end_scope();
-    }
-    r.wall_ms = (now_ms() - t0) / samples;
-    r.gpu_ms = r.wall_ms;
-    double bytes = B * nH * S * S * 4.0 * 3;
-    r.bw_gbs = bytes / (r.wall_ms / 1000.0) / 1e9;
-    return r;
-}
 
 // ── Layer-level forward pass ──────────────────────────────────────────────
 static BenchResult bench_layer_fwd() {
@@ -766,10 +644,9 @@ static BenchResult bench_layer_fwd() {
 
     TransformerLayer layer(cfg);
     // fill weights
-    auto fill = [](Tensor &t, float v) { for (size_t _i = 0; _i < t.num_elements(); _i++) t.data()[_i] = v; };
-    fill(layer.w_gate, 0.02f); fill(layer.w_up, 0.02f); fill(layer.w_down, 0.02f);
-    fill(layer.attn.Wq(), 0.02f); fill(layer.attn.Wk(), 0.02f);
-    fill(layer.attn.Wv(), 0.02f); fill(layer.attn.Wo(), 0.02f);
+    layer.w_gate.fill(0.02f); layer.w_up.fill(0.02f); layer.w_down.fill(0.02f);
+    layer.attn.Wq().fill(0.02f); layer.attn.Wk().fill(0.02f);
+    layer.attn.Wv().fill(0.02f); layer.attn.Wo().fill(0.02f);
 
     RoPE rope(HD, S, 10000.0f);
     Tensor h({B, S, H}, 0.5f);
@@ -819,10 +696,9 @@ static BenchResult bench_layer_bwd() {
     cfg.vocab_size = V; cfg.rms_norm_eps = 1e-5f;
 
     TransformerLayer layer(cfg);
-    auto fill = [](Tensor &t, float v) { for (size_t _i = 0; _i < t.num_elements(); _i++) t.data()[_i] = v; };
-    fill(layer.w_gate, 0.02f); fill(layer.w_up, 0.02f); fill(layer.w_down, 0.02f);
-    fill(layer.attn.Wq(), 0.02f); fill(layer.attn.Wk(), 0.02f);
-    fill(layer.attn.Wv(), 0.02f); fill(layer.attn.Wo(), 0.02f);
+    layer.w_gate.fill(0.02f); layer.w_up.fill(0.02f); layer.w_down.fill(0.02f);
+    layer.attn.Wq().fill(0.02f); layer.attn.Wk().fill(0.02f);
+    layer.attn.Wv().fill(0.02f); layer.attn.Wo().fill(0.02f);
 
     RoPE rope(HD, S, 10000.0f);
     Tensor grad_output({B, S, H}, 0.5f);
@@ -906,9 +782,6 @@ int main() {
     results.push_back(bench_rope_bwd());
 
     // ── Attention-specific ──
-    results.push_back(bench_gqa_scores());
-    results.push_back(bench_attn_softmax());
-    results.push_back(bench_attn_ds());
     results.push_back(bench_fused_attn_bwd());
 
     // ── GEMMs ──
@@ -924,7 +797,6 @@ int main() {
     results.push_back(bench_gemm_proj_vark(M, H, I, "down (M,I×H)"));  // down: (M×I)@(I×H)
     results.push_back(bench_gemm_proj_trans_b(M, H, H, "grad_input (M,H)")); // 32768×1024×1024
     results.push_back(bench_gemm_proj_trans_b(M, H, I, "grad_ffn_in (M,I)"));// 32768×1024×2752
-    results.push_back(bench_gqa_bwd());
 
     // ── AdamW for different parameter sizes ──
     results.push_back(bench_adamw_size(H * H, "(H×H=1M)"));      // attn weights
@@ -1000,10 +872,7 @@ int main() {
     ledger.push_back({"rope_forward", find_ms("rope_forward"), FREQ_ROPE_FWD, 0, 0});
     // rope backward
     ledger.push_back({"rope_backward", find_ms("rope_backward"), FREQ_ROPE_BWD, 0, 0});
-    // gqa_scores (attention fwd — QK^T)
-    ledger.push_back({"gqa_scores", find_ms("gqa_scores"), FREQ_PER_LAYER, 0, 0});
-    // attn_softmax
-    ledger.push_back({"attn_softmax", find_ms("attn_softmax"), FREQ_PER_LAYER, 0, 0});
+
     // gemm_gqa (attention output — PV)
     ledger.push_back({"gemm_gqa (attn_out)", find_ms("gemm_gqa"), FREQ_PER_LAYER, 0, 0});
     // fused_attn_bwd

@@ -70,53 +70,8 @@ Tensor RMSNorm::forward(const Tensor &x) const {
     }
   }
 
-  if (use_gpu) {
-    metal_bridge::rms_norm_forward(x.data(), result.data(), weight_.data(),
-                                   eps_, num_rows, dims);
-    return result;
-  }
-
-  unsigned int num_threads = std::thread::hardware_concurrency();
-  if (num_threads == 0) num_threads = 4;
-
-  std::vector<std::thread> workers;
-  size_t rows_per_thread = (num_rows + num_threads - 1) / num_threads;
-
-  for (unsigned int t = 0; t < num_threads; ++t) {
-    size_t start_row = t * rows_per_thread;
-    size_t end_row = std::min(start_row + rows_per_thread, num_rows);
-
-    if (start_row >= end_row) continue;
-
-    workers.emplace_back([this, start_row, end_row, dims, &x, &result]() {
-      const float *x_data = x.data();
-      const float *w_data = weight_.data();
-      float *res_data = result.data();
-
-      for (size_t r = start_row; r < end_row; ++r) {
-        size_t offset = r * dims;
-
-        float sum_sq = std::inner_product(
-            x_data + offset,
-            x_data + offset + dims,
-            x_data + offset,
-            0.0f
-        );
-
-        float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
-
-        for (size_t col_idx = 0; col_idx < dims; col_idx++) {
-          res_data[offset + col_idx] =
-              (x_data[offset + col_idx] / rms) * w_data[col_idx];
-        }
-      }
-    });
-  }
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-
+  metal_bridge::rms_norm_forward(x.data(), result.data(), weight_.data(),
+                                 eps_, num_rows, dims);
   return result;
 }
 

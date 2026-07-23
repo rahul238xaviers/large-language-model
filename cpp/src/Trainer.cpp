@@ -289,16 +289,19 @@ void Trainer::train() {
 
     if (step == 0) metal_bridge::start_step_trace();
 
+    // ── Scope 1: Forward ──
     metal_bridge::begin_scope();
-
-    // Tensors must stay alive past end_scope() — GPU kernels execute
-    // asynchronously and read from their data.
     Tensor logits = model_.forward(tokens);
+    metal_bridge::end_scope();
+
+    // ── Loss + Gradient (standalone, synchronous) ──
+    // Compute cross-entropy loss on GPU (gradient for backward pass).
     CrossEntropyLoss lf;
-    loss = lf.forward(logits, targets);
+    loss = lf.forward(logits, targets);  // standalone, executes immediately
     const Tensor &grad_logits = lf.grad_logits();
 
-    // GPU-native blit zeroing — no CPU memset, no virtual-memory thrash
+    // ── Scope 2: Backward + Optimizer ──
+    metal_bridge::begin_scope();
     metal_bridge::fill_zero_async(grad_embeddings.data(), grad_embeddings.raw_bytes());
     metal_bridge::fill_zero_async(grad_output_projection.data(), grad_output_projection.raw_bytes());
     for (size_t l = 0; l < model_.layers().size(); ++l) {
@@ -315,7 +318,6 @@ void Trainer::train() {
                      grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
                      grad_output_projection, rope_);
     optimizer_.step(lr);
-
     metal_bridge::end_scope();
 
     if (step == 0) metal_bridge::stop_step_trace();

@@ -3,14 +3,12 @@
 
 void (*PagedBuffer::gpu_release_fn)(void*) = nullptr;
 
-#include "gpu_kernel/MetalBridge.hpp"
 #include <Accelerate/Accelerate.h>
 #include <algorithm>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 
-// ── Constructors ───────────────────────────────────────────────────────────
 Tensor::Tensor() : shape_(), dtype_(DType::FP32) {}
 
 Tensor::Tensor(const Shape &shape, DType dtype)
@@ -25,37 +23,33 @@ Tensor::Tensor(const Shape &shape, float val, DType dtype)
   size_t n = compute_size(shape);
   if (n > 0) {
     buf_ = std::make_shared<PagedBuffer>();
-    buf_->resize_fill_f32(n, val);
+    if (dtype == DType::BF16) {
+      buf_->resize_raw(n, 2);
+      uint16_t bf = float_to_bf16(val);
+      uint16_t* ptr = (uint16_t*)buf_->data();
+      std::fill(ptr, ptr + n, bf);
+    } else {
+      buf_->resize_fill_f32(n, val);
+    }
   }
-  compute_strides();
-}
-
-Tensor::Tensor(const Shape &shape, const PagedBuffer &data, DType dtype)
-    : shape_(shape), dtype_(dtype) {
-  buf_ = std::make_shared<PagedBuffer>(data);
   compute_strides();
 }
 
 Tensor::Tensor(const Shape &shape, const std::vector<float> &data, DType dtype)
     : shape_(shape), dtype_(dtype) {
   buf_ = std::make_shared<PagedBuffer>();
-  buf_->resize_store_f32(data.size(), data.data());
+  size_t n = compute_size(shape);
+  if (dtype == DType::BF16) {
+    buf_->resize_raw(n, 2);
+    uint16_t* dst = (uint16_t*)buf_->data();
+    for (size_t i = 0; i < n && i < data.size(); ++i)
+      dst[i] = float_to_bf16(data[i]);
+  } else {
+    buf_->resize_store_f32(data.size(), data.data());
+  }
   compute_strides();
 }
 
-// ── Element access (FP32 path; BF16 access via raw_ptr for hot paths) ─────
-float &Tensor::operator()(size_t i) { return buf_->data_float()[i]; }
-const float &Tensor::operator()(size_t i) const { return buf_->data_float()[i]; }
-float &Tensor::operator()(size_t i, size_t j) { return buf_->data_float()[i * strides_[0] + j]; }
-const float &Tensor::operator()(size_t i, size_t j) const { return buf_->data_float()[i * strides_[0] + j]; }
-float &Tensor::operator()(size_t i, size_t j, size_t k) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
-const float &Tensor::operator()(size_t i, size_t j, size_t k) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
-float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
-const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
-float &Tensor::operator()(const std::vector<size_t> &indices) { return buf_->data_float()[get_index(indices)]; }
-const float &Tensor::operator()(const std::vector<size_t> &indices) const { return buf_->data_float()[get_index(indices)]; }
-
-// ── Other methods ─────────────────────────────────────────────────────────
 void Tensor::compute_strides() {
   if (shape_.ndim == 0) return;
   size_t stride = 1;
@@ -77,19 +71,26 @@ size_t Tensor::get_index(const std::vector<size_t> &indices) const {
   return idx;
 }
 
-void Tensor::fill(const float val) {
+float &Tensor::operator()(size_t i) { return buf_->data_float()[i]; }
+const float &Tensor::operator()(size_t i) const { return buf_->data_float()[i]; }
+float &Tensor::operator()(size_t i, size_t j) { return buf_->data_float()[i * strides_[0] + j]; }
+const float &Tensor::operator()(size_t i, size_t j) const { return buf_->data_float()[i * strides_[0] + j]; }
+float &Tensor::operator()(size_t i, size_t j, size_t k) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
+const float &Tensor::operator()(size_t i, size_t j, size_t k) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k]; }
+float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
+const float &Tensor::operator()(size_t i, size_t j, size_t k, size_t l) const { return buf_->data_float()[i * strides_[0] + j * strides_[1] + k * strides_[2] + l]; }
+float &Tensor::operator()(const std::vector<size_t> &indices) { return buf_->data_float()[get_index(indices)]; }
+const float &Tensor::operator()(const std::vector<size_t> &indices) const { return buf_->data_float()[get_index(indices)]; }
+
+void Tensor::fill(float val) {
   if (!buf_) return;
   if (dtype_ == DType::BF16) {
-    // For BF16, fill with the 16-bit truncated value
     uint16_t bf = float_to_bf16(val);
     uint16_t* ptr = (uint16_t*)buf_->data();
     size_t n = buf_->bytes() / 2;
     std::fill(ptr, ptr + n, bf);
   } else {
-    if (val == 0.0f && buf_->size_float() > 0)
-      buf_->resize_fill_f32(buf_->size_float(), 0.0f);
-    else
-      std::fill(buf_->data_float(), buf_->data_float() + buf_->size_float(), val);
+    std::fill(buf_->data_float(), buf_->data_float() + buf_->bytes() / sizeof(float), val);
   }
 }
 
@@ -105,7 +106,7 @@ void Tensor::print(const std::string &name) const {
   size_t n = std::min(num_elements(), size_t(20));
   for (size_t i = 0; i < n; ++i) {
     float v;
-    if (dtype_ == DType::BF16) v = bf16_to_float(((uint16_t*)buf_->data())[i]);
+    if (dtype_ == DType::BF16) v = bf16_to_float(((const uint16_t*)buf_->data())[i]);
     else v = buf_->data_float()[i];
     std::cout << v << " ";
   }
@@ -113,12 +114,10 @@ void Tensor::print(const std::string &name) const {
   std::cout << "\n";
 }
 
-// ── Arithmetic (always works on FP32 data) ─────────────────────────────────
 void Tensor::add_(const Tensor &other) {
   if (shape_ != other.shape_)
     throw std::invalid_argument("Shape mismatch for in-place addition");
-  // Both must be FP32 for vDSP. BF16 tensors should use GPU residual_add.
-  size_t n = buf_->size_float();
+  size_t n = buf_->bytes() / sizeof(float);
   if (n > 262144 && metal_bridge::is_available()) {
     metal_bridge::residual_add(buf_->data_float(), other.buf_->data_float(), n);
     return;
@@ -132,12 +131,12 @@ void Tensor::mul_(const Tensor &other) {
     throw std::invalid_argument("Shape mismatch for in-place multiplication");
   vDSP_vmul(buf_->data_float(), 1, other.buf_->data_float(), 1,
             buf_->data_float(), 1,
-            static_cast<vDSP_Length>(buf_->size_float()));
+            static_cast<vDSP_Length>(buf_->bytes() / sizeof(float)));
 }
 
 void Tensor::scale_(float factor) {
   vDSP_vsmul(buf_->data_float(), 1, &factor, buf_->data_float(), 1,
-             static_cast<vDSP_Length>(buf_->size_float()));
+             static_cast<vDSP_Length>(buf_->bytes() / sizeof(float)));
 }
 
 Tensor Tensor::add(const Tensor &other) const {
@@ -158,13 +157,11 @@ Tensor Tensor::scale(float factor) const {
   return result;
 }
 
-// ── Deep copy ──────────────────────────────────────────────────────────────
 Tensor Tensor::clone() const {
   Tensor t(shape_, dtype_);
   if (buf_ && buf_->bytes() > 0) {
     size_t n = num_elements();
     if (dtype_ == DType::BF16) {
-      // Copy raw bytes — no conversion needed
       std::memcpy(t.buf_->data(), buf_->data(), buf_->bytes());
       t.buf_->reshape(n, 2);
     } else {
@@ -174,7 +171,6 @@ Tensor Tensor::clone() const {
   return t;
 }
 
-// ── Matmul ─────────────────────────────────────────────────────────────────
 Tensor Tensor::matmul(const Tensor &other) const {
   if (shape_.ndim < 2 || other.shape_.ndim < 2)
     throw std::invalid_argument("Matmul requires at least 2 dimensions");
@@ -190,7 +186,6 @@ Tensor Tensor::matmul(const Tensor &other) const {
 
     Shape result_shape = shape_;
     result_shape.dims[shape_.ndim - 1] = N;
-    // Result inherits dtype from this tensor (will be BF16 if input is BF16)
     Tensor result(result_shape, 0.0f, dtype_);
 
     metal_bridge::gemm_bf16(buf_->data(), other.buf_->data(), result.buf_->data(),
@@ -248,6 +243,6 @@ Tensor Tensor::reshape(const std::vector<size_t> &new_shape) const {
   if (new_size != num_elements())
     throw std::invalid_argument("Total size must match for reshape");
   Tensor t(new_shape);
-  if (buf_) t.buf_->resize_store_f32(buf_->size_float(), buf_->data_float());
+  if (buf_) t.buf_->resize_store_f32(buf_->bytes() / sizeof(float), buf_->data_float());
   return t;
 }
