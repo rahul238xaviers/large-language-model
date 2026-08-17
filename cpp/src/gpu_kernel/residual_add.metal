@@ -26,3 +26,23 @@ kernel void residual_add(
     // WHY:  No synchronization needed — each thread owns exactly one element.
     a[gid] += b[gid];
 }
+
+kernel void convert_fp32_to_bf16(
+    device const float* src [[buffer(0)]],
+    device bfloat*      dst [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    dst[gid] = (bfloat)src[gid];
+}
+
+kernel void convert_bf16_to_fp32(
+    device const bfloat* src [[buffer(0)]],
+    device float*        dst [[buffer(1)]],
+    constant uint&       n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    dst[gid] = (float)src[gid];
+}

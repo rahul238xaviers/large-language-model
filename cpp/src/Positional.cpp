@@ -207,24 +207,12 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
     size_t seq_len = grad_q.shape()[2];
     size_t head_dim = grad_q.shape()[3];
 
-    Tensor q_bf16 = grad_q.to_dtype(DType::BF16);
-    Tensor k_bf16 = grad_k.to_dtype(DType::BF16);
-
-    metal_bridge::rope_backward((float*)q_bf16.raw_ptr(), cos_table_.data(),
+    metal_bridge::rope_backward((float*)grad_q.raw_ptr(), cos_table_.data(),
                                 sin_table_.data(), batch, q_heads, seq_len,
                                 head_dim);
-    metal_bridge::rope_backward((float*)k_bf16.raw_ptr(), cos_table_.data(),
+    metal_bridge::rope_backward((float*)grad_k.raw_ptr(), cos_table_.data(),
                                 sin_table_.data(), batch, k_heads, seq_len,
                                 head_dim);
-
-    if (grad_q.dtype() == DType::FP32) {
-      Tensor tmp = q_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_q.data(), tmp.data(), tmp.raw_bytes());
-    }
-    if (grad_k.dtype() == DType::FP32) {
-      Tensor tmp = k_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_k.data(), tmp.data(), tmp.raw_bytes());
-    }
     return;
   }
 

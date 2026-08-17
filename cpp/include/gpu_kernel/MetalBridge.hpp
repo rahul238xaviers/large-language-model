@@ -87,6 +87,8 @@ void fill_zero_async(float *data, size_t bytes);
 void copy_buffer_async(float *dst, size_t dst_bytes, const float *src, size_t src_bytes);
 
 void residual_add(float *a, const float *b, size_t n);
+void convert_fp32_to_bf16(const float *src, float *dst, size_t n);
+void convert_bf16_to_fp32(const float *src, float *dst, size_t n);
 void fused_add_norm(float *x_residual, const float *residual,
                     const float *weight, float *output,
                     size_t num_rows, size_t D, float eps);
