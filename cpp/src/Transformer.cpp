@@ -527,13 +527,13 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   }
 
   if (use_gpu) {
-    if (grad_w_gate.dtype() == DType::FP32) { Tensor tmp = grad_w_gate_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_gate.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_w_up.dtype() == DType::FP32) { Tensor tmp = grad_w_up_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_up.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_w_down.dtype() == DType::FP32) { Tensor tmp = grad_w_down_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_down.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_Wq.dtype() == DType::FP32) { Tensor tmp = grad_Wq_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wq.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_Wk.dtype() == DType::FP32) { Tensor tmp = grad_Wk_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wk.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_Wv.dtype() == DType::FP32) { Tensor tmp = grad_Wv_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wv.data(), tmp.data(), tmp.raw_bytes()); }
-    if (grad_Wo.dtype() == DType::FP32) { Tensor tmp = grad_Wo_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wo.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_w_gate.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_w_gate_bf16.raw_ptr(), (float*)grad_w_gate.raw_ptr(), grad_w_gate.size()); }
+    if (grad_w_up.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_w_up_bf16.raw_ptr(), (float*)grad_w_up.raw_ptr(), grad_w_up.size()); }
+    if (grad_w_down.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_w_down_bf16.raw_ptr(), (float*)grad_w_down.raw_ptr(), grad_w_down.size()); }
+    if (grad_Wq.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_Wq_bf16.raw_ptr(), (float*)grad_Wq.raw_ptr(), grad_Wq.size()); }
+    if (grad_Wk.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_Wk_bf16.raw_ptr(), (float*)grad_Wk.raw_ptr(), grad_Wk.size()); }
+    if (grad_Wv.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_Wv_bf16.raw_ptr(), (float*)grad_Wv.raw_ptr(), grad_Wv.size()); }
+    if (grad_Wo.dtype() == DType::FP32) { metal_bridge::convert_bf16_to_fp32((const float*)grad_Wo_bf16.raw_ptr(), (float*)grad_Wo.raw_ptr(), grad_Wo.size()); }
   }
 
   return use_gpu ? grad_h_in.to_dtype(grad_output.dtype()) : grad_h_in;
@@ -583,13 +583,34 @@ static void accumulate_output_projection_grads(
     const Tensor &final_h, const Tensor &grad_logits,
     Tensor &grad_output_projection) {
   // grad_output_projection [H, V] = final_h[B*S, H].T @ grad_logits[B*S, V]
-  // Use gemm_backward (trA=true) so both inputs stay BF16 — avoids the broken
-  // FP32->bfloat matmul path and the 13 GB transpose allocation.
-  metal_bridge::gemm_backward(
-      (const float*)final_h.raw_ptr(),
-      (const float*)grad_logits.raw_ptr(),
-      (float*)grad_output_projection.raw_ptr(),
-      hidden_dim, vocab_size, batch_size * seq_len);
+  // Use gemm_backward (trA=true) so both inputs stay BF16.
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (use_gpu) {
+    Tensor grad_output_projection_bf16({hidden_dim, vocab_size}, 0.0f, DType::BF16);
+    metal_bridge::gemm_backward(
+        (const float*)final_h.raw_ptr(),
+        (const float*)grad_logits.raw_ptr(),
+        (float*)grad_output_projection_bf16.raw_ptr(),
+        hidden_dim, vocab_size, batch_size * seq_len);
+    metal_bridge::convert_bf16_to_fp32(
+        (const float*)grad_output_projection_bf16.raw_ptr(),
+        (float*)grad_output_projection.raw_ptr(),
+        grad_output_projection.size());
+  } else {
+    metal_bridge::gemm_backward(
+        (const float*)final_h.raw_ptr(),
+        (const float*)grad_logits.raw_ptr(),
+        (float*)grad_output_projection.raw_ptr(),
+        hidden_dim, vocab_size, batch_size * seq_len);
+  }
 }
 
 // Static helper to accumulate gradients w.r.t token embeddings
@@ -743,6 +764,9 @@ Tensor Transformer::backward(
   // --- 5. Embedding Lookup Backward ---
   if (profile_bwd) std::cout << "[PROFILE-BWD]   4. Embedding Grad Accumulation..." << std::endl;
   auto temb_start = std::chrono::high_resolution_clock::now();
+  if (use_gpu) {
+    metal_bridge::end_scope();
+  }
   accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h,
                              grad_embeddings);
 

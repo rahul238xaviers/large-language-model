@@ -57,6 +57,8 @@ static id<MTLComputePipelineState> pipelineStateGEMMBwdWeight = nil;
 static id<MTLComputePipelineState> pipelineStateFusedAddNorm = nil;
 static id<MTLComputePipelineState> pipelineStateFusedBackwardAddNorm = nil;
 static id<MTLComputePipelineState> pipelineStateFusedSwiGLUGEMM = nil;
+static id<MTLComputePipelineState> pipelineStateConvertFP32ToBF16 = nil;
+static id<MTLComputePipelineState> pipelineStateConvertBF16ToFP32 = nil;
 
 static float last_step_loss = 0.0f;
 static bool initialized = false;
@@ -506,6 +508,18 @@ void initialize() {
   pipelineStateFusedSwiGLUGEMM = [device newComputePipelineStateWithFunction:fusedSwiGLUFunc error:&error];
   if (!pipelineStateFusedSwiGLUGEMM) { std::cerr << "Failed to compile 'fused_swiglu_gemm'\n"; return; }
   std::cout << "Compiled 'fused_swiglu_gemm'!" << std::endl;
+
+  id<MTLFunction> convertFP32ToBF16Func = [defaultLibrary newFunctionWithName:@"convert_fp32_to_bf16"];
+  if (!convertFP32ToBF16Func) { std::cerr << "Failed to find 'convert_fp32_to_bf16'\n"; return; }
+  pipelineStateConvertFP32ToBF16 = [device newComputePipelineStateWithFunction:convertFP32ToBF16Func error:&error];
+  if (!pipelineStateConvertFP32ToBF16) { std::cerr << "Failed to compile 'convert_fp32_to_bf16'\n"; return; }
+  std::cout << "Compiled 'convert_fp32_to_bf16'!" << std::endl;
+
+  id<MTLFunction> convertBF16ToFP32Func = [defaultLibrary newFunctionWithName:@"convert_bf16_to_fp32"];
+  if (!convertBF16ToFP32Func) { std::cerr << "Failed to find 'convert_bf16_to_fp32'\n"; return; }
+  pipelineStateConvertBF16ToFP32 = [device newComputePipelineStateWithFunction:convertBF16ToFP32Func error:&error];
+  if (!pipelineStateConvertBF16ToFP32) { std::cerr << "Failed to compile 'convert_bf16_to_fp32'\n"; return; }
+  std::cout << "Compiled 'convert_bf16_to_fp32'!" << std::endl;
 
   // Wire up the gpu_wrapper release function so PagedBuffer destructors
   // can call CFRelease without including ObjC headers.
@@ -1371,6 +1385,100 @@ void residual_add(float *a, const float *b, size_t n) {
     }
   }
 }
+
+void convert_fp32_to_bf16(const float *src, float *dst, size_t n) {
+  if (n == 0 || src == nullptr || dst == nullptr) return;
+
+  size_t bytesSrc = n * sizeof(float);
+  size_t bytesDst = n * sizeof(__bf16);
+
+  id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+  uint32_t un = static_cast<uint32_t>(n);
+
+  if (!bufSrc || !bufDst) {
+    std::cerr << "[convert_fp32_to_bf16] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  id<MTLCommandBuffer> cb__ = batchCommandBuffer;
+  if (cb__) {
+    id<MTLComputeCommandEncoder> e__ = [cb__ computeCommandEncoder];
+    [e__ setComputePipelineState:pipelineStateConvertFP32ToBF16];
+    [e__ setBuffer:bufSrc offset:0 atIndex:0];
+    [e__ setBuffer:bufDst offset:0 atIndex:1];
+    [e__ setBytes:&un length:sizeof(uint32_t) atIndex:2];
+
+    MTLSize threads = MTLSizeMake(256, 1, 1);
+    MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+    [e__ dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+    [e__ endEncoding];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb2__ = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> e__ = [cb2__ computeCommandEncoder];
+      [e__ setComputePipelineState:pipelineStateConvertFP32ToBF16];
+      [e__ setBuffer:bufSrc offset:0 atIndex:0];
+      [e__ setBuffer:bufDst offset:0 atIndex:1];
+      [e__ setBytes:&un length:sizeof(uint32_t) atIndex:2];
+      MTLSize threads = MTLSizeMake(256, 1, 1);
+      MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+      [e__ dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+      [e__ endEncoding];
+      [cb2__ commit];
+      [cb2__ waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+void convert_bf16_to_fp32(const float *src, float *dst, size_t n) {
+  if (n == 0 || src == nullptr || dst == nullptr) return;
+
+  size_t bytesSrc = n * sizeof(__bf16);
+  size_t bytesDst = n * sizeof(float);
+
+  id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+  uint32_t un = static_cast<uint32_t>(n);
+
+  if (!bufSrc || !bufDst) {
+    std::cerr << "[convert_bf16_to_fp32] Failed to allocate Metal buffers." << std::endl;
+    return;
+  }
+
+  id<MTLCommandBuffer> cb__ = batchCommandBuffer;
+  if (cb__) {
+    id<MTLComputeCommandEncoder> e__ = [cb__ computeCommandEncoder];
+    [e__ setComputePipelineState:pipelineStateConvertBF16ToFP32];
+    [e__ setBuffer:bufSrc offset:0 atIndex:0];
+    [e__ setBuffer:bufDst offset:0 atIndex:1];
+    [e__ setBytes:&un length:sizeof(uint32_t) atIndex:2];
+
+    MTLSize threads = MTLSizeMake(256, 1, 1);
+    MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+    [e__ dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+    [e__ endEncoding];
+  } else {
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb2__ = [commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> e__ = [cb2__ computeCommandEncoder];
+      [e__ setComputePipelineState:pipelineStateConvertBF16ToFP32];
+      [e__ setBuffer:bufSrc offset:0 atIndex:0];
+      [e__ setBuffer:bufDst offset:0 atIndex:1];
+      [e__ setBytes:&un length:sizeof(uint32_t) atIndex:2];
+      MTLSize threads = MTLSizeMake(256, 1, 1);
+      MTLSize grid    = MTLSizeMake((n + 255) / 256, 1, 1);
+      [e__ dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+      [e__ endEncoding];
+      [cb2__ commit];
+      [cb2__ waitUntilCompleted];
+      run_copy_back_tasks();
+    }
+  }
+}
+
+
 
 void fused_add_norm(float *x_residual, const float *residual,
                     const float *weight, float *output,

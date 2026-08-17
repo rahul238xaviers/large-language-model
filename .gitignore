@@ -77,3 +77,7 @@ test_output.txt
 # ── OS Generated ──
 .DS_Store
 Thumbs.db
+
+# ── Graphify Index ──
+graphify-out/
+

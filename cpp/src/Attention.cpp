@@ -549,21 +549,29 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
     }
   }
 
-  // 6. Backpropagate RoPE
-  rope.backward(grad_q4, grad_k4);
-
-  // 7. Reshape gradients back to 3D
-  Tensor grad_q_proj = reshape_to_3d(grad_q4);
-  Tensor grad_k_proj = reshape_to_3d(grad_k4);
-  Tensor grad_v_proj = reshape_to_3d(grad_v4);
-
-  // gemm_backward/gemm_proj_trans_b read inputs as bfloat → convert FP32
-  // projection grads to BF16 for the GPU path.
+  // 6. Backpropagate RoPE, 7. Reshape gradients back to 3D, and handle BF16 conversions on GPU
   Tensor grad_q_proj_bf16, grad_k_proj_bf16, grad_v_proj_bf16;
+  Tensor grad_q_proj, grad_k_proj, grad_v_proj;
+
   if (use_gpu) {
-    grad_q_proj_bf16 = grad_q_proj.to_dtype(DType::BF16);
-    grad_k_proj_bf16 = grad_k_proj.to_dtype(DType::BF16);
-    grad_v_proj_bf16 = grad_v_proj.to_dtype(DType::BF16);
+    Tensor grad_q4_bf16({batch, n_heads, seq_len, head_dim}, 0.0f, DType::BF16);
+    Tensor grad_k4_bf16({batch, n_kv_heads, seq_len, head_dim}, 0.0f, DType::BF16);
+    Tensor grad_v4_bf16({batch, n_kv_heads, seq_len, head_dim}, 0.0f, DType::BF16);
+
+    metal_bridge::convert_fp32_to_bf16((const float*)grad_q4.raw_ptr(), (float*)grad_q4_bf16.raw_ptr(), grad_q4.size());
+    metal_bridge::convert_fp32_to_bf16((const float*)grad_k4.raw_ptr(), (float*)grad_k4_bf16.raw_ptr(), grad_k4.size());
+    metal_bridge::convert_fp32_to_bf16((const float*)grad_v4.raw_ptr(), (float*)grad_v4_bf16.raw_ptr(), grad_v4.size());
+
+    rope.backward(grad_q4_bf16, grad_k4_bf16);
+
+    grad_q_proj_bf16 = reshape_to_3d(grad_q4_bf16);
+    grad_k_proj_bf16 = reshape_to_3d(grad_k4_bf16);
+    grad_v_proj_bf16 = reshape_to_3d(grad_v4_bf16);
+  } else {
+    rope.backward(grad_q4, grad_k4);
+    grad_q_proj = reshape_to_3d(grad_q4);
+    grad_k_proj = reshape_to_3d(grad_k4);
+    grad_v_proj = reshape_to_3d(grad_v4);
   }
 
   // 8. Parameter gradients for Wq, Wk, Wv
