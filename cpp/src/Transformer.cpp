@@ -33,7 +33,12 @@ TransformerLayer::TransformerLayer(const ModelConfig &config)
       // Fused QKV: [H, nH*HD + 2*nKV*HD] = [1024, 2048]
       w_qkv({config.hidden_dim, config.n_heads * config.head_dim + 2 * config.n_kv_heads * config.head_dim}, 0.0f, DType::BF16),
       // Fused gate+up: [H, 2*I] = [1024, 5504]
-      w_gate_up({config.hidden_dim, 2 * config.intermediate_dim}, 0.0f, DType::BF16) {
+      w_gate_up({config.hidden_dim, 2 * config.intermediate_dim}, 0.0f, DType::BF16),
+      grad_activated_({}, DType::BF16),
+      grad_gate_({}, DType::BF16),
+      grad_up_({}, DType::BF16),
+      grad_ffn_in_({}, DType::BF16),
+      grad_up_in_({}, DType::BF16) {
   // Copy individual weights into fused buffers
   // w_qkv = [Wq | Wk | Wv] where Wq=[H,H], Wk=[H,512], Wv=[H,512]
   // w_gate_up = [Wgate | Wup] where both are [H,I]
@@ -95,8 +100,6 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
   size_t batch_size = tokens.shape()[0];
   size_t seq_len = tokens.shape()[1];
 
-  Tensor h = Tensor({batch_size, seq_len, config_.hidden_dim});
-
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;
   if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
@@ -105,6 +108,8 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
       use_gpu = true;
     }
   }
+
+  Tensor h = use_gpu ? Tensor({batch_size, seq_len, config_.hidden_dim}, 0.0f, DType::BF16) : Tensor({batch_size, seq_len, config_.hidden_dim});
 
   if (use_gpu) {
     size_t total_tokens = batch_size * seq_len;
@@ -149,11 +154,11 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
 
     if (use_gpu) {
       // Fused: h += attn_out  (in-place for backward)  AND  ffn_in = rmsnorm(h)
-      // ffn_in stays FP32 for now (rms_norm_forward kernel writes float*)
+      // ffn_in is BF16 to match the kernel's packed-BF16 output.
       Tensor ffn_in({batch_size, seq_len, config_.hidden_dim}, DType::BF16);
-      metal_bridge::fused_add_norm(h.data(), attn_out.data(),
-                                   layer.ffn_norm.weight().data(),
-                                   ffn_in.data(),
+      metal_bridge::fused_add_norm(h.data(), (const float*)attn_out.raw_ptr(),
+                                   (const float*)layer.ffn_norm.weight().raw_ptr(),
+                                   (float*)ffn_in.raw_ptr(),
                                    batch_size * seq_len,
                                    config_.hidden_dim,
                                    config_.rms_norm_eps);
@@ -162,8 +167,8 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
       Tensor up_proj = ffn_in.matmul(layer.w_up);
       Tensor ffn_out({batch_size, seq_len, config_.hidden_dim}, DType::BF16);
       metal_bridge::fused_swiglu_gemm(
-          gate_proj.data(), up_proj.data(), layer.w_down.data(),
-          ffn_out.data(),
+          (const float*)gate_proj.raw_ptr(), (const float*)up_proj.raw_ptr(), (const float*)layer.w_down.data(),
+          (float*)ffn_out.raw_ptr(),
           batch_size * seq_len, config_.hidden_dim, config_.intermediate_dim);
 
       // Fused: h += ffn_out  (in-place for backward)  AND  attn_in_next = rmsnorm(h)
@@ -173,7 +178,7 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
       // The attn_norm.forward in the next iteration still needs to run separately.
       // But we can fuse the add with a dummy output — the next iter's attn_norm.forward
       // will recompute the rmsnorm. So we just do the in-place add here:
-      metal_bridge::residual_add(h.data(), ffn_out.data(), h.size());
+      metal_bridge::residual_add(h.data(), (const float*)ffn_out.raw_ptr(), h.size());
     } else {
       h.add_(attn_out);
       Tensor ffn_in = layer.ffn_norm.forward(h);
@@ -190,10 +195,26 @@ Tensor Transformer::forward(const Tensor &tokens, KVCache *cache) const {
   // Final RMSNorm
   Tensor final_h = final_norm_.forward(h);
 
-  // Project to vocabulary logits
-  Tensor logits = final_h.matmul(output_projection_);
+  if (getenv("DEBUG_LOGITS")) {
+    auto ncnt = [](const uint16_t* p, size_t n) { size_t c = 0; for (size_t i = 0; i < n; ++i) if ((p[i] & 0x7F80) == 0x7F80) c++; return c; };
+    printf("[F] h NaN=%zu, final_h NaN=%zu\n",
+           ncnt((const uint16_t*)h.raw_ptr(), h.num_elements()),
+           ncnt((const uint16_t*)final_h.raw_ptr(), final_h.num_elements()));
+  }
 
-  return logits;
+  // Project to vocabulary logits — reuse the persistent logits_ buffer so the
+  // 6.5 GB allocation happens once, not every step (avoids page-fault churn).
+  Shape logits_shape = h.shape();
+  logits_shape.dims[2] = config_.vocab_size;
+  logits_shape.ndim = 3;
+  if (logits_.shape() != logits_shape)
+    logits_ = Tensor(logits_shape, 0.0f, DType::BF16);
+
+  metal_bridge::gemm_bf16(final_h.data(), output_projection_.data(),
+                          (float*)logits_.raw_ptr(),
+                          batch_size * seq_len, config_.vocab_size,
+                          config_.hidden_dim, false, false, true);
+  return logits_;
 }
 
 /**
@@ -220,14 +241,23 @@ accumulate_ffn_down_grads(size_t batch, size_t seq_len, size_t intermediate_dim,
   if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
     metal_bridge::initialize();
     if (metal_bridge::is_available()) {
+      Tensor activated_bf16 = activated.to_dtype(DType::BF16);
+      Tensor grad_output_bf16 = grad_output.to_dtype(DType::BF16);
+      Tensor grad_w_down_bf16 = grad_w_down.to_dtype(DType::BF16);
+
       metal_bridge::gemm_backward(
-          activated.data(),
-          grad_output.data(),
-          grad_w_down.data(),
+          (const float*)activated_bf16.raw_ptr(),
+          (const float*)grad_output_bf16.raw_ptr(),
+          (float*)grad_w_down_bf16.raw_ptr(),
           intermediate_dim,
           hidden_dim,
           batch * seq_len
       );
+
+      if (grad_w_down.dtype() == DType::FP32) {
+        Tensor tmp = grad_w_down_bf16.to_dtype(DType::FP32);
+        std::memcpy(grad_w_down.data(), tmp.data(), tmp.raw_bytes());
+      }
       return;
     }
   }
@@ -263,22 +293,37 @@ accumulate_ffn_gate_up_grads(size_t batch, size_t seq_len, size_t hidden_dim,
   if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
     metal_bridge::initialize();
     if (metal_bridge::is_available()) {
+      Tensor ffn_in_bf16 = ffn_in.to_dtype(DType::BF16);
+      Tensor grad_gate_bf16 = grad_gate.to_dtype(DType::BF16);
+      Tensor grad_up_bf16 = grad_up.to_dtype(DType::BF16);
+      Tensor grad_w_gate_bf16 = grad_w_gate.to_dtype(DType::BF16);
+      Tensor grad_w_up_bf16 = grad_w_up.to_dtype(DType::BF16);
+
       metal_bridge::gemm_backward(
-          ffn_in.data(),
-          grad_gate.data(),
-          grad_w_gate.data(),
+          (const float*)ffn_in_bf16.raw_ptr(),
+          (const float*)grad_gate_bf16.raw_ptr(),
+          (float*)grad_w_gate_bf16.raw_ptr(),
           hidden_dim,
           intermediate_dim,
           batch * seq_len
       );
       metal_bridge::gemm_backward(
-          ffn_in.data(),
-          grad_up.data(),
-          grad_w_up.data(),
+          (const float*)ffn_in_bf16.raw_ptr(),
+          (const float*)grad_up_bf16.raw_ptr(),
+          (float*)grad_w_up_bf16.raw_ptr(),
           hidden_dim,
           intermediate_dim,
           batch * seq_len
       );
+
+      if (grad_w_gate.dtype() == DType::FP32) {
+        Tensor tmp = grad_w_gate_bf16.to_dtype(DType::FP32);
+        std::memcpy(grad_w_gate.data(), tmp.data(), tmp.raw_bytes());
+      }
+      if (grad_w_up.dtype() == DType::FP32) {
+        Tensor tmp = grad_w_up_bf16.to_dtype(DType::FP32);
+        std::memcpy(grad_w_up.data(), tmp.data(), tmp.raw_bytes());
+      }
       return;
     }
   }
@@ -368,10 +413,21 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
     }
   }
 
-  // --- A. Recompute Forward States (FP32 for norm output, BF16 for matmul results) ---
-  Tensor attn_in = attn_norm.forward(h_in);
+  // --- A. Recompute Forward States (BF16 if GPU is enabled) ---
+  Tensor h_in_aligned = use_gpu ? h_in.to_dtype(DType::BF16) : h_in;
+  Tensor grad_output_aligned = use_gpu ? grad_output.to_dtype(DType::BF16) : grad_output;
+
+  Tensor grad_w_gate_bf16 = use_gpu ? grad_w_gate.to_dtype(DType::BF16) : grad_w_gate;
+  Tensor grad_w_up_bf16 = use_gpu ? grad_w_up.to_dtype(DType::BF16) : grad_w_up;
+  Tensor grad_w_down_bf16 = use_gpu ? grad_w_down.to_dtype(DType::BF16) : grad_w_down;
+  Tensor grad_Wq_bf16 = use_gpu ? grad_Wq.to_dtype(DType::BF16) : grad_Wq;
+  Tensor grad_Wk_bf16 = use_gpu ? grad_Wk.to_dtype(DType::BF16) : grad_Wk;
+  Tensor grad_Wv_bf16 = use_gpu ? grad_Wv.to_dtype(DType::BF16) : grad_Wv;
+  Tensor grad_Wo_bf16 = use_gpu ? grad_Wo.to_dtype(DType::BF16) : grad_Wo;
+
+  Tensor attn_in = attn_norm.forward(h_in_aligned);
   Tensor attn_out = attn.forward(attn_in, rope, cache);
-  Tensor h_mid = h_in.add(attn_out);
+  Tensor h_mid = h_in_aligned.add(attn_out);
 
   Tensor ffn_in = ffn_norm.forward(h_mid);
   Tensor gate_proj = ffn_in.matmul(w_gate);
@@ -380,13 +436,13 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
 
   // --- B. FFN Down Projection Backward ---
   accumulate_ffn_down_grads(batch, seq_len, intermediate_dim, hidden_dim,
-                            activated, grad_output, grad_w_down);
+                            activated, grad_output_aligned, grad_w_down_bf16);
 
   // Reuse persistent storage — no allocation, no zeroing
   grad_activated_.resize_storage({batch, seq_len, intermediate_dim});
   if (use_gpu) {
-    metal_bridge::gemm_proj_trans_b(grad_output.data(), w_down.data(),
-                                    grad_activated_.data(), batch * seq_len,
+    metal_bridge::gemm_proj_trans_b((const float*)grad_output_aligned.raw_ptr(), (const float*)w_down.raw_ptr(),
+                                    (float*)grad_activated_.raw_ptr(), batch * seq_len,
                                     intermediate_dim, hidden_dim);
   } else {
     auto transpose_w = [](const Tensor &w) {
@@ -397,7 +453,7 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
                   static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
       return transposed;
     };
-    grad_activated_ = grad_output.matmul(transpose_w(w_down));
+    grad_activated_ = grad_output_aligned.matmul(transpose_w(w_down));
   }
 
   // --- C. SwiGLU & Projection Backwards ---
@@ -412,19 +468,19 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
                                   grad_gate_, grad_up_);
 
   accumulate_ffn_gate_up_grads(batch, seq_len, hidden_dim, intermediate_dim,
-                               ffn_in, grad_gate_, grad_up_, grad_w_gate,
-                               grad_w_up);
+                               ffn_in, grad_gate_, grad_up_, grad_w_gate_bf16,
+                               grad_w_up_bf16);
 
   grad_ffn_in_.resize_storage({batch, seq_len, hidden_dim});
   if (use_gpu) {
-    metal_bridge::gemm_proj_trans_b(grad_gate_.data(), w_gate.data(),
-                                    grad_ffn_in_.data(), batch * seq_len,
+    metal_bridge::gemm_proj_trans_b((const float*)grad_gate_.raw_ptr(), (const float*)w_gate.raw_ptr(),
+                                    (float*)grad_ffn_in_.raw_ptr(), batch * seq_len,
                                     hidden_dim, intermediate_dim);
     grad_up_in_.resize_storage({batch, seq_len, hidden_dim});
-    metal_bridge::gemm_proj_trans_b(grad_up_.data(), w_up.data(),
-                                    grad_up_in_.data(), batch * seq_len,
+    metal_bridge::gemm_proj_trans_b((const float*)grad_up_.raw_ptr(), (const float*)w_up.raw_ptr(),
+                                    (float*)grad_up_in_.raw_ptr(), batch * seq_len,
                                     hidden_dim, intermediate_dim);
-    metal_bridge::residual_add(grad_ffn_in_.data(), grad_up_in_.data(), grad_ffn_in_.size());
+    metal_bridge::residual_add((float*)grad_ffn_in_.raw_ptr(), (const float*)grad_up_in_.raw_ptr(), grad_ffn_in_.size());
   } else {
     auto transpose_w = [](const Tensor &w) {
       size_t rows = w.shape()[0];
@@ -442,35 +498,45 @@ Tensor TransformerLayer::backward(const Tensor &grad_output, const Tensor &h_in,
   Tensor grad_h_mid({batch, seq_len, hidden_dim}, DType::BF16);
   if (use_gpu) {
     metal_bridge::fused_backward_add_norm(
-        grad_ffn_in_.raw_ptr(), h_mid.raw_ptr(),
-        ffn_norm.weight().raw_ptr(), grad_output.raw_ptr(),
-        grad_h_mid.raw_ptr(),
+        (const float*)grad_ffn_in_.raw_ptr(), (const float*)h_mid.raw_ptr(),
+        (const float*)ffn_norm.weight().raw_ptr(), (const float*)grad_output_aligned.raw_ptr(),
+        (float*)grad_h_mid.raw_ptr(),
         batch * seq_len, hidden_dim, cfg.rms_norm_eps);
   } else {
     Tensor grad_ffn_norm_weight_dummy({hidden_dim}, 0.0f);
     grad_h_mid = ffn_norm.backward(grad_ffn_in_, h_mid, grad_ffn_norm_weight_dummy);
-    grad_h_mid.add_(grad_output);
+    grad_h_mid.add_(grad_output_aligned);
   }
 
   // --- E. Attention Layer & Norm & Residual Backward ---
-  Tensor grad_attn_in = attn.backward(grad_h_mid, attn_in, rope, grad_Wq,
-                                      grad_Wk, grad_Wv, grad_Wo, cache);
+  Tensor grad_attn_in = attn.backward(grad_h_mid, attn_in, rope, grad_Wq_bf16,
+                                      grad_Wk_bf16, grad_Wv_bf16, grad_Wo_bf16, cache);
 
   // --- F. Attention Norm & Residual Backward (FUSED) ---
   Tensor grad_h_in({batch, seq_len, hidden_dim}, DType::BF16);
   if (use_gpu) {
     metal_bridge::fused_backward_add_norm(
-        grad_attn_in.raw_ptr(), h_in.raw_ptr(),
-        attn_norm.weight().raw_ptr(), grad_h_mid.raw_ptr(),
-        grad_h_in.raw_ptr(),
+        (const float*)grad_attn_in.raw_ptr(), (const float*)h_in_aligned.raw_ptr(),
+        (const float*)attn_norm.weight().raw_ptr(), (const float*)grad_h_mid.raw_ptr(),
+        (float*)grad_h_in.raw_ptr(),
         batch * seq_len, hidden_dim, cfg.rms_norm_eps);
   } else {
     Tensor grad_attn_norm_weight_dummy({hidden_dim}, 0.0f);
-    grad_h_in = attn_norm.backward(grad_attn_in, h_in, grad_attn_norm_weight_dummy);
+    grad_h_in = attn_norm.backward(grad_attn_in, h_in_aligned, grad_attn_norm_weight_dummy);
     grad_h_in.add_(grad_h_mid);
   }
 
-  return grad_h_in;
+  if (use_gpu) {
+    if (grad_w_gate.dtype() == DType::FP32) { Tensor tmp = grad_w_gate_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_gate.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_w_up.dtype() == DType::FP32) { Tensor tmp = grad_w_up_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_up.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_w_down.dtype() == DType::FP32) { Tensor tmp = grad_w_down_bf16.to_dtype(DType::FP32); std::memcpy(grad_w_down.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wq.dtype() == DType::FP32) { Tensor tmp = grad_Wq_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wq.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wk.dtype() == DType::FP32) { Tensor tmp = grad_Wk_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wk.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wv.dtype() == DType::FP32) { Tensor tmp = grad_Wv_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wv.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wo.dtype() == DType::FP32) { Tensor tmp = grad_Wo_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wo.data(), tmp.data(), tmp.raw_bytes()); }
+  }
+
+  return use_gpu ? grad_h_in.to_dtype(grad_output.dtype()) : grad_h_in;
 }
 
 // Static helper to run a cached forward pass storing intermediate hidden states
@@ -517,7 +583,13 @@ static void accumulate_output_projection_grads(
     const Tensor &final_h, const Tensor &grad_logits,
     Tensor &grad_output_projection) {
   // grad_output_projection [H, V] = final_h[B*S, H].T @ grad_logits[B*S, V]
-  grad_output_projection = final_h.reshape({batch_size * seq_len, hidden_dim}).transpose().matmul(grad_logits.reshape({batch_size * seq_len, vocab_size}));
+  // Use gemm_backward (trA=true) so both inputs stay BF16 — avoids the broken
+  // FP32->bfloat matmul path and the 13 GB transpose allocation.
+  metal_bridge::gemm_backward(
+      (const float*)final_h.raw_ptr(),
+      (const float*)grad_logits.raw_ptr(),
+      (float*)grad_output_projection.raw_ptr(),
+      hidden_dim, vocab_size, batch_size * seq_len);
 }
 
 // Static helper to accumulate gradients w.r.t token embeddings
@@ -526,11 +598,16 @@ static void accumulate_embedding_grads(size_t batch_size, size_t seq_len,
                                        const Tensor &grad_h,
                                        Tensor &grad_embeddings) {
   grad_embeddings.fill(0.0f);
+  // grad_h is BF16 (2-byte packed) in the GPU path; Tensor::operator() reads via
+  // data_float() (4 bytes/elem), which would over-read 2x past the buffer and
+  // return garbage.  Convert to FP32 first so the indexed reads are in-bounds.
+  Tensor gh = (grad_h.dtype() == DType::BF16) ? grad_h.to_dtype(DType::FP32)
+                                              : grad_h;
   for (size_t b = 0; b < batch_size; ++b) {
     for (size_t s = 0; s < seq_len; ++s) {
       size_t id = static_cast<size_t>(tokens(b, s));
       for (size_t d = 0; d < hidden_dim; ++d) {
-        grad_embeddings(id, d) += grad_h(b, s, d);
+        grad_embeddings(id, d) += gh(b, s, d);
       }
     }
   }
@@ -589,69 +666,94 @@ Tensor Transformer::backward(
     }
   }
 
-  std::cout << "[PROFILE-BWD] Starting Model Backward..." << std::endl;
+  bool profile_bwd = getenv("PROFILE_BWD") != nullptr;
+  bool skip_outproj_bwd = getenv("DEBUG_SKIP_OUTPROJ_BWD") != nullptr;
   auto tbwd_start = std::chrono::high_resolution_clock::now();
+  if (profile_bwd) std::cout << "[PROFILE-BWD] Starting Model Backward..." << std::endl;
 
   // --- 1. Use cached hidden states from the forward pass ---
-  // h_cache_[l] is the hidden state AFTER layer l-1 (embedding output for l=0).
-  // This eliminates the expensive run_forward_cache recomputation (~2.8s).
   const auto &h_states = h_cache_;
   Tensor final_h = final_norm_.forward(h_states.back());
 
   // --- 2. Output Projection Backward ---
-  std::cout << "[PROFILE-BWD]   1. Output Projection Grad..." << std::endl;
-  accumulate_output_projection_grads(batch_size, seq_len, hidden_dim,
-                                     vocab_size, final_h, grad_logits,
-                                     grad_output_projection);
+  if (profile_bwd) std::cout << "[PROFILE-BWD]   1. Output Projection Grad..." << std::endl;
+  auto top_start = std::chrono::high_resolution_clock::now();
+  Tensor grad_h;
+  if (!skip_outproj_bwd) {
+    accumulate_output_projection_grads(batch_size, seq_len, hidden_dim,
+                                       vocab_size, final_h, grad_logits,
+                                       grad_output_projection);
 
-  Tensor grad_final_h({batch_size, seq_len, hidden_dim}, 0.0f);
-  if (use_gpu) {
-    metal_bridge::gemm_proj_trans_b(
-        grad_logits.data(),
-        output_projection_.data(),
-        grad_final_h.data(),
-        batch_size * seq_len,
-        hidden_dim,
-        vocab_size
-    );
+    Tensor grad_final_h({batch_size, seq_len, hidden_dim}, 0.0f);
+    if (use_gpu) {
+      // gemm_proj_trans_b writes BF16; use a temporary BF16 tensor and convert.
+      Tensor grad_final_h_bf16({batch_size, seq_len, hidden_dim}, 0.0f, DType::BF16);
+      metal_bridge::gemm_proj_trans_b(
+          grad_logits.data(),
+          output_projection_.data(),
+          (float*)grad_final_h_bf16.raw_ptr(),
+          batch_size * seq_len,
+          hidden_dim,
+          vocab_size
+      );
+      if (grad_final_h.dtype() == DType::FP32) {
+        Tensor tmp = grad_final_h_bf16.to_dtype(DType::FP32);
+        std::memcpy(grad_final_h.data(), tmp.data(), tmp.raw_bytes());
+      }
+    } else {
+      auto transpose_w = [](const Tensor &w) {
+        size_t rows = w.shape()[0];
+        size_t cols = w.shape()[1];
+        Tensor transposed({cols, rows}, 0.0f);
+        vDSP_mtrans(w.data(), 1, transposed.data(), 1,
+                    static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
+        return transposed;
+      };
+      grad_final_h = grad_logits.matmul(transpose_w(output_projection_));
+    }
+
+    // --- 3. Final RMSNorm Backward ---
+    if (profile_bwd) std::cout << "[PROFILE-BWD]   2. Final RMSNorm Backward..." << std::endl;
+    Tensor grad_final_norm_weight_dummy({hidden_dim}, 0.0f);
+    grad_h = final_norm_.backward(grad_final_h, h_states.back(),
+                                       grad_final_norm_weight_dummy);
   } else {
-    auto transpose_w = [](const Tensor &w) {
-      size_t rows = w.shape()[0];
-      size_t cols = w.shape()[1];
-      Tensor transposed({cols, rows}, 0.0f);
-      vDSP_mtrans(w.data(), 1, transposed.data(), 1,
-                  static_cast<vDSP_Length>(cols), static_cast<vDSP_Length>(rows));
-      return transposed;
-    };
-    grad_final_h = grad_logits.matmul(transpose_w(output_projection_));
+    grad_h = final_h;
+  }
+  if (profile_bwd) {
+    auto top_end = std::chrono::high_resolution_clock::now();
+    double ms_op = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(top_end - top_start).count()) / 1000.0;
+    std::cout << "[PROFILE-BWD]   outproj+grad_final_h+finalnorm finished in " << ms_op << " ms" << std::endl;
   }
 
-  // --- 3. Final RMSNorm Backward ---
-  std::cout << "[PROFILE-BWD]   2. Final RMSNorm Backward..." << std::endl;
-  Tensor grad_final_norm_weight_dummy({hidden_dim}, 0.0f);
-  Tensor grad_h = final_norm_.backward(grad_final_h, h_states.back(),
-                                       grad_final_norm_weight_dummy);
-
   // --- 4. Backprop through Stacked Layers (in reverse order) ---
-  std::cout << "[PROFILE-BWD]   3. Layer-by-Layer Backward (" << config_.n_layers << " layers)..." << std::endl;
+  if (profile_bwd) std::cout << "[PROFILE-BWD]   3. Layer-by-Layer Backward (" << config_.n_layers << " layers)..." << std::endl;
   auto tl_start = std::chrono::high_resolution_clock::now();
   for (int l = static_cast<int>(config_.n_layers) - 1; l >= 0; --l) {
     grad_h = layers_[l].backward(grad_h, h_states[l], grad_w_gate[l],
                                  grad_w_up[l], grad_w_down[l], grad_Wq[l],
                                  grad_Wk[l], grad_Wv[l], grad_Wo[l], rope);
   }
-  auto tl_end = std::chrono::high_resolution_clock::now();
-  double ms_layers = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tl_end - tl_start).count()) / 1000.0;
-  std::cout << "[PROFILE-BWD]   3. All " << config_.n_layers << " layers finished in " << ms_layers << " ms" << std::endl;
+  if (profile_bwd) {
+    auto tl_end = std::chrono::high_resolution_clock::now();
+    double ms_layers = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tl_end - tl_start).count()) / 1000.0;
+    std::cout << "[PROFILE-BWD]   3. All " << config_.n_layers << " layers finished in " << ms_layers << " ms" << std::endl;
+  }
 
   // --- 5. Embedding Lookup Backward ---
-  std::cout << "[PROFILE-BWD]   4. Embedding Grad Accumulation..." << std::endl;
+  if (profile_bwd) std::cout << "[PROFILE-BWD]   4. Embedding Grad Accumulation..." << std::endl;
+  auto temb_start = std::chrono::high_resolution_clock::now();
   accumulate_embedding_grads(batch_size, seq_len, hidden_dim, tokens, grad_h,
                              grad_embeddings);
 
-  auto tbwd_end = std::chrono::high_resolution_clock::now();
-  double ms_bwd_total = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tbwd_end - tbwd_start).count()) / 1000.0;
-  std::cout << "[PROFILE-BWD] Finished Model Backward in " << ms_bwd_total << " ms" << std::endl;
+  if (profile_bwd) {
+    auto temb_end = std::chrono::high_resolution_clock::now();
+    double ms_emb = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(temb_end - temb_start).count()) / 1000.0;
+    std::cout << "[PROFILE-BWD]   embedding grad finished in " << ms_emb << " ms" << std::endl;
+    auto tbwd_end = std::chrono::high_resolution_clock::now();
+    double ms_bwd_total = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(tbwd_end - tbwd_start).count()) / 1000.0;
+    std::cout << "[PROFILE-BWD] Finished Model Backward in " << ms_bwd_total << " ms" << std::endl;
+  }
 
   return grad_h;
 }

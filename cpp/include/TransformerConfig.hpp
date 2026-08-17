@@ -22,7 +22,7 @@ struct ModelConfig {
 
   /**
    * @brief Dimension of the token embeddings and hidden states (H).
-   * @note Direct impact on Projection GEMM (gemm_proj.metal).
+   * @note Direct impact on projection GEMMs (gemm_bf16.metal).
    *       For optimal performance on GPU hardware matrix cores, hidden_dim
    *       should be a multiple of the threadgroup tile size (64 elements).
    *       Examples of well-aligned values: 512, 1024, 2048, 4096.
@@ -32,12 +32,12 @@ struct ModelConfig {
   /**
    * @brief Hidden dimension of the Feed-Forward Network (FFN) expansion layer
    * (typically ~4H).
-   * @note Direct impact on Feed-Forward GEMM (gemm_ffn.metal).
+   * @note Direct impact on the fused SwiGLU FFN GEMM (fused_swiglu_gemm.metal).
    *       For optimal GPU ALU occupancy and to prevent execution
-   * padding/divergence, intermediate_dim should be a multiple of the FFN tile
-   * size (128 elements). If non-aligned (e.g., 5461), the GPU shader fallback
-   * path relies on zero-padding, which incurs memory boundary check overhead.
-   * Optimal recommendation: 5632.
+   *       padding/divergence, intermediate_dim should be a multiple of the FFN tile
+   *       size (128 elements). If non-aligned (e.g., 5461), the GPU shader fallback
+   *       path relies on zero-padding, which incurs memory boundary check overhead.
+   *       Optimal recommendation: 5632.
    */
   size_t intermediate_dim;
 

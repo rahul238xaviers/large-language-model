@@ -23,12 +23,12 @@ inline float warp_sum(float v) {
 }
 
 kernel void fused_add_norm(
-    device float*       x_residual [[buffer(0)]],  // h (in-place, read-write)
-    device const float* residual   [[buffer(1)]],  // attn_out or ffn_out
-    device const float* weight     [[buffer(2)]],  // norm weight [D]
-    device float*       output     [[buffer(3)]],  // normalized output
-    constant uint&      D          [[buffer(4)]],
-    constant float&     eps        [[buffer(5)]],
+    device bfloat*       x_residual [[buffer(0)]],  // h (in-place, read-write, BF16)
+    device const bfloat* residual   [[buffer(1)]],  // attn_out or ffn_out (BF16)
+    device const bfloat* weight     [[buffer(2)]],  // norm weight [D] (BF16)
+    device bfloat*       output     [[buffer(3)]],  // normalized output (BF16)
+    constant uint&       D          [[buffer(4)]],
+    constant float&      eps        [[buffer(5)]],
     uint row_idx [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tpg     [[threads_per_threadgroup]],
@@ -42,10 +42,10 @@ kernel void fused_add_norm(
     float local_sq = 0.0f;
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
-        float xv = x_residual[idx];
-        float rv = residual[idx];
+        float xv = (float)x_residual[idx];
+        float rv = (float)residual[idx];
         float nv = xv + rv;
-        x_residual[idx] = nv;   // write back for backward
+        x_residual[idx] = (bfloat)nv;   // write back for backward
         local_sq += nv * nv;
     }
 
@@ -67,6 +67,6 @@ kernel void fused_add_norm(
     // and write normalized output
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
-        output[idx] = x_residual[idx] * rms * weight[c];
+        output[idx] = (bfloat)((float)x_residual[idx] * rms * (float)weight[c]);
     }
 }

@@ -48,7 +48,7 @@ kernel void cross_entropy(
     device const bfloat* logits     [[buffer(0)]],
     device const uint*  targets     [[buffer(1)]],
     device atomic_float* loss_out   [[buffer(2)]],
-    device float*       grad_logits [[buffer(3)]],
+    device bfloat*      grad_logits [[buffer(3)]],
     constant uint&      vocab_size  [[buffer(4)]],
     constant uint&      total_tokens[[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]],
@@ -58,8 +58,10 @@ kernel void cross_entropy(
 
     threadgroup float shared_mem[256];
     device const bfloat* token_logits = logits + t * vocab_size;
-    device float* token_grads = grad_logits + t * vocab_size;
+    device bfloat* token_grads = grad_logits + t * vocab_size;
     uint target_id = targets[t];
+    // Guard: an out-of-range target would index past the row (GPU fault).
+    if (target_id >= vocab_size) return;
 
     // --- Pass 1: Local Max ---
     float local_max = -INFINITY;
@@ -87,6 +89,6 @@ kernel void cross_entropy(
     for (uint v = tid; v < vocab_size; v += 256) {
         float prob = exp(token_logits[v] - group_max) / group_sum_exp;
         float is_target = (v == target_id) ? 1.0f : 0.0f;
-        token_grads[v] = (prob - is_target) * inv_total;
+        token_grads[v] = (bfloat)((prob - is_target) * inv_total);
     }
 }

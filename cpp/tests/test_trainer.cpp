@@ -517,10 +517,11 @@ int main() {
                                     &grad_Wo_s[l]);
       }
 
-      // Populate random initial weights
-      float *emb_data = model_save.token_embeddings().data();
+      // Populate random initial weights (model weights are BF16, so fill the
+      // packed 2-byte buffer directly).
+      uint16_t *emb_data = (uint16_t *)model_save.token_embeddings().data_bf16();
       for (size_t i = 0; i < model_save.token_embeddings().num_elements(); ++i) {
-        emb_data[i] = static_cast<float>(i) * 0.01f + 0.1f;
+        emb_data[i] = float_to_bf16(static_cast<float>(i) * 0.01f + 0.1f);
       }
       // Put fake gradients to verify optimizer moments update
       grad_embeddings_s.fill(1.0f);
@@ -589,14 +590,17 @@ int main() {
                   << std::endl;
       }
 
-      // Verify model parameters match exactly
-      const float *data_save = model_save.token_embeddings().data();
-      const float *data_load = model_load.token_embeddings().data();
+      // Verify model parameters match exactly (weights are BF16-packed, so
+      // compare the stored 2-byte values directly).
+      const uint16_t *w_save =
+          (const uint16_t *)model_save.token_embeddings().data_bf16();
+      const uint16_t *w_load =
+          (const uint16_t *)model_load.token_embeddings().data_bf16();
       for (size_t i = 0; i < model_save.token_embeddings().num_elements(); ++i) {
-        if (data_save[i] != data_load[i]) {
+        if (w_save[i] != w_load[i]) {
           checkpoint_pass = false;
           std::cerr << "Model weights mismatch at index " << i
-                    << ": save=" << data_save[i] << ", load=" << data_load[i]
+                    << ": save=" << w_save[i] << ", load=" << w_load[i]
                     << std::endl;
           break;
         }

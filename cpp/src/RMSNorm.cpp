@@ -57,7 +57,6 @@ Tensor RMSNorm::forward(const Tensor &x) const {
         "Input tensor last dimension must match RMSNorm dims");
   }
 
-  Tensor result(x.shape(), 0.0f);
   size_t total_elements = x.size();
   size_t num_rows = total_elements / dims;
 
@@ -70,8 +69,35 @@ Tensor RMSNorm::forward(const Tensor &x) const {
     }
   }
 
-  metal_bridge::rms_norm_forward(x.data(), result.data(), weight_.data(),
-                                 eps_, num_rows, dims);
+  if (use_gpu) {
+    Tensor x_bf16 = x.to_dtype(DType::BF16);
+    Tensor result_bf16(x.shape(), 0.0f, DType::BF16);
+
+    metal_bridge::rms_norm_forward((const float*)x_bf16.raw_ptr(),
+                                   (float*)result_bf16.raw_ptr(),
+                                   (const float*)weight_.raw_ptr(),
+                                   eps_, num_rows, dims);
+    return result_bf16.to_dtype(x.dtype());
+  }
+
+  // CPU path fallback
+  Tensor result(x.shape(), 0.0f, x.dtype());
+  const float *x_ptr = x.data();
+  float *res_ptr = result.data();
+  for (size_t r = 0; r < num_rows; ++r) {
+    size_t offset = r * dims;
+    float sum_sq = 0.0f;
+    for (size_t col = 0; col < dims; ++col) {
+      float val = x_ptr[offset + col];
+      sum_sq += val * val;
+    }
+    float rms = std::sqrt(sum_sq / static_cast<float>(dims) + eps_);
+    float inv_rms = 1.0f / rms;
+    for (size_t col = 0; col < dims; ++col) {
+      float w_val = (weight_.dtype() == DType::BF16) ? bf16_to_float(((const uint16_t*)weight_.raw_ptr())[col]) : weight_.data()[col];
+      res_ptr[offset + col] = x_ptr[offset + col] * inv_rms * w_val;
+    }
+  }
   return result;
 }
 
@@ -88,7 +114,7 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
         "grad_weight must match RMSNorm weight dimensions");
   }
 
-  Tensor grad_input(input.shape(), 0.0f);
+  Tensor grad_input(input.shape(), 0.0f, input.dtype());
   size_t total_elements = input.size();
   size_t num_rows = total_elements / dims;
 
@@ -102,13 +128,33 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   }
 
   if (use_gpu) {
-    metal_bridge::rms_norm_backward(grad_output.data(), input.data(), weight_.data(),
-                                    grad_input.data(), grad_weight.data(), eps_,
-                                    num_rows, dims);
+    Tensor grad_output_bf16 = grad_output.to_dtype(DType::BF16);
+    Tensor input_bf16 = input.to_dtype(DType::BF16);
+    Tensor grad_input_bf16(input.shape(), 0.0f, DType::BF16);
+    Tensor grad_weight_bf16 = grad_weight.to_dtype(DType::BF16);
+
+    metal_bridge::rms_norm_backward((const float*)grad_output_bf16.raw_ptr(),
+                                    (const float*)input_bf16.raw_ptr(),
+                                    (const float*)weight_.raw_ptr(),
+                                    (float*)grad_input_bf16.raw_ptr(),
+                                    (float*)grad_weight_bf16.raw_ptr(),
+                                    eps_, num_rows, dims);
+
+    if (grad_input.dtype() == DType::FP32) {
+      Tensor tmp = grad_input_bf16.to_dtype(DType::FP32);
+      std::memcpy(grad_input.data(), tmp.data(), tmp.raw_bytes());
+    } else {
+      std::memcpy(grad_input.raw_ptr(), grad_input_bf16.raw_ptr(), grad_input_bf16.raw_bytes());
+    }
+
+    if (grad_weight.dtype() == DType::FP32) {
+      Tensor tmp = grad_weight_bf16.to_dtype(DType::FP32);
+      std::memcpy(grad_weight.data(), tmp.data(), tmp.raw_bytes());
+    } else {
+      std::memcpy(grad_weight.raw_ptr(), grad_weight_bf16.raw_ptr(), grad_weight_bf16.raw_bytes());
+    }
     return grad_input;
   }
-
-  float *dw_data = grad_weight.data();
 
   unsigned int num_threads = std::thread::hardware_concurrency();
   if (num_threads == 0) num_threads = 4;
@@ -126,7 +172,7 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
     workers.emplace_back([this, start_row, end_row, dims, &input, &grad_output, &grad_input, &thread_dw, t]() {
       const float *x_data = input.data();
       const float *g_data = grad_output.data();
-      const float *w_data = weight_.data();
+      const uint16_t *w_data = (const uint16_t*)weight_.raw_ptr();
       float *dx_data = grad_input.data();
       float *dw_local = thread_dw[t].data();
 
@@ -145,18 +191,20 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
         float sum_g_w_xhat = 0.0f;
         for (size_t col = 0; col < dims; ++col) {
           float xhat = x_data[offset + col] / rms;
-          sum_g_w_xhat += g_data[offset + col] * w_data[col] * xhat;
+          float w_val = (weight_.dtype() == DType::BF16) ? bf16_to_float(w_data[col]) : ((const float*)w_data)[col];
+          sum_g_w_xhat += g_data[offset + col] * w_val * xhat;
         }
         sum_g_w_xhat /= static_cast<float>(dims);
 
         // 3. Compute gradients w.r.t input and accumulate weights gradients locally
         for (size_t col = 0; col < dims; ++col) {
           float xhat = x_data[offset + col] / rms;
+          float w_val = (weight_.dtype() == DType::BF16) ? bf16_to_float(w_data[col]) : ((const float*)w_data)[col];
 
           // grad_input calculation
           dx_data[offset + col] =
               (1.0f / rms) *
-              (g_data[offset + col] * w_data[col] - xhat * sum_g_w_xhat);
+              (g_data[offset + col] * w_val - xhat * sum_g_w_xhat);
 
           // Accumulate weight gradient locally
           dw_local[col] += g_data[offset + col] * xhat;
@@ -172,7 +220,14 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   // Sum up thread-local gradients into global grad_weight
   for (unsigned int t = 0; t < num_threads; ++t) {
     for (size_t col = 0; col < dims; ++col) {
-      dw_data[col] += thread_dw[t][col];
+      if (grad_weight.dtype() == DType::BF16) {
+        uint16_t *w_ptr = (uint16_t*)grad_weight.raw_ptr();
+        float val = bf16_to_float(w_ptr[col]) + thread_dw[t][col];
+        w_ptr[col] = float_to_bf16(val);
+      } else {
+        float *w_ptr = grad_weight.data();
+        w_ptr[col] += thread_dw[t][col];
+      }
     }
   }
 

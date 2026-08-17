@@ -51,7 +51,11 @@ kernel void fused_swiglu_gemm(
             uint base = (tid * 2 + i) * 4;
             uint r = base / BK, c = base % BK;
             uint gr = tr + r, gc = kb + c;
-            if (gr < M && gc < Kdim) {
+            // Vector path only when the full bfloat4 stays inside the row;
+            // otherwise fall through to the bounds-checked scalar path.  A
+            // bfloat4 load at gc near Kdim would read past the row and, on the
+            // last row, past the buffer (GPU page fault).
+            if (gr < M && gc < Kdim && gc + 4 <= Kdim) {
                 bfloat4 gv = *((device const bfloat4*)(&gate_proj[gr * Kdim + gc]));
                 bfloat4 uv = *((device const bfloat4*)(&up_proj[gr * Kdim + gc]));
                 float4 g = float4((float)gv[0], (float)gv[1], (float)gv[2], (float)gv[3]);
@@ -80,7 +84,8 @@ kernel void fused_swiglu_gemm(
             uint base = (tid * 2 + i) * 4;
             uint r = base / BN, c = base % BN;
             uint gr = kb + r, gc = tc + c;
-            if (gr < Kdim && gc < N) {
+            // Same tail guard: bfloat4 must fit within the row (and buffer).
+            if (gr < Kdim && gc < N && gc + 4 <= N) {
                 bfloat4 v = *((device const bfloat4*)(&B[gr * N + gc]));
                 shB[slot][r*BN+c+0] = v[0]; shB[slot][r*BN+c+1] = v[1];
                 shB[slot][r*BN+c+2] = v[2]; shB[slot][r*BN+c+3] = v[3];
@@ -125,7 +130,9 @@ kernel void fused_swiglu_gemm(
             uint gcol = tc + sgc * cps + c * 8;
             if (grow >= M || gcol >= N) continue;
             auto vals = acc[r][c].thread_elements();
-            uint lr = ln_id / 4, lc = (ln_id % 4) * 2;
+            // Apple simdgroup_matrix 8x8 lane layout (Morton order)
+            uint lr = (ln_id/4 >> 2)*4 + (ln_id/2) % 4;
+            uint lc = (ln_id/4 & 2)*2 + (ln_id%2)*2;
             uint wr = grow + lr, wc = gcol + lc;
             if (wr < M && wc < N) {
                 C[wr * N + wc] = (bfloat)vals[0];

@@ -66,11 +66,8 @@ Attention::Attention(const ModelConfig &config)
  * @return Tensor Reshaped 4D tensor.
  */
 Tensor reshape_to_4d(const Tensor &src, size_t n_heads, size_t head_dim) {
-
   size_t batch = src.shape()[0];
   size_t seq_len = src.shape()[1];
-
-  Tensor dest({batch, n_heads, seq_len, head_dim}, 0.0f);
 
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;
@@ -82,39 +79,25 @@ Tensor reshape_to_4d(const Tensor &src, size_t n_heads, size_t head_dim) {
   }
 
   if (use_gpu) {
-    metal_bridge::reshape_to_4d(src.data(), dest.data(),
+    Tensor dest({batch, n_heads, seq_len, head_dim}, 0.0f, src.dtype());
+    metal_bridge::reshape_to_4d((const float*)src.raw_ptr(), (float*)dest.raw_ptr(),
                                  batch, n_heads, seq_len, head_dim);
     return dest;
   }
 
+  Tensor src_fp32 = src.to_dtype(DType::FP32);
+  Tensor dest({batch, n_heads, seq_len, head_dim}, 0.0f, DType::FP32);
   for (size_t b = 0; b < batch; ++b) {
     for (size_t h = 0; h < n_heads; h++) {
       for (size_t s = 0; s < seq_len; ++s) {
         for (size_t d = 0; d < head_dim; ++d) {
-          dest(b, h, s, d) = src(b, s, h * head_dim + d);
+          dest(b, h, s, d) = src_fp32(b, s, h * head_dim + d);
         }
       }
     }
   }
-  return dest;
+  return dest.to_dtype(src.dtype());
 }
-
-/**
- * @brief Reshapes a 4D tensor of shape [batch, n_heads, seq_len, head_dim]
- *        into a 3D tensor of shape [batch, seq_len, n_heads * head_dim].
- *
- * Used to isolate attention heads so self-attention can be computed
- * head-by-head.
- *
- * Example:
- *   If src shape is [2, 128, 256], calling reshape_to_4d(src, 8, 32)
- *   returns a tensor of shape [2, 8, 128, 32].
- *
- * @param src Input 3D tensor to reshape.
- * @param n_heads Number of attention heads.
- * @param head_dim Dimension of each attention head.
- * @return Tensor Reshaped 4D tensor.
- */
 
 Tensor reshape_to_3d(const Tensor &src) {
   size_t batch = src.shape()[0];
@@ -122,8 +105,6 @@ Tensor reshape_to_3d(const Tensor &src) {
   size_t seq_len = src.shape()[2];
   size_t head_dim = src.shape()[3];
 
-  Tensor dest({batch, seq_len, n_heads * head_dim}, 0.0f);
-
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;
   if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
@@ -134,21 +115,24 @@ Tensor reshape_to_3d(const Tensor &src) {
   }
 
   if (use_gpu) {
-    metal_bridge::reshape_to_3d(src.data(), dest.data(),
+    Tensor dest({batch, seq_len, n_heads * head_dim}, 0.0f, src.dtype());
+    metal_bridge::reshape_to_3d((const float*)src.raw_ptr(), (float*)dest.raw_ptr(),
                                  batch, n_heads, seq_len, head_dim);
     return dest;
   }
 
+  Tensor src_fp32 = src.to_dtype(DType::FP32);
+  Tensor dest({batch, seq_len, n_heads * head_dim}, 0.0f, DType::FP32);
   for (size_t b = 0; b < batch; ++b) {
     for (size_t h = 0; h < n_heads; h++) {
       for (size_t s = 0; s < seq_len; ++s) {
         for (size_t d = 0; d < head_dim; ++d) {
-          dest(b, s, h * head_dim + d) = src(b, h, s, d);
+          dest(b, s, h * head_dim + d) = src_fp32(b, h, s, d);
         }
       }
     }
   }
-  return dest;
+  return dest.to_dtype(src.dtype());
 }
 
 /**
@@ -189,9 +173,9 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
     }
   }
 
+  Tensor x_aligned = use_gpu ? x.to_dtype(DType::BF16) : x;
   RMSNorm rms_norm(config_.hidden_dim, config_.rms_norm_eps);
-
-  Tensor x_norm = rms_norm.forward(x);
+  Tensor x_norm = rms_norm.forward(x_aligned);
 
   Tensor q4 =
       reshape_to_4d(x_norm.matmul(Wq_), config_.n_heads, config_.head_dim);
@@ -207,16 +191,7 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
   size_t gqa_factor = config_.n_heads / config_.n_kv_heads;
   float scale = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
 
-  // Initialize the output tensor with shape [batch, seq_len, hidden_dim]
-  Tensor attn_output({batch, seq_len, config_.hidden_dim}, 0.0f);
-
-  // GCD-parallel dispatch over (batch × n_heads): each (b,h) pair writes to
-  // non-overlapping output channels [h*head_dim, (h+1)*head_dim), so no mutex
-  // needed.
-  const float *q4_ptr = q4.data();
-  const float *k4_ptr = k4.data();
-  const float *v4_ptr = v4.data();
-  float *out_ptr = attn_output.data();
+  Tensor attn_output({batch, seq_len, config_.hidden_dim}, 0.0f, x_aligned.dtype());
 
   const size_t n_h = config_.n_heads;
   const size_t h_d = config_.head_dim;
@@ -224,7 +199,7 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
 
   if (use_gpu) {
     auto start = std::chrono::high_resolution_clock::now();
-    metal_bridge::flash_attn_fwd(q4_ptr, k4_ptr, v4_ptr, out_ptr,
+    metal_bridge::flash_attn_fwd((const float*)q4.raw_ptr(), (const float*)k4.raw_ptr(), (const float*)v4.raw_ptr(), (float*)attn_output.raw_ptr(),
                                   batch, n_h, n_kv, seq_len, h_d);
     auto end = std::chrono::high_resolution_clock::now();
     metal_bridge::accum_gpu_time_ms +=
@@ -233,6 +208,13 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
         1000.0;
     metal_bridge::count_gpu_calls++;
   } else {
+    Tensor q4_fp32 = q4.to_dtype(DType::FP32);
+    Tensor k4_fp32 = k4.to_dtype(DType::FP32);
+    Tensor v4_fp32 = v4.to_dtype(DType::FP32);
+    const float *q4_ptr = q4_fp32.data();
+    const float *k4_ptr = k4_fp32.data();
+    const float *v4_ptr = v4_fp32.data();
+    float *out_ptr = attn_output.data();
     dispatch_apply(
         batch * n_h, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
         ^(size_t bh) {
@@ -280,7 +262,7 @@ Tensor Attention::forward(const Tensor &x, const RoPE &rope, KVCache *cache,
         });
   }
   Tensor out = attn_output.matmul(Wo_);
-  return out;
+  return use_gpu ? out.to_dtype(x.dtype()) : out;
 }
 /**
  * @brief Helper function to perform GQA backward pass calculations for a single
@@ -390,17 +372,7 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   size_t gqa_factor = n_heads / n_kv_heads;
   float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-  // 1. Recompute forward states
-  RMSNorm rms_norm(hidden_dim, config_.rms_norm_eps);
-  Tensor x_norm = rms_norm.forward(x);
-
-  Tensor q4 = reshape_to_4d(x_norm.matmul(Wq_), n_heads, head_dim);
-  Tensor k4 = reshape_to_4d(x_norm.matmul(Wk_), n_kv_heads, head_dim);
-  Tensor v4 = reshape_to_4d(x_norm.matmul(Wv_), n_kv_heads, head_dim);
-  rope.forward(q4, k4);
-
-  Tensor attn_output({batch, seq_len, hidden_dim}, 0.0f);
-
+  // 1. DType alignment & conversion for GPU path
   const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
   bool use_gpu = false;
   if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
@@ -410,6 +382,24 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
     }
   }
 
+  Tensor x_aligned = use_gpu ? x.to_dtype(DType::BF16) : x;
+  Tensor grad_output_aligned = use_gpu ? grad_output.to_dtype(DType::BF16) : grad_output;
+
+  Tensor grad_Wq_bf16 = use_gpu ? grad_Wq.to_dtype(DType::BF16) : grad_Wq;
+  Tensor grad_Wk_bf16 = use_gpu ? grad_Wk.to_dtype(DType::BF16) : grad_Wk;
+  Tensor grad_Wv_bf16 = use_gpu ? grad_Wv.to_dtype(DType::BF16) : grad_Wv;
+  Tensor grad_Wo_bf16 = use_gpu ? grad_Wo.to_dtype(DType::BF16) : grad_Wo;
+
+  RMSNorm rms_norm(hidden_dim, config_.rms_norm_eps);
+  Tensor x_norm = rms_norm.forward(x_aligned);
+
+  Tensor q4 = reshape_to_4d(x_norm.matmul(Wq_), n_heads, head_dim);
+  Tensor k4 = reshape_to_4d(x_norm.matmul(Wk_), n_kv_heads, head_dim);
+  Tensor v4 = reshape_to_4d(x_norm.matmul(Wv_), n_kv_heads, head_dim);
+  rope.forward(q4, k4);
+
+  Tensor attn_output({batch, seq_len, hidden_dim}, 0.0f, x_aligned.dtype());
+
   if (use_gpu) {
     metal_bridge::GQAParams gqa_params = {
         .batch = static_cast<uint32_t>(batch),
@@ -418,7 +408,7 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
         .seq_len = static_cast<uint32_t>(seq_len),
         .head_dim = static_cast<uint32_t>(head_dim),
     };
-    metal_bridge::gemm_gqa(gqa_params, q4.data(), k4.data(), v4.data(), attn_output.data());
+    metal_bridge::gemm_gqa(gqa_params, (const float*)q4.raw_ptr(), (const float*)k4.raw_ptr(), (const float*)v4.raw_ptr(), (float*)attn_output.raw_ptr());
   } else {
     const float *q4_ptr = q4.data();
     const float *k4_ptr = k4.data();
@@ -472,36 +462,37 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   // 2. grad_Wo[NH*HD, H] = attn_output[B*S, NH*HD].T @ grad_output[B*S, H]
   if (use_gpu) {
     metal_bridge::gemm_backward(
-        attn_output.data(),
-        grad_output.data(),
-        grad_Wo.data(),
+        (const float*)attn_output.raw_ptr(),
+        (const float*)grad_output_aligned.raw_ptr(),
+        (float*)grad_Wo_bf16.raw_ptr(),
         hidden_dim,
         hidden_dim,
         batch * seq_len
     );
   } else {
-    grad_Wo = attn_output.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_output.reshape({batch * seq_len, hidden_dim}));
+    grad_Wo = attn_output.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_output_aligned.reshape({batch * seq_len, hidden_dim}));
   }
 
   // 3. Backpropagate to attention head outputs: grad_attn_output = grad_output @ Wo^T
-  Tensor grad_attn_output({batch, seq_len, hidden_dim}, 0.0f);
+  Tensor grad_attn_output({batch, seq_len, hidden_dim}, 0.0f, x_aligned.dtype());
   if (use_gpu) {
     metal_bridge::gemm_proj_trans_b(
-        grad_output.data(),
-        Wo_.data(),
-        grad_attn_output.data(),
+        (const float*)grad_output_aligned.raw_ptr(),
+        (const float*)Wo_.raw_ptr(),
+        (float*)grad_attn_output.raw_ptr(),
         batch * seq_len,
         hidden_dim,
         hidden_dim
     );
   } else {
-    grad_attn_output = grad_output.matmul(Wo_.transpose());
+    grad_attn_output = grad_output_aligned.matmul(Wo_.transpose());
   }
 
-  // 4. Initialize head gradients
-  Tensor grad_q4({batch, n_heads, seq_len, head_dim}, 0.0f);
-  Tensor grad_k4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
-  Tensor grad_v4({batch, n_kv_heads, seq_len, head_dim}, 0.0f);
+  // 4. Initialize head gradients — FP32 because fused_attn_bwd uses 4-byte
+  // atomics on dK/dV (bfloat buffers would overflow adjacent memory).
+  Tensor grad_q4({batch, n_heads, seq_len, head_dim}, 0.0f, DType::FP32);
+  Tensor grad_k4({batch, n_kv_heads, seq_len, head_dim}, 0.0f, DType::FP32);
+  Tensor grad_v4({batch, n_kv_heads, seq_len, head_dim}, 0.0f, DType::FP32);
 
   // 5. GQA attention backpropagation — fused GPU kernel (no global S/P/dS)
   // Single kernel call: computes dQ, dK, dV using tiled shared memory.
@@ -512,28 +503,46 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
         std::chrono::high_resolution_clock::time_point start;
         ProfileBlock(std::string name) : name(name), start(std::chrono::high_resolution_clock::now()) {}
         ~ProfileBlock() {
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
-            std::cout << "[PROFILE-BWD]   " << name << " took " << ms << " ms" << std::endl;
+            if (getenv("PROFILE_BWD")) {
+                auto end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+                std::cout << "[PROFILE-BWD]   " << name << " took " << ms << " ms" << std::endl;
+            }
         }
     };
 
-    Tensor dS_mat({batch, n_heads, seq_len, seq_len}, 0.0f);  // reused for profiling, allocated for compat
-
-    {
-        ProfileBlock p("fused_attn_bwd");
-        metal_bridge::fused_attn_bwd(q4.data(), k4.data(), v4.data(),
-                                     grad_attn_output.data(),
-                                     grad_q4.data(), grad_k4.data(), grad_v4.data(),
-                                     batch, n_heads, n_kv_heads, seq_len, head_dim);
+    if (getenv("DEBUG_SKIP_FUSED_BWD")) {
+      // CPU GQA backward fallback — used to isolate fused_attn_bwd corruption
+      Tensor q4_fp32 = q4.to_dtype(DType::FP32);
+      Tensor k4_fp32 = k4.to_dtype(DType::FP32);
+      Tensor v4_fp32 = v4.to_dtype(DType::FP32);
+      for (size_t bb = 0; bb < batch; ++bb) {
+        for (size_t hh = 0; hh < n_heads; ++hh) {
+          size_t kv_hh = hh / gqa_factor;
+          for (size_t s_q = 0; s_q < seq_len; ++s_q) {
+            gqa_backward_query_token(bb, hh, kv_hh, s_q, seq_len, head_dim, scale, q4_fp32,
+                                     k4_fp32, v4_fp32, grad_attn_output, grad_q4, grad_k4,
+                                     grad_v4);
+          }
+        }
+      }
+    } else {
+      ProfileBlock p("fused_attn_bwd");
+      metal_bridge::fused_attn_bwd((const float*)q4.raw_ptr(), (const float*)k4.raw_ptr(), (const float*)v4.raw_ptr(),
+                                   (const float*)grad_attn_output.raw_ptr(),
+                                   (float*)grad_q4.raw_ptr(), (float*)grad_k4.raw_ptr(), (float*)grad_v4.raw_ptr(),
+                                   batch, n_heads, n_kv_heads, seq_len, head_dim);
     }
   } else {
+    Tensor q4_fp32 = q4.to_dtype(DType::FP32);
+    Tensor k4_fp32 = k4.to_dtype(DType::FP32);
+    Tensor v4_fp32 = v4.to_dtype(DType::FP32);
     for (size_t b = 0; b < batch; ++b) {
       for (size_t h = 0; h < n_heads; ++h) {
         size_t kv_h = h / gqa_factor;
         for (size_t s_q = 0; s_q < seq_len; ++s_q) {
-          gqa_backward_query_token(b, h, kv_h, s_q, seq_len, head_dim, scale, q4,
-                                   k4, v4, grad_attn_output, grad_q4, grad_k4,
+          gqa_backward_query_token(b, h, kv_h, s_q, seq_len, head_dim, scale, q4_fp32,
+                                   k4_fp32, v4_fp32, grad_attn_output, grad_q4, grad_k4,
                                    grad_v4);
         }
       }
@@ -548,16 +557,25 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   Tensor grad_k_proj = reshape_to_3d(grad_k4);
   Tensor grad_v_proj = reshape_to_3d(grad_v4);
 
+  // gemm_backward/gemm_proj_trans_b read inputs as bfloat → convert FP32
+  // projection grads to BF16 for the GPU path.
+  Tensor grad_q_proj_bf16, grad_k_proj_bf16, grad_v_proj_bf16;
+  if (use_gpu) {
+    grad_q_proj_bf16 = grad_q_proj.to_dtype(DType::BF16);
+    grad_k_proj_bf16 = grad_k_proj.to_dtype(DType::BF16);
+    grad_v_proj_bf16 = grad_v_proj.to_dtype(DType::BF16);
+  }
+
   // 8. Parameter gradients for Wq, Wk, Wv
   if (use_gpu) {
     metal_bridge::gemm_backward(
-        x_norm.data(), grad_q_proj.data(), grad_Wq.data(),
+        (const float*)x_norm.raw_ptr(), (const float*)grad_q_proj_bf16.raw_ptr(), (float*)grad_Wq_bf16.raw_ptr(),
         hidden_dim, n_heads * head_dim, batch * seq_len);
     metal_bridge::gemm_backward(
-        x_norm.data(), grad_k_proj.data(), grad_Wk.data(),
+        (const float*)x_norm.raw_ptr(), (const float*)grad_k_proj_bf16.raw_ptr(), (float*)grad_Wk_bf16.raw_ptr(),
         hidden_dim, n_kv_heads * head_dim, batch * seq_len);
     metal_bridge::gemm_backward(
-        x_norm.data(), grad_v_proj.data(), grad_Wv.data(),
+        (const float*)x_norm.raw_ptr(), (const float*)grad_v_proj_bf16.raw_ptr(), (float*)grad_Wv_bf16.raw_ptr(),
         hidden_dim, n_kv_heads * head_dim, batch * seq_len);
   } else {
     grad_Wq = x_norm.reshape({batch * seq_len, hidden_dim}).transpose().matmul(grad_q_proj.reshape({batch * seq_len, n_heads * head_dim}));
@@ -566,23 +584,23 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   }
 
   // 9. Compute gradient w.r.t normalized input: grad_x_norm = grad_q_proj @ Wq^T + grad_k_proj @ Wk^T + grad_v_proj @ Wv^T
-  Tensor grad_x_norm({batch, seq_len, hidden_dim}, 0.0f);
+  Tensor grad_x_norm({batch, seq_len, hidden_dim}, 0.0f, x_aligned.dtype());
   if (use_gpu) {
     metal_bridge::gemm_proj_trans_b(
-        grad_q_proj.data(), Wq_.data(), grad_x_norm.data(),
+        (const float*)grad_q_proj_bf16.raw_ptr(), (const float*)Wq_.raw_ptr(), (float*)grad_x_norm.raw_ptr(),
         batch * seq_len, hidden_dim, n_heads * head_dim);
 
-    Tensor grad_k_norm({batch, seq_len, hidden_dim}, 0.0f);
+    Tensor grad_k_norm({batch, seq_len, hidden_dim}, 0.0f, x_aligned.dtype());
     metal_bridge::gemm_proj_trans_b(
-        grad_k_proj.data(), Wk_.data(), grad_k_norm.data(),
+        (const float*)grad_k_proj_bf16.raw_ptr(), (const float*)Wk_.raw_ptr(), (float*)grad_k_norm.raw_ptr(),
         batch * seq_len, hidden_dim, n_kv_heads * head_dim);
-    metal_bridge::residual_add(grad_x_norm.data(), grad_k_norm.data(), grad_x_norm.size());
+    metal_bridge::residual_add((float*)grad_x_norm.raw_ptr(), (const float*)grad_k_norm.raw_ptr(), grad_x_norm.size());
 
-    Tensor grad_v_norm({batch, seq_len, hidden_dim}, 0.0f);
+    Tensor grad_v_norm({batch, seq_len, hidden_dim}, 0.0f, x_aligned.dtype());
     metal_bridge::gemm_proj_trans_b(
-        grad_v_proj.data(), Wv_.data(), grad_v_norm.data(),
+        (const float*)grad_v_proj_bf16.raw_ptr(), (const float*)Wv_.raw_ptr(), (float*)grad_v_norm.raw_ptr(),
         batch * seq_len, hidden_dim, n_kv_heads * head_dim);
-    metal_bridge::residual_add(grad_x_norm.data(), grad_v_norm.data(), grad_x_norm.size());
+    metal_bridge::residual_add((float*)grad_x_norm.raw_ptr(), (const float*)grad_v_norm.raw_ptr(), grad_x_norm.size());
   } else {
     grad_x_norm = grad_q_proj.matmul(Wq_.transpose());
     grad_x_norm.add_(grad_k_proj.matmul(Wk_.transpose()));
@@ -590,8 +608,15 @@ Tensor Attention::backward(const Tensor &grad_output, const Tensor &x,
   }
 
   // 10. Backpropagate through RMSNorm to get gradient w.r.t raw input x
-  Tensor grad_weight_dummy({hidden_dim}, 0.0f);
-  Tensor grad_x = rms_norm.backward(grad_x_norm, x, grad_weight_dummy);
+  Tensor grad_weight_dummy({hidden_dim}, 0.0f, x_aligned.dtype());
+  Tensor grad_x = rms_norm.backward(grad_x_norm, x_aligned, grad_weight_dummy);
 
-  return grad_x;
+  if (use_gpu) {
+    if (grad_Wq.dtype() == DType::FP32) { Tensor tmp = grad_Wq_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wq.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wk.dtype() == DType::FP32) { Tensor tmp = grad_Wk_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wk.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wv.dtype() == DType::FP32) { Tensor tmp = grad_Wv_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wv.data(), tmp.data(), tmp.raw_bytes()); }
+    if (grad_Wo.dtype() == DType::FP32) { Tensor tmp = grad_Wo_bf16.to_dtype(DType::FP32); std::memcpy(grad_Wo.data(), tmp.data(), tmp.raw_bytes()); }
+  }
+
+  return use_gpu ? grad_x.to_dtype(grad_output.dtype()) : grad_x;
 }

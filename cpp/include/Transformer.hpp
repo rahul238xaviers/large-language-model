@@ -81,4 +81,5 @@ private:
   Tensor output_projection_;
   RoPE rope_;
   mutable std::vector<Tensor> h_cache_;
+  mutable Tensor logits_;  // persistent logits buffer (reused across steps)
 };

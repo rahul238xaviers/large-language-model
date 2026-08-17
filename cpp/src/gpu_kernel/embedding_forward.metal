@@ -23,6 +23,7 @@ kernel void embedding_forward(
     device bfloat*       output          [[buffer(2)]],  // WHAT: Output hidden states [B*S, hidden_dim]
     constant uint&      hidden_dim      [[buffer(3)]],  // WHAT: Embedding / hidden dimension H
     constant uint&      total_tokens    [[buffer(4)]],  // WHAT: B * S (total token positions)
+    constant uint&      vocab_size      [[buffer(5)]],  // WHAT: Embedding table row count
     uint gid [[thread_position_in_grid]]
 ) {
     // WHAT: Total elements = B * S * hidden_dim. Guard threads past this.
@@ -43,5 +44,10 @@ kernel void embedding_forward(
 
     // WHAT: Copy the d-th dimension of the token's embedding row to the output.
     // WHY:  row = token_id * hidden_dim; element = row + d.
+    // Guard: an out-of-range token id would index past the table (GPU fault).
+    if (token_id >= vocab_size) {
+      output[gid] = 0;
+      return;
+    }
     output[gid] = embedding_table[token_id * hidden_dim + d];
 }

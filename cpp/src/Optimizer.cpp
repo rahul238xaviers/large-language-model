@@ -98,9 +98,10 @@ static void adamw_update_parameter(
     float lr, float beta1, float beta2, float eps, float weight_decay,
     float bias_correction1, float bias_correction2) {
   size_t n = param.size();
-  // hACK: param may be BF16 but size() should still return element count
-  fprintf(stderr, "[OPT] param.size()=%zu itemsize=%zu bytes=%zu\n",
-          n, param.itemsize(), param.raw_bytes());
+  if (getenv("DEBUG_OPT")) {
+    fprintf(stderr, "[OPT] param.size()=%zu itemsize=%zu bytes=%zu\n",
+            n, param.itemsize(), param.raw_bytes());
+  }
   float *p_data = param.data();
   const float *g_data = grad.data();
   float *m_data = m.data();

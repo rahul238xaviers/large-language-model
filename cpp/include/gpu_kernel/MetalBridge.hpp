@@ -41,6 +41,18 @@ void gemm_bf16(const void *A, const void *B, void *C,
                bool transA = false, bool transB = false,
                bool is_forward = false);
 
+// ── Small-batch down-projection GEMM ─────────────────────────────────
+// C[M,N] = A[M,K] @ B[K,N]  (B stored as N×K, loaded with coalesced access)
+// Specialized for M=32, K=1024, N=2752 (down-projection backward shape).
+void gemm_proj_down(const void *A, const void *B, void *C,
+                    size_t M, size_t N, size_t K);
+
+// ── Coalesced weight-gradient GEMM ──────────────────────────────────
+// C[M,N] = A_transposed[M,K] × B[K,N]  (A stored as K×M, B as K×N)
+// Specialized for K=32 with trA=true coalesced load.
+void gemm_bwd_weight(const void *A, const void *B, void *C,
+                     size_t M, size_t N, size_t K);
+
 void fused_swiglu_gemm(const void *gate_proj, const void *up_proj,
                        const void *B, void *C,
                        size_t M, size_t N, size_t K);
@@ -64,7 +76,6 @@ void rms_norm_backward(const float *grad_output, const float *input,
                        float *grad_weight, float eps, size_t num_rows, size_t dims);
 void swiglu_backward(const float *grad_output, const float *gate,
                      const float *up, float *grad_gate, float *grad_up, size_t n);
-void swiglu_forward(const float *gate, const float *up, float *out, size_t n);
 void rope_backward(float *grad, const float *cos_table, const float *sin_table,
                    size_t batch, size_t heads, size_t seq_len, size_t head_dim);
 // ── GPU wrapper registration (called from PagedBuffer on alloc/free) ──
@@ -96,29 +107,13 @@ struct AdamWStepParams {
 
 void adamw_step(float *param, const float *grad, float *m, float *v,
                 const AdamWStepParams &params);
-void attn_softmax(const float *scores, float *probs,
-                  size_t batch, size_t n_heads, size_t seq_len);
-void attn_ds(const float *probs, const float *dP_row, float *dS_out,
-             size_t batch, size_t n_heads, size_t seq_len);
 
 // ── Legacy / deprecated ─────────────────────────────────────────────
 // These exist for backward compat but are replaced by gemm_bf16 + async:
 struct GQAParams { uint32_t batch, n_q_heads, n_kv_heads, seq_len, head_dim; };
-struct GQABackwardParams { uint32_t batch, n_q_heads, n_kv_heads, seq_len, head_dim; };
 
 void gemm_gqa(const GQAParams &params, const float *q, const float *k,
               const float *v, float *out_gqa, float *L_out = nullptr);
-void gqa_backward(const GQABackwardParams &params,
-                  const float *Q, const float *K, const float *V,
-                  const float *grad_attn_output,
-                  float *grad_Q, float *grad_K, float *grad_V,
-                  const float *precomputed_scores = nullptr);
-void gqa_scores(const float *Q, const float *K, float *scores,
-                size_t batch, size_t n_heads, size_t n_kv,
-                size_t seq_len, size_t head_dim);
-void gemm_ffn(const float *a, const float *b_gate, const float *b_up, float *c,
-              size_t M, size_t N, size_t K);
-void gemm_proj(const float *a, const float *b, float *c, size_t M, size_t N, size_t K);
 void gemm_backward(const float *a_transposed, const float *b, float *c,
                    size_t M, size_t N, size_t K);
 void gemm_proj_trans_b(const float *a, const float *b_transposed, float *c,
@@ -139,6 +134,7 @@ void start_step_trace();
 void stop_step_trace();
 
 extern double accum_gpu_time_ms;
+extern double last_scope_gpu_time_ms;
 extern double accum_cpu_time_ms;
 extern size_t count_gpu_calls;
 extern size_t count_cpu_calls;

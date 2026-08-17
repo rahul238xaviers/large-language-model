@@ -33,10 +33,10 @@ constant uint NQ=S/Br, NK=S/Bc;     // 32 tiles each
 constant uint WL=32;
 
 kernel void flash_attn_fwd(
-    device const float* Q      [[buffer(0)]],  // [B, nH,  S, HD]
-    device const float* K      [[buffer(1)]],  // [B, nKV, S, HD]
-    device const float* V      [[buffer(2)]],  // [B, nKV, S, HD]
-    device float*       O      [[buffer(3)]],  // [B, nH,  S, HD]
+    device const bfloat* Q      [[buffer(0)]],  // [B, nH,  S, HD]  (packed BF16)
+    device const bfloat* K      [[buffer(1)]],  // [B, nKV, S, HD]  (packed BF16)
+    device const bfloat* V      [[buffer(2)]],  // [B, nKV, S, HD]  (packed BF16)
+    device bfloat*       O      [[buffer(3)]],  // [B, nH,  S, HD]  (packed BF16)
     constant uint*      n_heads_ptr [[buffer(4)]],
     constant uint*      n_kv_ptr    [[buffer(5)]],
     uint2 tg_id [[threadgroup_position_in_grid]],
@@ -72,11 +72,11 @@ kernel void flash_attn_fwd(
         for (uint i = li * 2; i < Br * HD; i += 256 * 2) {
             uint r = i / HD, c = i % HD;
             uint gr = q_base + r;
-            if (gr < S) { Qs[r*HD+c] = (bfloat)Q[q_off + gr*HD + c]; }
+            if (gr < S) { Qs[r*HD+c] = Q[q_off + gr*HD + c]; }
             if (i+1 < Br*HD) {
                 uint r2 = (i+1)/HD, c2 = (i+1)%HD;
                 uint gr2 = q_base + r2;
-                if (gr2 < S) { Qs[r2*HD+c2] = (bfloat)Q[q_off + gr2*HD + c2]; }
+                if (gr2 < S) { Qs[r2*HD+c2] = Q[q_off + gr2*HD + c2]; }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -97,15 +97,15 @@ kernel void flash_attn_fwd(
                 uint r = i / HD, c = i % HD;
                 uint gr = k_base + r;
                 if (gr < S) {
-                    Ks[r*HD + c] = (bfloat)K[kv_off + gr*HD + c];
-                    Vs[r*HD + c] = (bfloat)V[kv_off + gr*HD + c];
+                    Ks[r*HD + c] = K[kv_off + gr*HD + c];
+                    Vs[r*HD + c] = V[kv_off + gr*HD + c];
                 }
                 if (i+1 < Bc*HD) {
                     uint r2 = (i+1)/HD, c2 = (i+1)%HD;
                     uint gr2 = k_base + r2;
                     if (gr2 < S) {
-                        Ks[r2*HD + c2] = (bfloat)K[kv_off + gr2*HD + c2];
-                        Vs[r2*HD + c2] = (bfloat)V[kv_off + gr2*HD + c2];
+                        Ks[r2*HD + c2] = K[kv_off + gr2*HD + c2];
+                        Vs[r2*HD + c2] = V[kv_off + gr2*HD + c2];
                     }
                 }
             }
@@ -163,7 +163,7 @@ kernel void flash_attn_fwd(
             if (gqr >= S) continue;
             uint o_row = (sg_id*QR+qr) * HD;
             for (uint d = ln_id; d < HD; d += WL)
-                O[q_off + gqr*HD + d] = Oa[o_row + d] / reg_l[qr];
+                O[q_off + gqr*HD + d] = (bfloat)(Oa[o_row + d] / reg_l[qr]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

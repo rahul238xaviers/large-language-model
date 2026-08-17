@@ -18,6 +18,7 @@
 #include "Optimizer.hpp"
 #include "DataIngestion.hpp"
 #include "Positional.hpp"
+#include "Loss.hpp"
 #include <cstddef>
 
 /**
@@ -35,6 +36,10 @@ struct TrainerConfig {
   size_t checkpoint_interval = 500;
   size_t keep_last_n_checkpoints = 3;
   bool resume = true;
+
+  /// Path to a specific checkpoint to load at startup (e.g. a Python-converted
+  /// model). When empty, the latest checkpoint in checkpoint_dir is auto-loaded.
+  std::string init_checkpoint = "";
 };
 
 /**
@@ -73,6 +78,9 @@ private:
   Optimizer &optimizer_;
   DataIngestion &data_loader_;
   const RoPE &rope_;
+  // Persistent loss object: grad_logits_ buffer (13 GB) is reused across steps
+  // instead of being re-allocated every step.
+  CrossEntropyLoss lf_;
 
   void _truncate_metrics_file(size_t step_cutoff);
 };

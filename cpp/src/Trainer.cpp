@@ -111,17 +111,19 @@ static void run_training_step(
   optimizer.step(lr);
   auto t5 = std::chrono::high_resolution_clock::now();
 
-  double ms_fwd      = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-  double ms_loss_fwd = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.0;
-  double ms_loss_bwd = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000.0;
-  double ms_bwd      = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count() / 1000.0;
-  double ms_opt      = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count() / 1000.0;
+  if (getenv("PROFILE_STEP")) {
+    double ms_fwd      = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+    double ms_loss_fwd = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.0;
+    double ms_loss_bwd = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000.0;
+    double ms_bwd      = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count() / 1000.0;
+    double ms_opt      = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count() / 1000.0;
 
-  std::cout << "[PROFILE] Model Forward (queue):  " << ms_fwd      << " ms" << std::endl;
-  std::cout << "[PROFILE] Loss Forward (queue):   " << ms_loss_fwd << " ms" << std::endl;
-  std::cout << "[PROFILE] Loss Backward (queue):  " << ms_loss_bwd << " ms" << std::endl;
-  std::cout << "[PROFILE] Model Backward (queue): " << ms_bwd      << " ms" << std::endl;
-  std::cout << "[PROFILE] Optimizer Step (queue): " << ms_opt      << " ms" << std::endl;
+    std::cout << "[PROFILE] Model Forward (queue):  " << ms_fwd      << " ms" << std::endl;
+    std::cout << "[PROFILE] Loss Forward (queue):   " << ms_loss_fwd << " ms" << std::endl;
+    std::cout << "[PROFILE] Loss Backward (queue):  " << ms_loss_bwd << " ms" << std::endl;
+    std::cout << "[PROFILE] Model Backward (queue): " << ms_bwd      << " ms" << std::endl;
+    std::cout << "[PROFILE] Optimizer Step (queue): " << ms_opt      << " ms" << std::endl;
+  }
 }
 
 /**
@@ -204,11 +206,21 @@ void Trainer::train() {
     optimizer_.register_parameter(&model_.layers()[l].attn.Wo(), &grad_Wo[l]);
   }
 
-  // 1. Checkpoint auto-resume
+  // 1. Checkpoint loading: explicit init checkpoint takes priority, otherwise
+  //    auto-discover the latest checkpoint in the checkpoint dir.
   size_t start_step = 0;
-  std::string latest_ckpt = "";
-  if (config_.resume && fs::exists(config_.checkpoint_dir)) {
+  if (!config_.init_checkpoint.empty()) {
+    std::cout << "[INFO] Loading initial checkpoint: " << config_.init_checkpoint << std::endl;
+    if (Checkpoint::load(config_.init_checkpoint, model_, optimizer_, start_step)) {
+      std::cout << "[INFO] Initial checkpoint loaded successfully. start_step = " << start_step << std::endl;
+      _truncate_metrics_file(start_step);
+    } else {
+      std::cerr << "[WARNING] Failed to load initial checkpoint. Starting training from scratch." << std::endl;
+      start_step = 0;
+    }
+  } else if (config_.resume && fs::exists(config_.checkpoint_dir)) {
     size_t max_step_num = 0;
+    std::string latest_ckpt = "";
     for (const auto &entry : fs::directory_iterator(config_.checkpoint_dir)) {
       if (entry.is_regular_file()) {
         std::string filename = entry.path().filename().string();
@@ -261,7 +273,7 @@ void Trainer::train() {
   std::cout << "[INFO] Commencing pre-training loop..." << std::endl;
 
   for (size_t step = start_step; step < config_.max_steps; ++step) {
-    std::cout << "[DEBUG] Starting step: " << step << std::endl;
+    if (getenv("DEBUG_STEP")) std::cout << "[DEBUG] Starting step: " << step << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
     
     std::vector<std::vector<int>> batch = data_loader_.get_batch();
@@ -289,36 +301,67 @@ void Trainer::train() {
 
     if (step == 0) metal_bridge::start_step_trace();
 
+    auto t_fwd0 = std::chrono::high_resolution_clock::now();
     // ── Scope 1: Forward ──
     metal_bridge::begin_scope();
     Tensor logits = model_.forward(tokens);
     metal_bridge::end_scope();
+    auto t_fwd1 = std::chrono::high_resolution_clock::now();
+    double scope_fwd_gpu = metal_bridge::last_scope_gpu_time_ms;
 
     // ── Loss + Gradient (standalone, synchronous) ──
     // Compute cross-entropy loss on GPU (gradient for backward pass).
-    CrossEntropyLoss lf;
-    loss = lf.forward(logits, targets);  // standalone, executes immediately
-    const Tensor &grad_logits = lf.grad_logits();
+    // Reuse lf across steps so grad_logits_ (13 GB) is allocated once, not
+    // every step — prevents GPU memory exhaustion + page-fault slowdown.
+    loss = lf_.forward(logits, targets);  // standalone, executes immediately
+    const Tensor &grad_logits = lf_.grad_logits();
+    auto t_loss1 = std::chrono::high_resolution_clock::now();
 
-    // ── Scope 2: Backward + Optimizer ──
+    // ── Scope 2a: Zero gradients ──
     metal_bridge::begin_scope();
-    metal_bridge::fill_zero_async(grad_embeddings.data(), grad_embeddings.raw_bytes());
-    metal_bridge::fill_zero_async(grad_output_projection.data(), grad_output_projection.raw_bytes());
-    for (size_t l = 0; l < model_.layers().size(); ++l) {
-      metal_bridge::fill_zero_async(grad_w_gate[l].data(), grad_w_gate[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_w_up[l].data(),   grad_w_up[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_w_down[l].data(), grad_w_down[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_Wq[l].data(),     grad_Wq[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_Wk[l].data(),     grad_Wk[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_Wv[l].data(),     grad_Wv[l].raw_bytes());
-      metal_bridge::fill_zero_async(grad_Wo[l].data(),     grad_Wo[l].raw_bytes());
+    if (!getenv("DEBUG_SKIP_BWD")) {
+      metal_bridge::fill_zero_async(grad_embeddings.data(), grad_embeddings.raw_bytes());
+      metal_bridge::fill_zero_async(grad_output_projection.data(), grad_output_projection.raw_bytes());
+      for (size_t l = 0; l < model_.layers().size(); ++l) {
+        metal_bridge::fill_zero_async(grad_w_gate[l].data(), grad_w_gate[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_w_up[l].data(),   grad_w_up[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_w_down[l].data(), grad_w_down[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_Wq[l].data(),     grad_Wq[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_Wk[l].data(),     grad_Wk[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_Wv[l].data(),     grad_Wv[l].raw_bytes());
+        metal_bridge::fill_zero_async(grad_Wo[l].data(),     grad_Wo[l].raw_bytes());
+      }
     }
-
-    model_.backward(grad_logits, tokens, grad_w_gate, grad_w_up, grad_w_down,
-                     grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
-                     grad_output_projection, rope_);
-    optimizer_.step(lr);
     metal_bridge::end_scope();
+    double scope_zero_gpu = metal_bridge::last_scope_gpu_time_ms;
+
+    // ── Scope 2b: Backward ──
+    metal_bridge::begin_scope();
+    if (!getenv("DEBUG_SKIP_BWD")) {
+      model_.backward(grad_logits, tokens, grad_w_gate, grad_w_up, grad_w_down,
+                       grad_Wq, grad_Wk, grad_Wv, grad_Wo, grad_embeddings,
+                       grad_output_projection, rope_);
+    }
+    metal_bridge::end_scope();
+    double scope_bwd_gpu = metal_bridge::last_scope_gpu_time_ms;
+
+    // ── Scope 2c: Optimizer ──
+    metal_bridge::begin_scope();
+    if (!getenv("DEBUG_SKIP_BWD")) {
+      optimizer_.step(lr);
+    }
+    metal_bridge::end_scope();
+    double scope_opt_gpu = metal_bridge::last_scope_gpu_time_ms;
+
+    auto t_bwd1 = std::chrono::high_resolution_clock::now();
+    if (getenv("PROFILE_STEP")) {
+      double ms_f = std::chrono::duration_cast<std::chrono::milliseconds>(t_fwd1 - t_fwd0).count();
+      double ms_l = std::chrono::duration_cast<std::chrono::milliseconds>(t_loss1 - t_fwd1).count();
+      double ms_b = std::chrono::duration_cast<std::chrono::milliseconds>(t_bwd1 - t_loss1).count();
+      std::cout << "[PROFILE] fwd=" << ms_f << "ms loss=" << ms_l << "ms bwd+opt=" << ms_b << "ms"
+                << " | GPU: fwd=" << scope_fwd_gpu << " zero=" << scope_zero_gpu
+                << " bwd=" << scope_bwd_gpu << " opt=" << scope_opt_gpu << "ms" << std::endl;
+    }
 
     if (step == 0) metal_bridge::stop_step_trace();
 
@@ -344,7 +387,12 @@ void Trainer::train() {
             mcfg.intermediate_dim * mcfg.hidden_dim +
             mcfg.hidden_dim * 2
         ) + mcfg.hidden_dim + mcfg.hidden_dim * mcfg.vocab_size;
-    double mfu_pct = ((6.0 * param_count * (active_batch_size * seq_len)) / (step_ms / 1000.0)) / (28.3e12) * 100.0;
+    // M3 Ultra peak bf16 (config.py convention, 1 FMA = 1 op):
+    // 80 cores × 1.4 GHz × 512 madd/cycle = 57.34 TOPS
+    // MFU numerator uses 3×N×B×S (forward=1, backward=2) to stay in the same
+    // 1-op-per-FMA convention as the denominator.
+    double peak_ops = 80.0 * 1.4e9 * 512.0;
+    double mfu_pct = ((3.0 * param_count * (active_batch_size * seq_len)) / (step_ms / 1000.0)) / peak_ops * 100.0;
     double gpu_active_pct = (metal_bridge::accum_gpu_time_ms / step_ms) * 100.0;
 
     // 4. Log to metrics.csv

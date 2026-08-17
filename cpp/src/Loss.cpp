@@ -56,7 +56,10 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
       }
 
       loss_val_ = 0.0f;
-      grad_logits_ = Tensor({batch, seq_len, vocab_size}, 0.0f);
+      // Reuse grad_logits_ buffer to avoid reallocating Metal buffers every step.
+      // BF16 dtype: the backward pass reads grad_logits as bfloat via gemm_bf16.
+      if (grad_logits_.shape() != Shape{batch, seq_len, vocab_size})
+        grad_logits_ = Tensor({batch, seq_len, vocab_size}, 0.0f, DType::BF16);
 
       metal_bridge::cross_entropy(
           logits.data(),
@@ -67,7 +70,10 @@ float CrossEntropyLoss::forward(const Tensor &logits, const Tensor &targets) {
           vocab_size
       );
 
-      return loss_val_;
+      // The bridge writes the GPU-computed loss into its static buffer.
+      // Read it back so forward() returns the true scalar (trainer also
+      // overwrites with get_last_loss() later, but this keeps it consistent).
+      return metal_bridge::get_last_loss();
     }
   }
 

@@ -37,7 +37,7 @@ struct AdamWParams {
 
 kernel void adamw_step(
     device bfloat*      param [[buffer(0)]],
-    device const bfloat* grad  [[buffer(1)]],
+    device const float* grad  [[buffer(1)]],  // genuinely FP32 gradients
     device float*       m     [[buffer(2)]],
     device float*       v     [[buffer(3)]],
     constant AdamWParams& p   [[buffer(4)]],
@@ -59,11 +59,14 @@ kernel void adamw_step(
     // WHAT: Apply decoupled weight decay directly to the parameter.
     // WHY: AdamW separates weight decay from gradient-based updates to prevent
     //      the adaptive learning rate from interfering with regularization.
-    if (p.weight_decay > 0.0f) {
-        param[idx] = (bfloat)((float)param[idx] - p.lr * p.weight_decay * (float)param[idx]);
+    // Guard against lr == 0: 0 * NaN == NaN in IEEE-754 would corrupt params
+    // even during warmup (step 0 has lr=0 but gradients can be NaN).
+    if (p.lr > 0.0f) {
+        if (p.weight_decay > 0.0f) {
+            param[idx] = (bfloat)((float)param[idx] - p.lr * p.weight_decay * (float)param[idx]);
+        }
+        float m_hat = m[idx] / p.bias_correction1;
+        float v_hat = v[idx] / p.bias_correction2;
+        param[idx] = (bfloat)((float)param[idx] - p.lr * m_hat / (sqrt(v_hat) + p.eps));
     }
-
-    float m_hat = m[idx] / p.bias_correction1;
-    float v_hat = v[idx] / p.bias_correction2;
-    param[idx] = (bfloat)((float)param[idx] - p.lr * m_hat / (sqrt(v_hat) + p.eps));
 }

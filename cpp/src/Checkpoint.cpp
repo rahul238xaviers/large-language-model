@@ -18,7 +18,8 @@ struct SavedTensor {
   std::string name;
   std::vector<size_t> shape;
   const float *data = nullptr;
-  size_t size = 0;
+  size_t size = 0;          // element count
+  size_t size_bytes = 0;    // byte count for `data` (2/elem for BF16, 4 for FP32)
   std::vector<float> owned_data;
   std::string dtype = "F32";
   const char *raw_data = nullptr;
@@ -78,12 +79,16 @@ static void transpose_matrix(const float *src, float *dst, size_t src_rows, size
 
 // Transpose to std::vector helper
 static std::vector<float> transpose_to_vector(const Tensor &t) {
+  // Convert to a genuine FP32 copy so element reads (via data()) are correct
+  // even when the tensor is packed BF16 (n*2 bytes).
+  Tensor tf = (t.dtype() == DType::BF16) ? t.to_dtype(DType::FP32) : t;
   size_t rows = t.shape()[0];
   size_t cols = t.shape()[1];
   std::vector<float> dst(rows * cols);
+  const float *base = tf.data();
   for (size_t r = 0; r < rows; ++r) {
     for (size_t c = 0; c < cols; ++c) {
-      dst[c * rows + r] = t(r, c);
+      dst[c * rows + r] = base[r * cols + c];
     }
   }
   return dst;
@@ -91,6 +96,9 @@ static std::vector<float> transpose_to_vector(const Tensor &t) {
 
 // Fuses and transposes Wq, Wk, Wv into a single Python wqkv weight block
 static std::vector<float> fuse_and_transpose_wqkv(const Tensor &Wq, const Tensor &Wk, const Tensor &Wv) {
+  Tensor Wq_f = (Wq.dtype() == DType::BF16) ? Wq.to_dtype(DType::FP32) : Wq;
+  Tensor Wk_f = (Wk.dtype() == DType::BF16) ? Wk.to_dtype(DType::FP32) : Wk;
+  Tensor Wv_f = (Wv.dtype() == DType::BF16) ? Wv.to_dtype(DType::FP32) : Wv;
   size_t hidden_dim = Wq.shape()[0];
   size_t q_features = Wq.shape()[1];
   size_t kv_features = Wk.shape()[1];
@@ -100,7 +108,7 @@ static std::vector<float> fuse_and_transpose_wqkv(const Tensor &Wq, const Tensor
   // Wq_T shape: [q_features, hidden_dim]
   for (size_t r = 0; r < hidden_dim; ++r) {
     for (size_t c = 0; c < q_features; ++c) {
-      fused[c * hidden_dim + r] = Wq(r, c);
+      fused[c * hidden_dim + r] = Wq_f.data()[r * q_features + c];
     }
   }
   
@@ -108,7 +116,7 @@ static std::vector<float> fuse_and_transpose_wqkv(const Tensor &Wq, const Tensor
   size_t offset1 = q_features * hidden_dim;
   for (size_t r = 0; r < hidden_dim; ++r) {
     for (size_t c = 0; c < kv_features; ++c) {
-      fused[offset1 + c * hidden_dim + r] = Wk(r, c);
+      fused[offset1 + c * hidden_dim + r] = Wk_f.data()[r * kv_features + c];
     }
   }
   
@@ -116,7 +124,7 @@ static std::vector<float> fuse_and_transpose_wqkv(const Tensor &Wq, const Tensor
   size_t offset2 = (q_features + kv_features) * hidden_dim;
   for (size_t r = 0; r < hidden_dim; ++r) {
     for (size_t c = 0; c < kv_features; ++c) {
-      fused[offset2 + c * hidden_dim + r] = Wv(r, c);
+      fused[offset2 + c * hidden_dim + r] = Wv_f.data()[r * kv_features + c];
     }
   }
   
@@ -125,6 +133,8 @@ static std::vector<float> fuse_and_transpose_wqkv(const Tensor &Wq, const Tensor
 
 // Fuses and transposes gate and up projections into a single Python w12 weight block
 static std::vector<float> fuse_and_transpose_w12(const Tensor &w_gate, const Tensor &w_up) {
+  Tensor g_f = (w_gate.dtype() == DType::BF16) ? w_gate.to_dtype(DType::FP32) : w_gate;
+  Tensor u_f = (w_up.dtype() == DType::BF16) ? w_up.to_dtype(DType::FP32) : w_up;
   size_t hidden_dim = w_gate.shape()[0];
   size_t intermediate_dim = w_gate.shape()[1];
   
@@ -133,7 +143,7 @@ static std::vector<float> fuse_and_transpose_w12(const Tensor &w_gate, const Ten
   // w_gate_T shape: [intermediate_dim, hidden_dim]
   for (size_t r = 0; r < hidden_dim; ++r) {
     for (size_t c = 0; c < intermediate_dim; ++c) {
-      fused[c * hidden_dim + r] = w_gate(r, c);
+      fused[c * hidden_dim + r] = g_f.data()[r * intermediate_dim + c];
     }
   }
   
@@ -141,7 +151,7 @@ static std::vector<float> fuse_and_transpose_w12(const Tensor &w_gate, const Ten
   size_t offset = intermediate_dim * hidden_dim;
   for (size_t r = 0; r < hidden_dim; ++r) {
     for (size_t c = 0; c < intermediate_dim; ++c) {
-      fused[offset + c * hidden_dim + r] = w_up(r, c);
+      fused[offset + c * hidden_dim + r] = u_f.data()[r * intermediate_dim + c];
     }
   }
   
@@ -201,14 +211,14 @@ static std::string build_safetensors_json(
   for (const auto &p : tensors) {
     const std::string &name = p.first;
     const Tensor *t = p.second;
-    size_t size_bytes = t->size() * sizeof(float);
+    size_t size_bytes = t->raw_bytes();  // n * itemsize (2 for BF16, 4 for FP32)
     size_t start = current_offset;
     size_t end = current_offset + size_bytes;
     current_offset = end;
     offsets.push_back(end);
 
     json += ",\"" + name + "\":{";
-    json += "\"dtype\":\"F32\",";
+    json += (t->dtype() == DType::BF16) ? "\"dtype\":\"BF16\"," : "\"dtype\":\"F32\",";
 
     json += "\"shape\":[";
     for (size_t d = 0; d < t->shape().size(); ++d) {
@@ -321,8 +331,7 @@ static bool write_safetensors(
 
   for (size_t i = 0; i < tensors.size(); ++i) {
     const Tensor *t = tensors[i].second;
-    out.write(reinterpret_cast<const char *>(t->data()),
-              t->size() * sizeof(float));
+    out.write(reinterpret_cast<const char *>(t->raw_ptr()), t->raw_bytes());
   }
 
   return out.good();
@@ -376,11 +385,19 @@ static bool read_safetensors(const std::string &filepath,
     if (!in.good())
       return false;
 
-    // Direct read assuming float32
-    in.read(reinterpret_cast<char *>(t->data()),
-            t->size() * sizeof(float));
-    if (!in.good())
-      return false;
+    // Direct read — BF16 tensors need float-to-BF16 conversion
+    if (t->dtype() == DType::BF16) {
+      size_t n = t->size();
+      std::vector<float> float_buf(n);
+      in.read(reinterpret_cast<char *>(float_buf.data()), n * sizeof(float));
+      if (!in.good()) return false;
+      uint16_t* dst = (uint16_t*)t->data_bf16();
+      for (size_t i = 0; i < n; ++i) dst[i] = float_to_bf16(float_buf[i]);
+    } else {
+      in.read(reinterpret_cast<char *>(t->data()),
+              t->size() * sizeof(float));
+      if (!in.good()) return false;
+    }
   }
 
   return true;
@@ -448,19 +465,38 @@ static bool load_python_tensor(std::ifstream &in, size_t payload_start, const st
     if (!in.good()) return false;
   }
   
+  
+  // Write to destination: BF16 tensors use data_bf16() to write 2-byte BF16 values
+  // matching the n*2 buffer size.  FP32 tensors use data() for 4-byte floats.
+  bool dest_is_bf16 = (dest.dtype() == DType::BF16);
   if (transpose) {
     if (shape.size() != 2 || dest.shape().size() != 2 ||
         shape[0] != dest.shape()[1] || shape[1] != dest.shape()[0]) {
       std::cerr << "[ERROR] Checkpoint | Transpose shape mismatch for '" << name << "'" << std::endl;
       return false;
     }
-    transpose_matrix(temp_buf.data(), dest.data(), shape[0], shape[1]);
+    if (dest_is_bf16) {
+      // Transpose float temp buffer and convert to BF16 for destination
+      std::vector<float> transposed(dest.size());
+      transpose_matrix(temp_buf.data(), transposed.data(), shape[0], shape[1]);
+      uint16_t* dst = (uint16_t*)dest.data_bf16();
+      for (size_t i = 0; i < dest.size(); ++i)
+        dst[i] = float_to_bf16(transposed[i]);
+    } else {
+      transpose_matrix(temp_buf.data(), dest.data(), shape[0], shape[1]);
+    }
   } else {
     if (temp_buf.size() != dest.size()) {
       std::cerr << "[ERROR] Checkpoint | Shape mismatch for '" << name << "': expected size " << dest.size() << ", got " << temp_buf.size() << std::endl;
       return false;
     }
-    std::copy(temp_buf.begin(), temp_buf.end(), dest.data());
+    if (dest_is_bf16) {
+      uint16_t* dst = (uint16_t*)dest.data_bf16();
+      for (size_t i = 0; i < dest.size(); ++i)
+        dst[i] = float_to_bf16(temp_buf[i]);
+    } else {
+      std::copy(temp_buf.begin(), temp_buf.end(), dest.data());
+    }
   }
   return true;
 }
@@ -523,7 +559,19 @@ static bool load_python_fused_tensor(std::ifstream &in, size_t payload_start, co
       std::copy(temp_buf.begin() + global_row * cols, temp_buf.begin() + (global_row + 1) * cols, slice_buf.begin() + r * cols);
     }
     
-    transpose_matrix(slice_buf.data(), dest.data(), num_rows, cols);
+    // Dest model weights are BF16 (2 bytes/elem); write converted values into
+    // the packed buffer exactly like load_python_tensor does. Writing raw F32
+    // into a BF16 buffer caused a 2x heap overflow and corrupted adjacent
+    // tensors.
+    if (dest.dtype() == DType::BF16) {
+      std::vector<float> transposed(num_rows * cols);
+      transpose_matrix(slice_buf.data(), transposed.data(), num_rows, cols);
+      uint16_t* dst = (uint16_t*)dest.data_bf16();
+      for (size_t i = 0; i < dest.size(); ++i)
+        dst[i] = float_to_bf16(transposed[i]);
+    } else {
+      transpose_matrix(slice_buf.data(), dest.data(), num_rows, cols);
+    }
   }
   return true;
 }
@@ -658,7 +706,8 @@ static std::string build_safetensors_json_adapted(
   offsets.push_back(0);
 
   for (const auto &t : tensors) {
-    size_t size_bytes = t.raw_data ? t.raw_size_bytes : (t.size * sizeof(float));
+    size_t size_bytes = t.raw_data ? t.raw_size_bytes
+                      : (t.size_bytes ? t.size_bytes : (t.size * sizeof(float)));
     size_t start = current_offset;
     size_t end = current_offset + size_bytes;
     current_offset = end;
@@ -709,8 +758,9 @@ static bool write_safetensors_adapted(
     if (tensors[i].raw_data) {
       out.write(tensors[i].raw_data, tensors[i].raw_size_bytes);
     } else {
-      out.write(reinterpret_cast<const char *>(tensors[i].data),
-                tensors[i].size * sizeof(float));
+      size_t bytes = tensors[i].size_bytes ? tensors[i].size_bytes
+                                            : (tensors[i].size * sizeof(float));
+      out.write(reinterpret_cast<const char *>(tensors[i].data), bytes);
     }
   }
 
@@ -729,6 +779,8 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
     t.shape = model.token_embeddings().shape();
     t.data = model.token_embeddings().data();
     t.size = model.token_embeddings().size();
+    t.size_bytes = model.token_embeddings().raw_bytes();
+    t.dtype = "BF16";
     save_list.push_back(t);
   }
   
@@ -740,6 +792,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
     t.owned_data = transpose_to_vector(model.output_projection());
     t.data = t.owned_data.data();
     t.size = t.owned_data.size();
+    t.size_bytes = t.owned_data.size() * sizeof(float);
     save_list.push_back(t);
   }
   
@@ -750,6 +803,8 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
     t.shape = model.final_norm().weight().shape();
     t.data = model.final_norm().weight().data();
     t.size = model.final_norm().weight().size();
+    t.size_bytes = model.final_norm().weight().raw_bytes();
+    t.dtype = "BF16";
     save_list.push_back(t);
   }
   
@@ -765,6 +820,8 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.shape = layer.attn_norm.weight().shape();
       t.data = layer.attn_norm.weight().data();
       t.size = layer.attn_norm.weight().size();
+      t.size_bytes = layer.attn_norm.weight().raw_bytes();
+      t.dtype = "BF16";
       save_list.push_back(t);
     }
     
@@ -775,6 +832,8 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.shape = layer.ffn_norm.weight().shape();
       t.data = layer.ffn_norm.weight().data();
       t.size = layer.ffn_norm.weight().size();
+      t.size_bytes = layer.ffn_norm.weight().raw_bytes();
+      t.dtype = "BF16";
       save_list.push_back(t);
     }
     
@@ -786,6 +845,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.owned_data = transpose_to_vector(layer.attn.Wo());
       t.data = t.owned_data.data();
       t.size = t.owned_data.size();
+      t.size_bytes = t.owned_data.size() * sizeof(float);
       save_list.push_back(t);
     }
     
@@ -797,6 +857,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.owned_data = transpose_to_vector(layer.w_down);
       t.data = t.owned_data.data();
       t.size = t.owned_data.size();
+      t.size_bytes = t.owned_data.size() * sizeof(float);
       save_list.push_back(t);
     }
     
@@ -811,6 +872,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.owned_data = fuse_and_transpose_wqkv(layer.attn.Wq(), layer.attn.Wk(), layer.attn.Wv());
       t.data = t.owned_data.data();
       t.size = t.owned_data.size();
+      t.size_bytes = t.owned_data.size() * sizeof(float);
       save_list.push_back(t);
     }
     
@@ -824,6 +886,7 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t.owned_data = fuse_and_transpose_w12(layer.w_gate, layer.w_up);
       t.data = t.owned_data.data();
       t.size = t.owned_data.size();
+      t.size_bytes = t.owned_data.size() * sizeof(float);
       save_list.push_back(t);
     }
   }
@@ -865,11 +928,13 @@ bool Checkpoint::save(const std::string &filepath, Transformer &model,
       t_m.shape = m_states[0].shape();
       t_m.data = m_states[0].data();
       t_m.size = m_states[0].size();
+      t_m.size_bytes = m_states[0].raw_bytes();
       
       t_v.name = "tok_embeddings.weight.v";
       t_v.shape = v_states[0].shape();
       t_v.data = v_states[0].data();
       t_v.size = v_states[0].size();
+      t_v.size_bytes = v_states[0].raw_bytes();
       
       opt_save_list.push_back(t_m);
       opt_save_list.push_back(t_v);
@@ -1075,7 +1140,7 @@ bool Checkpoint::load(const std::string &filepath, Transformer &model,
 
     std::string opt_json;
     if (read_safetensors_header(opt_filepath, opt_json)) {
-      if (is_python_checkpoint(opt_json) || opt_json.find("\"step\"") != std::string::npos) {
+      if (is_python_checkpoint(opt_json) || opt_json.find("\"tok_embeddings.weight.m\"") != std::string::npos) {
         if (!load_python_optimizer(opt_filepath, opt_json, model, *adamw)) {
           std::cerr << "[WARNING] Checkpoint | Failed to parse Python optimizer state. Adam moments will restart from zero." << std::endl;
           step = 0;
