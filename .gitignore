@@ -1,10 +1,26 @@
-# Python
+# ── C++ / CMake Build Artifacts ──
+build/
+build-*/
+build_*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.a
+*.dylib
+*.so
+*.dSYM/
+*.metallib
+*.gputrace
+compile_commands.json
+.cache/
+.clangd/
+
+# ── Python & Environments ──
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -19,61 +35,45 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual Environment
+*.whl
 venv/
 ENV/
 env/
 .venv/
+.ipynb_checkpoints/
+.pypirc
+
+# ── Training Data & Checkpoints ──
 data/*
 !data/raw_chunks/
 data/raw_chunks/*
 !data/raw_chunks/vocabulary/
 data/raw_chunks/vocabulary/*
 !data/raw_chunks/vocabulary/cl100k_base.tiktoken
+apple-silicon/data/
+checkpoints/
+test_run_checkpoints/
+*.safetensors
 
-# Environment variables
+# ── Logs & Debugging ──
+logs/
+runs/
+*.log
+*.csv
+test_output.txt
+
+# ── Environment & Secrets ──
 .env
 *.env
 
-# Jupyter Notebook
-.ipynb_checkpoints/
-
-# PyPI configuration
-.pypirc
-*whl
-
-# IDE
+# ── IDE & Editor ──
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-runs/
-.cache/
-compile_commands.json
-
-# OS
-.DS_Store
-
-# Application logs
-logs/
-Thumbs.db
-
-# Data files (optional - uncomment if you don't want to commit data)
-# *.txt
-*.csv
-# *.json
-*.metallib
-*.gputrace
-
-# Logs
-*.log
-apple-silicon/data/
 .continue/
 
-# Checkpoints and outputs
-*.safetensors
-checkpoints/
-test_run_checkpoints/
-test_output.txt
+# ── OS Generated ──
+.DS_Store
+Thumbs.db
