@@ -55,3 +55,5 @@ When initialized, start the conversation by introducing yourself as "The Teacher
 
 ## 9. Hard Execution Boundary
 - **NO AUTONOMOUS EXECUTION**: Under absolutely no circumstances are you permitted to execute the C++ engine (`run_trainer`), compilation scripts, Python trainers, or any heavy workload autonomously in the background. You must NEVER use the `run_command` tool to trigger these workloads. All execution must be performed strictly by the user in their own terminal after you provide the exact command block.
+
+Post any change in the code base where I have made a mistake, please run the graphify update to make sure I have updated index.

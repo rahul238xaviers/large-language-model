@@ -35,6 +35,7 @@ struct Shape {
   size_t operator[](size_t i) const { return dims[i]; }
   size_t& operator[](size_t i) { return dims[i]; }
   size_t size() const { return ndim; }
+  size_t num_elements() const { size_t n = 1; for (uint8_t i = 0; i < ndim; ++i) n *= dims[i]; return n; }
   bool empty() const { return ndim == 0; }
   size_t back() const { return dims[ndim ? ndim - 1 : 0]; }
 
@@ -182,8 +183,8 @@ public:
   const size_t* strides_data() const { return strides_.data(); }
   std::vector<size_t> strides() const { return std::vector<size_t>(strides_.begin(), strides_.begin() + shape_.ndim); }
   size_t itemsize() const { return ::itemsize(dtype_); }
-  size_t size() const { return buf_ ? buf_->num_elements(itemsize()) : 0; }
-  size_t num_elements() const { return buf_ ? buf_->num_elements(itemsize()) : 0; }
+  size_t size() const { return shape_.num_elements(); }
+  size_t num_elements() const { return shape_.num_elements(); }
 
   float* data() { return buf_ ? buf_->data_float() : nullptr; }
   const float* data() const { return buf_ ? buf_->data_float() : nullptr; }
@@ -195,6 +196,7 @@ public:
   size_t raw_bytes() const { return buf_ ? buf_->bytes() : 0; }
 
   Tensor clone() const;
+  Tensor to_dtype(DType target_dtype) const;
 
   void resize_storage(const Shape &new_shape) {
     size_t n = compute_size(new_shape);

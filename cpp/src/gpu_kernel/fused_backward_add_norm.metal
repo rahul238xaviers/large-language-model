@@ -17,11 +17,11 @@ inline float simd_sum_f(float v) {
 }
 
 kernel void fused_backward_add_norm(
-    device const bfloat* grad_output [[buffer(0)]],
-    device const bfloat* input       [[buffer(1)]],
-    device const float*  weight      [[buffer(2)]],
-    device const bfloat* residual    [[buffer(3)]],
-    device bfloat*       grad_input  [[buffer(4)]],
+    device const bfloat* grad_output [[buffer(0)]], // BF16
+    device const bfloat* input       [[buffer(1)]], // BF16
+    device const bfloat*  weight      [[buffer(2)]], // BF16
+    device const bfloat* residual    [[buffer(3)]], // BF16
+    device bfloat*       grad_input  [[buffer(4)]], // BF16
     constant uint&       D           [[buffer(5)]],
     constant float&      eps         [[buffer(6)]],
     uint row_idx [[threadgroup_position_in_grid]],
@@ -54,7 +54,7 @@ kernel void fused_backward_add_norm(
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
         float g = (float)grad_output[idx];
-        float w = weight[c];
+        float w = (float)weight[c];
         float x = (float)input[idx];
         float xhat = x / rms;
         local_gwx += g * w * xhat;
@@ -74,7 +74,7 @@ kernel void fused_backward_add_norm(
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
         float g  = (float)grad_output[idx];
-        float w  = weight[c];
+        float w  = (float)weight[c];
         float x  = (float)input[idx];
         float r  = (float)residual[idx];
         float xhat = x / rms;

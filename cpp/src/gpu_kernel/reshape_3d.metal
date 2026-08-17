@@ -2,8 +2,8 @@
 using namespace metal;
 
 kernel void reshape_to_3d(
-    device const float* src    [[buffer(0)]],
-    device float*       dst    [[buffer(1)]],
+    device const bfloat* src    [[buffer(0)]],
+    device bfloat*       dst    [[buffer(1)]],
     constant uint&      batch   [[buffer(2)]],
     constant uint&      n_heads [[buffer(3)]],
     constant uint&      seq_len [[buffer(4)]],

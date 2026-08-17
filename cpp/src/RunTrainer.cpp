@@ -44,20 +44,55 @@ static std::string get_timestamp() {
   return ss.str();
 }
 
-static void save_config_json(const std::string &filepath, const ModelConfig &config, size_t batch_size, size_t max_steps) {
+// Format floats like Python's json.dumps (integral values get a trailing ".0").
+static std::string fmt_float(float v) {
+  std::ostringstream ss;
+  ss << v;
+  std::string s = ss.str();
+  if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+      s.find("inf") == std::string::npos && s.find("nan") == std::string::npos) {
+    s += ".0";
+  }
+  return s;
+}
+
+static void save_config_json(const std::string &filepath, const ModelConfig &config,
+                             size_t batch_size, size_t max_steps,
+                             const TrainerConfig &train_cfg,
+                             float opt_beta1, float opt_beta2, float opt_eps,
+                             float opt_weight_decay, float grad_clip_norm) {
+  // CPP does not implement gradient accumulation yet; one micro-batch == one
+  // optimizer step.  Effective batch / tokens mirror the Python config schema.
+  const size_t gradient_accumulation_steps = 1;
+  const size_t effective_batch_size = batch_size * gradient_accumulation_steps;
+
   std::ofstream out(filepath);
   if (out.is_open()) {
     out << "{\n";
-    out << "    \"hidden_dim\": " << config.hidden_dim << ",\n";
-    out << "    \"intermediate_dim\": " << config.intermediate_dim << ",\n";
-    out << "    \"n_layers\": " << config.n_layers << ",\n";
-    out << "    \"n_heads\": " << config.n_heads << ",\n";
-    out << "    \"n_kv_heads\": " << config.n_kv_heads << ",\n";
+    out << "    \"n_layer\": " << config.n_layers << ",\n";
+    out << "    \"n_embd\": " << config.hidden_dim << ",\n";
+    out << "    \"n_head\": " << config.n_heads << ",\n";
+    out << "    \"n_kv_head\": " << config.n_kv_heads << ",\n";
     out << "    \"head_dim\": " << config.head_dim << ",\n";
-    out << "    \"max_seq_len\": " << config.max_seq_len << ",\n";
+    out << "    \"block_size\": " << config.max_seq_len << ",\n";
     out << "    \"vocab_size\": " << config.vocab_size << ",\n";
-    out << "    \"batch_size\": " << batch_size << ",\n";
-    out << "    \"max_steps\": " << max_steps << "\n";
+    out << "    \"micro_batch_size\": " << batch_size << ",\n";
+    out << "    \"gradient_accumulation_steps\": " << gradient_accumulation_steps << ",\n";
+    out << "    \"learning_rate\": " << fmt_float(train_cfg.lr_max) << ",\n";
+    out << "    \"min_lr\": " << fmt_float(train_cfg.lr_min) << ",\n";
+    out << "    \"warmup_iters\": " << train_cfg.warmup_steps << ",\n";
+    out << "    \"max_iters\": " << max_steps << ",\n";
+    out << "    \"weight_decay\": " << fmt_float(opt_weight_decay) << ",\n";
+    out << "    \"grad_clip_norm\": " << fmt_float(grad_clip_norm) << ",\n";
+    out << "    \"beta1\": " << fmt_float(opt_beta1) << ",\n";
+    out << "    \"beta2\": " << fmt_float(opt_beta2) << ",\n";
+    out << "    \"eps\": " << fmt_float(opt_eps) << ",\n";
+    out << "    \"dtype\": \"bfloat16\",\n";
+    out << "    \"save_interval\": " << train_cfg.checkpoint_interval << ",\n";
+    out << "    \"keep_checkpoints\": " << train_cfg.keep_last_n_checkpoints << ",\n";
+    out << "    \"checkpoint_dir\": \"" << train_cfg.checkpoint_dir << "\",\n";
+    out << "    \"effective_batch_size\": " << effective_batch_size << ",\n";
+    out << "    \"total_tokens_per_iter\": " << effective_batch_size * config.max_seq_len << "\n";
     out << "}\n";
     out.close();
   }
@@ -112,15 +147,15 @@ int main(int argc, char* argv[]) {
   std::string vocab_path = "data/raw_chunks/vocabulary/cl100k_base.tiktoken";
   std::string checkpoint_dir = "cpp/runs";
   std::string metrics_filepath = "metrics.csv";
+  std::string init_checkpoint = "";
   bool resume = true;
 
   // Default 380M parameter Rust-GPT production configurations
   ModelConfig config;
-  // Pad vocab size to a multiple of 64 for optimal GPU/Metal GEMM tensor core utilization
-  // (cl100k_base has 100277, padded to 100352)
-  config.vocab_size = 100352; 
+  // Matches Python checkpoint vocab_size (cl100k_base).
+  config.vocab_size = 100277; 
   config.hidden_dim = 1024;
-  config.intermediate_dim = 2752; // Padded from 2730 to a multiple of 32 to avoid CPU fallback
+  config.intermediate_dim = 2730; // Match Python checkpoint
   config.n_layers = 24;
   config.n_heads = 16;
   config.n_kv_heads = 8;
@@ -130,6 +165,13 @@ int main(int argc, char* argv[]) {
   config.rms_norm_eps = 1e-5f;
 
   size_t checkpoint_interval = 500;
+
+  // AdamW / training hyperparameters (mirror the Python config schema).
+  const float opt_beta1 = 0.9f;
+  const float opt_beta2 = 0.999f;  // Python used 0.95; CPP uses 0.999.
+  const float opt_eps = 1e-8f;
+  const float opt_weight_decay = 0.1f;
+  const float grad_clip_norm = 1.0f;  // recorded for parity; clipping not enforced
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -149,6 +191,8 @@ int main(int argc, char* argv[]) {
       checkpoint_dir = argv[++i];
     } else if (arg == "--metrics" && i + 1 < argc) {
       metrics_filepath = argv[++i];
+    } else if (arg == "--init_checkpoint" && i + 1 < argc) {
+      init_checkpoint = argv[++i];
     } else if (arg == "--no-resume") {
       resume = false;
     } else if (arg == "--hidden_dim" && i + 1 < argc) {
@@ -216,6 +260,23 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Training schedule configuration (shared between config.json and the Trainer).
+  TrainerConfig train_cfg;
+  train_cfg.max_steps = max_steps;
+  if (const char *ws = std::getenv("TRAIN_WARMUP_STEPS")) train_cfg.warmup_steps = std::atoi(ws);
+  else train_cfg.warmup_steps = 500;
+  if (const char *lr = std::getenv("TRAIN_LR_MAX")) train_cfg.lr_max = std::atof(lr);
+  else train_cfg.lr_max = 3e-4f;
+  if (const char *lrmin = std::getenv("TRAIN_LR_MIN")) train_cfg.lr_min = std::atof(lrmin);
+  else train_cfg.lr_min = 3e-5f;
+  train_cfg.log_interval = 1;
+  train_cfg.checkpoint_interval = checkpoint_interval;
+  train_cfg.keep_last_n_checkpoints = 3;
+  train_cfg.checkpoint_dir = checkpoint_dir;
+  train_cfg.metrics_filepath = metrics_filepath;
+  train_cfg.resume = resume;
+  train_cfg.init_checkpoint = init_checkpoint;
+
   // Create a new run directory if we didn't find an existing run to resume
   if (run_dir.empty()) {
     std::string timestamp = get_timestamp();
@@ -223,9 +284,12 @@ int main(int argc, char* argv[]) {
     checkpoint_dir = run_dir + "/checkpoints";
     metrics_filepath = run_dir + "/metrics.csv";
     log_filepath = run_dir + "/train.log";
-    
+    train_cfg.checkpoint_dir = checkpoint_dir;
+    train_cfg.metrics_filepath = metrics_filepath;
+
     std::filesystem::create_directories(checkpoint_dir);
-    save_config_json(run_dir + "/config.json", config, batch_size, max_steps);
+    save_config_json(run_dir + "/config.json", config, batch_size, max_steps, train_cfg,
+                     opt_beta1, opt_beta2, opt_eps, opt_weight_decay, grad_clip_norm);
   } else {
     std::filesystem::create_directories(checkpoint_dir);
   }
@@ -257,6 +321,8 @@ int main(int argc, char* argv[]) {
   std::cout << "  max_steps:          " << max_steps << std::endl;
   std::cout << "  checkpoint_dir:     " << checkpoint_dir << std::endl;
   std::cout << "  metrics_file:       " << metrics_filepath << std::endl;
+  if (!init_checkpoint.empty())
+    std::cout << "  init_checkpoint:    " << init_checkpoint << std::endl;
   std::cout << "  auto_resume:        " << (resume ? "true" : "false") << std::endl;
   std::cout << "==========================================================" << std::endl;
 
@@ -270,22 +336,10 @@ int main(int argc, char* argv[]) {
   RoPE rope(config.head_dim, config.max_seq_len, config.rope_base);
 
   std::cout << "[INFO] Initialising AdamW Optimizer (decay=0.1)..." << std::endl;
-  AdamWOptimizer optimizer(0.9f, 0.999f, 1e-8f, 0.1f); 
+  AdamWOptimizer optimizer(opt_beta1, opt_beta2, opt_eps, opt_weight_decay);
 
   std::cout << "[INFO] Initialising Parquet Data Ingestion..." << std::endl;
   DataIngestion data_loader(data_dir, "", 500 * 1024 * 1024, batch_size, config.max_seq_len, vocab_path);
-
-  TrainerConfig train_cfg;
-  train_cfg.max_steps = max_steps;
-  train_cfg.warmup_steps = 500;
-  train_cfg.lr_max = 3e-4f;
-  train_cfg.lr_min = 3e-5f;
-  train_cfg.log_interval = 1;
-  train_cfg.checkpoint_interval = checkpoint_interval;
-  train_cfg.keep_last_n_checkpoints = 3;
-  train_cfg.checkpoint_dir = checkpoint_dir;
-  train_cfg.metrics_filepath = metrics_filepath;
-  train_cfg.resume = resume;
 
   Trainer trainer(train_cfg, model, optimizer, data_loader, rope);
 

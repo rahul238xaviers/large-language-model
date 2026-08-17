@@ -112,7 +112,7 @@ void RoPE::forward(Tensor &q, Tensor &k) const {
     size_t seq_len = q.shape()[2];
     size_t head_dim = q.shape()[3];
 
-    metal_bridge::rope_forward(q.data(), k.data(),
+    metal_bridge::rope_forward((float*)q.raw_ptr(), (float*)k.raw_ptr(),
                                 cos_table_.data(), sin_table_.data(),
                                 batch, q_heads, k_heads, seq_len, head_dim);
     return;
@@ -145,8 +145,22 @@ void RoPE::forward(Tensor &q, Tensor &k) const {
     }
   };
 
-  result_t(q);
-  result_t(k);
+  Tensor q_fp32 = q.to_dtype(DType::FP32);
+  Tensor k_fp32 = k.to_dtype(DType::FP32);
+  result_t(q_fp32);
+  result_t(k_fp32);
+  if (q.dtype() == DType::BF16) {
+    Tensor tmp_q = q_fp32.to_dtype(DType::BF16);
+    std::memcpy(q.data(), tmp_q.data(), tmp_q.raw_bytes());
+  } else {
+    std::memcpy(q.data(), q_fp32.data(), q_fp32.raw_bytes());
+  }
+  if (k.dtype() == DType::BF16) {
+    Tensor tmp_k = k_fp32.to_dtype(DType::BF16);
+    std::memcpy(k.data(), tmp_k.data(), tmp_k.raw_bytes());
+  } else {
+    std::memcpy(k.data(), k_fp32.data(), k_fp32.raw_bytes());
+  }
 }
 
 /**
@@ -193,12 +207,24 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
     size_t seq_len = grad_q.shape()[2];
     size_t head_dim = grad_q.shape()[3];
 
-    metal_bridge::rope_backward(grad_q.data(), cos_table_.data(),
+    Tensor q_bf16 = grad_q.to_dtype(DType::BF16);
+    Tensor k_bf16 = grad_k.to_dtype(DType::BF16);
+
+    metal_bridge::rope_backward((float*)q_bf16.raw_ptr(), cos_table_.data(),
                                 sin_table_.data(), batch, q_heads, seq_len,
                                 head_dim);
-    metal_bridge::rope_backward(grad_k.data(), cos_table_.data(),
+    metal_bridge::rope_backward((float*)k_bf16.raw_ptr(), cos_table_.data(),
                                 sin_table_.data(), batch, k_heads, seq_len,
                                 head_dim);
+
+    if (grad_q.dtype() == DType::FP32) {
+      Tensor tmp = q_bf16.to_dtype(DType::FP32);
+      std::memcpy(grad_q.data(), tmp.data(), tmp.raw_bytes());
+    }
+    if (grad_k.dtype() == DType::FP32) {
+      Tensor tmp = k_bf16.to_dtype(DType::FP32);
+      std::memcpy(grad_k.data(), tmp.data(), tmp.raw_bytes());
+    }
     return;
   }
 
@@ -229,6 +255,20 @@ void RoPE::backward(Tensor &grad_q, Tensor &grad_k) const {
     }
   };
 
-  result_t(grad_q);
-  result_t(grad_k);
+  Tensor q_fp32 = grad_q.to_dtype(DType::FP32);
+  Tensor k_fp32 = grad_k.to_dtype(DType::FP32);
+  result_t(q_fp32);
+  result_t(k_fp32);
+  if (grad_q.dtype() == DType::BF16) {
+    Tensor tmp_q = q_fp32.to_dtype(DType::BF16);
+    std::memcpy(grad_q.data(), tmp_q.data(), tmp_q.raw_bytes());
+  } else {
+    std::memcpy(grad_q.data(), q_fp32.data(), q_fp32.raw_bytes());
+  }
+  if (grad_k.dtype() == DType::BF16) {
+    Tensor tmp_k = k_fp32.to_dtype(DType::BF16);
+    std::memcpy(grad_k.data(), tmp_k.data(), tmp_k.raw_bytes());
+  } else {
+    std::memcpy(grad_k.data(), k_fp32.data(), k_fp32.raw_bytes());
+  }
 }
