@@ -37,7 +37,8 @@ function App() {
       <header className="hero">
         <div className="architect-badge">
           <span className="badge-icon">⚡</span>
-          Architected by <span className="rkmastermind-signature">Rkmastermind</span>
+          {' '}Architected by{' '}
+          <span className="rkmastermind-signature">Rkmastermind</span>
         </div>
         <h1 className="glow-text">LLM Training Engine</h1>
         <p className="subtitle">The Journey from Raw Text to a Reasoning Matrix</p>
