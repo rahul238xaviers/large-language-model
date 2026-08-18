@@ -35,6 +35,10 @@ function App() {
   return (
     <div className="app-container">
       <header className="hero">
+        <div className="architect-badge">
+          <span className="badge-icon">⚡</span>
+          Architected by <span className="rkmastermind-signature">Rkmastermind</span>
+        </div>
         <h1 className="glow-text">LLM Training Engine</h1>
         <p className="subtitle">The Journey from Raw Text to a Reasoning Matrix</p>
         
@@ -125,18 +129,7 @@ function App() {
       </main>
       
       <footer>
-        <div className="footer-content">
-          <p className="creator-credit">
-            Architected by <span className="creator-name glow-text-small">Rkmastermind</span>
-          </p>
-          <p className="footer-links">
-            <span className="separator">|</span>
-            <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noopener noreferrer" className="github-link">
-              System Repository
-            </a>
-            <span className="separator">|</span>
-          </p>
-        </div>
+        <p>Built with curiosity. Explore the <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noopener noreferrer">GitHub Repository</a>.</p>
       </footer>
     </div>
   )

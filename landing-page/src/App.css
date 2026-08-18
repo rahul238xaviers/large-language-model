@@ -412,3 +412,46 @@ footer a:hover {
   0% { filter: hue-rotate(0deg); }
   100% { filter: hue-rotate(360deg); }
 }
+
+/* Architect Hero Badge */
+.architect-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  backdrop-filter: blur(10px);
+  margin-bottom: 24px;
+  font-size: 0.85rem;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+  transition: all 0.3s ease;
+}
+
+.architect-badge:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-2px);
+}
+
+.badge-icon {
+  font-size: 1rem;
+  animation: pulse-glow 2s infinite alternate;
+}
+
+.rkmastermind-signature {
+  font-weight: 800;
+  color: #fff;
+  letter-spacing: 1.5px;
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.6), 0 0 20px var(--primary-color);
+}
+
+@keyframes pulse-glow {
+  0% { filter: drop-shadow(0 0 2px var(--primary-color)); }
+  100% { filter: drop-shadow(0 0 8px var(--primary-color)); }
+}
