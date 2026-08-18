@@ -40,12 +40,14 @@ function App() {
         
         <div className="pipeline-toggle">
           <button 
+            type="button"
             className={`toggle-btn ${pipeline === 'cpp' ? 'active' : ''}`}
             onClick={() => setPipeline('cpp')}
           >
             Native C++ (Metal)
           </button>
           <button 
+            type="button"
             className={`toggle-btn ${pipeline === 'python' ? 'active' : ''}`}
             onClick={() => setPipeline('python')}
           >
@@ -55,8 +57,8 @@ function App() {
       </header>
 
       <main className="curriculum-pathway">
-        {curriculumData.map((phase, phaseIdx) => (
-          <section key={phaseIdx} className="phase-section">
+        {curriculumData.map((phase) => (
+          <section key={phase.phase} className="phase-section">
             <div className="phase-header">
               <h2>{phase.phase}</h2>
               <p>{phase.description}</p>
@@ -67,28 +69,31 @@ function App() {
                 <div 
                   key={topic.id} 
                   data-id={topic.id}
-                  role="button"
-                  tabIndex={0}
                   className={`topic-node ${activeTopic === topic.id ? 'expanded' : ''} ${visibleNodes.has(topic.id) ? 'visible' : ''}`}
-                  onClick={() => setActiveTopic(activeTopic === topic.id ? null : topic.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setActiveTopic(activeTopic === topic.id ? null : topic.id);
-                    }
-                  }}
                 >
-                  <div className="node-marker">
+                  <button 
+                    type="button"
+                    className="node-marker trigger-button"
+                    onClick={() => setActiveTopic(activeTopic === topic.id ? null : topic.id)}
+                    aria-label={`Expand ${topic.title}`}
+                  >
                     <div className="core"></div>
                     <div className="pulse"></div>
-                  </div>
+                  </button>
                   
                   <div className="node-content">
-                    <div className="node-header">
-                      <span className="topic-id">{topic.id}</span>
-                      <h3>{topic.title}</h3>
-                    </div>
-                    <p className="topic-subtitle">{topic.subtitle}</p>
+                    <button 
+                      type="button"
+                      className="node-header-trigger trigger-button"
+                      onClick={() => setActiveTopic(activeTopic === topic.id ? null : topic.id)}
+                      aria-expanded={activeTopic === topic.id}
+                    >
+                      <div className="node-header">
+                        <span className="topic-id">{topic.id}</span>
+                        <h3>{topic.title}</h3>
+                      </div>
+                      <p className="topic-subtitle">{topic.subtitle}</p>
+                    </button>
                     
                     {activeTopic === topic.id && (
                       <div className="node-details animate-in">
@@ -106,7 +111,6 @@ function App() {
                           target="_blank" 
                           rel="noopener noreferrer"
                           className="code-link-btn"
-                          onClick={(e) => e.stopPropagation()}
                         >
                           View {pipeline === 'cpp' ? 'C++' : 'Python'} Implementation →
                         </a>
@@ -121,7 +125,7 @@ function App() {
       </main>
       
       <footer>
-        <p>Built with curiosity. Explore the <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noreferrer">GitHub Repository</a>.</p>
+        <p>Built with curiosity. Explore the <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noopener noreferrer">GitHub Repository</a>.</p>
       </footer>
     </div>
   )

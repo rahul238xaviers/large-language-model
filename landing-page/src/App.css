@@ -335,3 +335,23 @@ footer a:hover {
     font-size: 2.5rem;
   }
 }
+
+/* Trigger Button Resets (SonarQube Fixes) */
+.trigger-button {
+  background: transparent;
+  border: none;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  display: block;
+}
+
+.node-marker.trigger-button {
+  width: 60px; /* match original .node-marker width */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
