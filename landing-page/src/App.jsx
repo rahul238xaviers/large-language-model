@@ -5,13 +5,20 @@ import './App.css'
 function App() {
   const [pipeline, setPipeline] = useState('cpp') // 'cpp' or 'python'
   const [activeTopic, setActiveTopic] = useState(null)
+  const [visibleNodes, setVisibleNodes] = useState(new Set())
 
   useEffect(() => {
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
           if (entry.isIntersecting) {
-            entry.target.classList.add('visible')
+            setVisibleNodes((prev) => {
+              const newSet = new Set(prev)
+              newSet.add(entry.target.dataset.id)
+              return newSet
+            })
+            // Stop observing once it's visible so it doesn't fade out if we scroll back up
+            observer.unobserve(entry.target)
           }
         })
       },
@@ -56,10 +63,11 @@ function App() {
             </div>
             
             <div className="topics-container">
-              {phase.topics.map((topic, topicIdx) => (
+              {phase.topics.map((topic) => (
                 <div 
                   key={topic.id} 
-                  className={`topic-node ${activeTopic === topic.id ? 'expanded' : ''}`}
+                  data-id={topic.id}
+                  className={`topic-node ${activeTopic === topic.id ? 'expanded' : ''} ${visibleNodes.has(topic.id) ? 'visible' : ''}`}
                   onClick={() => setActiveTopic(activeTopic === topic.id ? null : topic.id)}
                 >
                   <div className="node-marker">
