@@ -67,8 +67,16 @@ function App() {
                 <div 
                   key={topic.id} 
                   data-id={topic.id}
+                  role="button"
+                  tabIndex={0}
                   className={`topic-node ${activeTopic === topic.id ? 'expanded' : ''} ${visibleNodes.has(topic.id) ? 'visible' : ''}`}
                   onClick={() => setActiveTopic(activeTopic === topic.id ? null : topic.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setActiveTopic(activeTopic === topic.id ? null : topic.id);
+                    }
+                  }}
                 >
                   <div className="node-marker">
                     <div className="core"></div>
@@ -96,7 +104,7 @@ function App() {
                         <a 
                           href={`https://github.com/rahul238xaviers/large-language-model/tree/main/${pipeline === 'cpp' ? topic.cppLink : topic.pythonLink}`}
                           target="_blank" 
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="code-link-btn"
                           onClick={(e) => e.stopPropagation()}
                         >
