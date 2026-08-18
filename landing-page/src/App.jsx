@@ -125,7 +125,18 @@ function App() {
       </main>
       
       <footer>
-        <p>Built with curiosity. Explore the <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noopener noreferrer">GitHub Repository</a>.</p>
+        <div className="footer-content">
+          <p className="creator-credit">
+            Architected by <span className="creator-name glow-text-small">Rkmastermind</span>
+          </p>
+          <p className="footer-links">
+            <span className="separator">|</span>
+            <a href="https://github.com/rahul238xaviers/large-language-model" target="_blank" rel="noopener noreferrer" className="github-link">
+              System Repository
+            </a>
+            <span className="separator">|</span>
+          </p>
+        </div>
       </footer>
     </div>
   )

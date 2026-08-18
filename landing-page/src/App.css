@@ -355,3 +355,60 @@ footer a:hover {
   justify-content: center;
   align-items: center;
 }
+
+/* Creative Footer Styles */
+.footer-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.creator-credit {
+  font-size: 1.1rem;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.creator-name {
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  background: linear-gradient(90deg, #ff00cc, #3333ff, #00ffff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: rgb-shift 5s linear infinite;
+}
+
+.glow-text-small {
+  text-shadow: 0 0 10px rgba(51, 51, 255, 0.4), 0 0 20px rgba(0, 255, 255, 0.2);
+}
+
+.footer-links {
+  font-size: 0.9rem;
+  opacity: 0.7;
+}
+
+.separator {
+  margin: 0 15px;
+  color: var(--primary-color);
+  opacity: 0.5;
+}
+
+.github-link {
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: all 0.3s ease;
+  letter-spacing: 1px;
+}
+
+.github-link:hover {
+  color: var(--primary-color);
+  text-shadow: 0 0 8px var(--primary-color);
+}
+
+@keyframes rgb-shift {
+  0% { filter: hue-rotate(0deg); }
+  100% { filter: hue-rotate(360deg); }
+}
