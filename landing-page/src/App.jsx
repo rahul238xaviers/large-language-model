@@ -112,7 +112,7 @@ function App() {
                         </div>
                         
                         <a 
-                          href={`https://github.com/rahul238xaviers/large-language-model/tree/main/${pipeline === 'cpp' ? topic.cppLink : topic.pythonLink}`}
+                          href={`https://github.com/rahul238xaviers/large-language-model/blob/main/${pipeline === 'cpp' ? topic.cppLink : topic.pythonLink}`}
                           target="_blank" 
                           rel="noopener noreferrer"
                           className="code-link-btn"
