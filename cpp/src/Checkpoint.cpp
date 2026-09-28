@@ -1168,11 +1168,19 @@ bool Checkpoint::load(const std::string &filepath, Transformer &model,
           std::cout << "[INFO] Resumed optimizer step count: " << step << std::endl;
         } else {
           std::cerr << "[WARNING] Checkpoint | Failed to read native optimizer state. Adam moments will restart from zero." << std::endl;
+          for (auto &m : m_states) m.fill(0.0f);
+          for (auto &v : v_states) v.fill(0.0f);
+          adamw->step_count() = 0;
           step = 0;
         }
       }
     } else {
       std::cerr << "[WARNING] Checkpoint | Failed to read optimizer state header. Adam moments will restart from zero." << std::endl;
+      auto &m_states = adamw->m_states();
+      auto &v_states = adamw->v_states();
+      for (auto &m : m_states) m.fill(0.0f);
+      for (auto &v : v_states) v.fill(0.0f);
+      adamw->step_count() = 0;
       step = 0;
     }
   }

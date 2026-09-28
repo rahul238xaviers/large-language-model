@@ -171,6 +171,42 @@ void Trainer::_truncate_metrics_file(size_t step_cutoff) {
   }
 }
 
+#include <limits>
+
+static void print_tensor_stats(const std::string &name, const Tensor &t) {
+  if (t.size() == 0) {
+    std::cout << "[STATS] " << name << " is empty" << std::endl;
+    return;
+  }
+  Tensor t_fp32 = (t.dtype() == DType::BF16) ? t.to_dtype(DType::FP32) : t;
+  const float *data = t_fp32.data();
+  size_t n = t_fp32.size();
+  
+  float min_val = std::numeric_limits<float>::has_infinity ? std::numeric_limits<float>::infinity() : 1e38f;
+  float max_val = std::numeric_limits<float>::has_infinity ? -std::numeric_limits<float>::infinity() : -1e38f;
+  size_t nan_count = 0;
+  size_t inf_count = 0;
+  double sum = 0.0;
+  
+  for (size_t i = 0; i < n; ++i) {
+    float val = data[i];
+    if (std::isnan(val)) {
+      nan_count++;
+    } else if (std::isinf(val)) {
+      inf_count++;
+    } else {
+      min_val = std::min(min_val, val);
+      max_val = std::max(max_val, val);
+      sum += val;
+    }
+  }
+  
+  std::cout << "[STATS] " << name << " | size: " << n 
+            << " | min: " << min_val << " | max: " << max_val 
+            << " | mean: " << (n > nan_count + inf_count ? sum / (n - nan_count - inf_count) : 0.0)
+            << " | NaNs: " << nan_count << " | Infs: " << inf_count << std::endl;
+}
+
 /**
  * @brief Executes the pre-training loop for the configured number of steps.
  *
@@ -309,6 +345,10 @@ void Trainer::train() {
     auto t_fwd1 = std::chrono::high_resolution_clock::now();
     double scope_fwd_gpu = metal_bridge::last_scope_gpu_time_ms;
 
+    if (getenv("DEBUG_STATS")) {
+      print_tensor_stats("DEBUG FORWARD h_cache_.back()", model_.h_cache().back());
+    }
+
     // ── Loss + Gradient (standalone, synchronous) ──
     // Compute cross-entropy loss on GPU (gradient for backward pass).
     // Reuse lf across steps so grad_logits_ (13 GB) is allocated once, not
@@ -345,6 +385,18 @@ void Trainer::train() {
     metal_bridge::end_scope();
     double scope_bwd_gpu = metal_bridge::last_scope_gpu_time_ms;
 
+    if (getenv("DEBUG_STATS")) {
+      std::cout << "\n=== DIAGNOSTICS BEFORE OPTIMIZER (STEP " << step << ") ===" << std::endl;
+      print_tensor_stats("grad_logits", grad_logits);
+      print_tensor_stats("grad_w_gate[0]", grad_w_gate[0]);
+      print_tensor_stats("grad_w_up[0]", grad_w_up[0]);
+      print_tensor_stats("grad_w_down[0]", grad_w_down[0]);
+      print_tensor_stats("grad_Wq[0]", grad_Wq[0]);
+      print_tensor_stats("grad_Wo[0]", grad_Wo[0]);
+      print_tensor_stats("grad_embeddings", grad_embeddings);
+      print_tensor_stats("grad_output_projection", grad_output_projection);
+    }
+
     // ── Scope 2c: Optimizer ──
     metal_bridge::begin_scope();
     if (!getenv("DEBUG_SKIP_BWD")) {
@@ -352,6 +404,15 @@ void Trainer::train() {
     }
     metal_bridge::end_scope();
     double scope_opt_gpu = metal_bridge::last_scope_gpu_time_ms;
+
+    if (getenv("DEBUG_STATS")) {
+      std::cout << "\n=== DIAGNOSTICS AFTER OPTIMIZER (STEP " << step << ") ===" << std::endl;
+      print_tensor_stats("w_gate[0]", model_.layers()[0].w_gate);
+      print_tensor_stats("Wq[0]", model_.layers()[0].attn.Wq());
+      print_tensor_stats("token_embeddings", model_.token_embeddings());
+      print_tensor_stats("output_projection", model_.output_projection());
+      std::cout << "=================================================\n" << std::endl;
+    }
 
     auto t_bwd1 = std::chrono::high_resolution_clock::now();
     if (getenv("PROFILE_STEP")) {

@@ -128,32 +128,45 @@ Tensor RMSNorm::backward(const Tensor &grad_output, const Tensor &input,
   }
 
   if (use_gpu) {
-    Tensor grad_output_bf16 = grad_output.to_dtype(DType::BF16);
-    Tensor input_bf16 = input.to_dtype(DType::BF16);
-    Tensor grad_input_bf16(input.shape(), 0.0f, DType::BF16);
-    Tensor grad_weight_bf16 = grad_weight.to_dtype(DType::BF16);
+    if (grad_output_bf16_.shape() != grad_output.shape()) {
+      grad_output_bf16_ = Tensor(grad_output.shape(), 0.0f, DType::BF16);
+    }
+    if (grad_output.dtype() == DType::FP32) {
+      metal_bridge::convert_fp32_to_bf16((const float*)grad_output.raw_ptr(), (float*)grad_output_bf16_.raw_ptr(), grad_output.size());
+    } else {
+      grad_output_bf16_ = grad_output;
+    }
 
-    metal_bridge::rms_norm_backward((const float*)grad_output_bf16.raw_ptr(),
-                                    (const float*)input_bf16.raw_ptr(),
+    if (input_bf16_.shape() != input.shape()) {
+      input_bf16_ = Tensor(input.shape(), 0.0f, DType::BF16);
+    }
+    if (input.dtype() == DType::FP32) {
+      metal_bridge::convert_fp32_to_bf16((const float*)input.raw_ptr(), (float*)input_bf16_.raw_ptr(), input.size());
+    } else {
+      input_bf16_ = input;
+    }
+
+    if (grad_input_bf16_.shape() != input.shape()) {
+      grad_input_bf16_ = Tensor(input.shape(), 0.0f, DType::BF16);
+    }
+
+    if (grad_weight_bf16_.shape() != grad_weight.shape()) {
+      grad_weight_bf16_ = Tensor(grad_weight.shape(), 0.0f, DType::BF16);
+    }
+
+    metal_bridge::rms_norm_backward((const float*)grad_output_bf16_.raw_ptr(),
+                                    (const float*)input_bf16_.raw_ptr(),
                                     (const float*)weight_.raw_ptr(),
-                                    (float*)grad_input_bf16.raw_ptr(),
-                                    (float*)grad_weight_bf16.raw_ptr(),
+                                    (float*)grad_input_bf16_.raw_ptr(),
+                                    (float*)grad_weight_bf16_.raw_ptr(),
                                     eps_, num_rows, dims);
 
     if (grad_input.dtype() == DType::FP32) {
-      Tensor tmp = grad_input_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_input.data(), tmp.data(), tmp.raw_bytes());
+      metal_bridge::convert_bf16_to_fp32((const float*)grad_input_bf16_.raw_ptr(), (float*)grad_input.raw_ptr(), grad_input.size());
+      return grad_input;
     } else {
-      std::memcpy(grad_input.raw_ptr(), grad_input_bf16.raw_ptr(), grad_input_bf16.raw_bytes());
+      return grad_input_bf16_;
     }
-
-    if (grad_weight.dtype() == DType::FP32) {
-      Tensor tmp = grad_weight_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_weight.data(), tmp.data(), tmp.raw_bytes());
-    } else {
-      std::memcpy(grad_weight.raw_ptr(), grad_weight_bf16.raw_ptr(), grad_weight_bf16.raw_bytes());
-    }
-    return grad_input;
   }
 
   unsigned int num_threads = std::thread::hardware_concurrency();

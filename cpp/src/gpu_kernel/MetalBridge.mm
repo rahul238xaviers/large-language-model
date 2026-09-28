@@ -115,7 +115,7 @@ static std::vector<std::pair<size_t, id<MTLBuffer>>> activeAllocationsThisStep;
 // Page-aligned NoCopy wrappers tie the buffer to a specific host pointer, so
 // they cannot be pooled/reused for a different pointer (reuse would write into
 // stale/freed memory).  Released after the step's GPU work completes.
-static std::vector<id<MTLBuffer>> nocopyAllocationsThisStep;
+static std::unordered_map<const void*, id<MTLBuffer>> step_nocopy_cache;
 
 struct CopyBackTask {
   void *dest;
@@ -707,7 +707,7 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
       size_t aligned_len = (bytes + 16383) & ~16383;
       buf = [device newBufferWithBytesNoCopy:(void*)ptr
                                       length:aligned_len
-                                     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                                     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked
                                  deallocator:nil];
       if (buf) {
         CFRetain((__bridge CFTypeRef)buf);
@@ -736,9 +736,14 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
   
   if (is_page_aligned) {
     size_t aligned_len = (bytes + 16383) & ~16383;
+    // Check step NoCopy cache first to reuse dynamic wrappers of temporary tensors
+    auto it = step_nocopy_cache.find(ptr);
+    if (it != step_nocopy_cache.end() && [it->second length] >= aligned_len) {
+      return it->second;
+    }
     buf = [device newBufferWithBytesNoCopy:(void*)ptr
                                     length:aligned_len
-                                   options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked
+                                   options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked
                                deallocator:nil];
     if (buf) CFRetain((__bridge CFTypeRef)buf);
   }
@@ -747,9 +752,28 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
     auto &bucket = sizePool[bytes];
     if (!bucket.empty()) { buf = bucket.back(); bucket.pop_back(); }
     else {
-      buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+      buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked];
       if (buf) CFRetain((__bridge CFTypeRef)buf);
     }
+  }
+
+  if (!buf) {
+    size_t sizePool_count = 0;
+    size_t sizePool_bytes = 0;
+    for (const auto &pair : sizePool) {
+      sizePool_count += pair.second.size();
+      sizePool_bytes += pair.first * pair.second.size();
+    }
+    std::cerr << "[OOM DIAGNOSTICS]"
+              << "\n  Requested bytes: " << bytes
+              << "\n  is_page_aligned: " << (is_page_aligned ? "true" : "false")
+              << "\n  step_nocopy_cache size: " << step_nocopy_cache.size()
+              << "\n  persistent_fallback_cache size: " << persistent_fallback_cache.size()
+              << "\n  activeAllocationsThisStep size: " << activeAllocationsThisStep.size()
+              << "\n  sizePool total buffers: " << sizePool_count
+              << "\n  sizePool total MB: " << (sizePool_bytes / (1024 * 1024))
+              << "\n  ptr_wrapper_map size: " << ptr_wrapper_map.size()
+              << std::endl;
   }
 
   if (buf) {
@@ -766,7 +790,7 @@ static id<MTLBuffer> get_or_create_buffer(const void *ptr, size_t bytes,
       // cannot be pooled and reused for a different pointer (that would write
       // into stale/freed memory and corrupt the heap).  Released after the
       // step's GPU work completes.
-      nocopyAllocationsThisStep.push_back(buf);
+      step_nocopy_cache[ptr] = buf;
     } else {
       activeAllocationsThisStep.push_back({bytes, buf});
     }
@@ -1065,9 +1089,9 @@ void fused_attn_bwd(const void *Q, const void *K, const void *V,
   id<MTLBuffer> bK = get_or_create_buffer(K, bytesKV);
   id<MTLBuffer> bV = get_or_create_buffer(V, bytesKV);
   id<MTLBuffer> bdO = get_or_create_buffer(dO, bytesDO);
-  id<MTLBuffer> bdQ = get_or_create_buffer(dQ, bytesQf, true);
-  id<MTLBuffer> bdK = get_or_create_buffer(dK, bytesKVf, true);
-  id<MTLBuffer> bdV = get_or_create_buffer(dV, bytesKVf, true);
+  id<MTLBuffer> bdQ = get_or_create_buffer(dQ, bytesQf, false);
+  id<MTLBuffer> bdK = get_or_create_buffer(dK, bytesKVf, false);
+  id<MTLBuffer> bdV = get_or_create_buffer(dV, bytesKVf, false);
   if (!bQ || !bK || !bV || !bdO || !bdQ || !bdK || !bdV) {
     std::cerr << "[fused_attn_bwd] buffer alloc failed\n"; return;
   }
@@ -1393,7 +1417,7 @@ void convert_fp32_to_bf16(const float *src, float *dst, size_t n) {
   size_t bytesDst = n * sizeof(__bf16);
 
   id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
-  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, false, false, false);
   uint32_t un = static_cast<uint32_t>(n);
 
   if (!bufSrc || !bufDst) {
@@ -1439,7 +1463,7 @@ void convert_bf16_to_fp32(const float *src, float *dst, size_t n) {
   size_t bytesDst = n * sizeof(float);
 
   id<MTLBuffer> bufSrc = get_or_create_buffer(src, bytesSrc, false, false, false);
-  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, true, false, false);
+  id<MTLBuffer> bufDst = get_or_create_buffer(dst, bytesDst, false, false, false);
   uint32_t un = static_cast<uint32_t>(n);
 
   if (!bufSrc || !bufDst) {
@@ -2084,9 +2108,9 @@ void end_scope() {
 
   // NoCopy wrappers are tied to a specific host pointer — release them (the
   // backing memory belongs to the caller, so this only drops the wrapper).
-  for (auto buf : nocopyAllocationsThisStep)
-    CFRelease((__bridge CFTypeRef)buf);
-  nocopyAllocationsThisStep.clear();
+  for (const auto &pair : step_nocopy_cache)
+    CFRelease((__bridge CFTypeRef)pair.second);
+  step_nocopy_cache.clear();
 
   // Return size-pool (copy) buffers for reuse
   for (const auto &pair : activeAllocationsThisStep)

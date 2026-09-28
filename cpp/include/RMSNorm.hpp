@@ -38,4 +38,10 @@ public:
 private:
   Tensor weight_;
   float eps_;
+
+  // Persistent BF16 gradients for GPU-based backward pass
+  mutable Tensor grad_output_bf16_;
+  mutable Tensor input_bf16_;
+  mutable Tensor grad_input_bf16_;
+  mutable Tensor grad_weight_bf16_;
 };

@@ -61,23 +61,24 @@ std::vector<std::vector<int>> DataIngestion::get_batch() {
   std::vector<std::vector<int>> batch;
   batch.reserve(batch_size_);
 
-  size_t available = token_batches_.size() - current_batch_idx_;
-  size_t batch_count = std::min(batch_size_, available);
-
-  if (batch_count == 0) {
-    return {}; // End of data
+  if (token_batches_.empty()) {
+    return {};
   }
 
-  batch.assign(token_batches_.begin() + current_batch_idx_,
-               token_batches_.begin() + current_batch_idx_ + batch_count);
-  current_batch_idx_ += batch_count;
+  for (size_t i = 0; i < batch_size_; ++i) {
+    if (current_batch_idx_ >= token_batches_.size()) {
+      current_batch_idx_ = 0; // Wrap around to the start of the token stream
+    }
+    batch.push_back(token_batches_[current_batch_idx_++]);
+  }
   return batch;
 }
 
 void DataIngestion::skip_sequences(size_t num_sequences) {
-  size_t available = token_batches_.size() - current_batch_idx_;
-  size_t to_skip = std::min(num_sequences, available);
-  current_batch_idx_ += to_skip;
-  if (getenv("VERBOSE")) std::cout << "[INFO] Resume | Skipped " << to_skip << " already-processed sequences (" 
-            << to_skip * (sequence_length_ + 1) << " tokens) from data stream." << std::endl;
+  if (token_batches_.empty()) return;
+  current_batch_idx_ = (current_batch_idx_ + num_sequences) % token_batches_.size();
+  if (getenv("VERBOSE")) {
+    std::cout << "[INFO] Resume | Skipped " << num_sequences << " already-processed sequences (" 
+              << num_sequences * (sequence_length_ + 1) << " tokens) from data stream." << std::endl;
+  }
 }

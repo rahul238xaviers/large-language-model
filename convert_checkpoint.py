@@ -37,10 +37,8 @@ def read_safetensors(filepath: str) -> dict:
             f.seek(8 + header_size + start)
             raw = f.read(end - start)
             if dtype_str == "BF16":
-                arr = np.frombuffer(raw, dtype=np.uint16).astype(np.float32)
-                # bf16 → f32: left-shift by 16 bits
-                arr = arr.view(np.uint32) << 16
-                arr = arr.view(np.float32)
+                arr = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+                arr = (arr << 16).view(np.float32)
             elif dtype_str == "F32":
                 arr = np.frombuffer(raw, dtype=np.float32)
             elif dtype_str == "U64":

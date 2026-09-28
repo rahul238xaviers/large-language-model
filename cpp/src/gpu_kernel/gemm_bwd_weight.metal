@@ -110,9 +110,9 @@ kernel void gemm_bwd_weight(
             const uint wr = grow + lr;
             const uint wc = gcol + lc;
             if (wr < M && wc < N) {
-                C[wr * N + wc] = (bfloat)((float)C[wr * N + wc] + vals[0]);
+                C[wr * N + wc] = (bfloat)vals[0];
                 if (wc + 1 < N)
-                    C[wr * N + wc + 1] = (bfloat)((float)C[wr * N + wc + 1] + vals[1]);
+                    C[wr * N + wc + 1] = (bfloat)vals[1];
             }
         }
     }

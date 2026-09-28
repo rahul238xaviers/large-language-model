@@ -155,18 +155,18 @@ public:
     bytes_ = need;
   }
 
-private:
   void grow(size_t need_bytes) {
+    size_t aligned_need = (need_bytes + 16383) & ~16383;
     char* new_ptr;
-    if (posix_memalign((void**)&new_ptr, 16384, need_bytes) != 0)
+    if (posix_memalign((void**)&new_ptr, 16384, aligned_need) != 0)
       throw std::bad_alloc();
+    release_gpu();
     if (data_) {
       std::memcpy(new_ptr, data_, bytes_ < need_bytes ? bytes_ : need_bytes);
-      metal_bridge::unregister_gpu_wrapper((float*)data_);
       std::free(data_);
     }
     data_ = new_ptr;
-    cap_bytes_ = need_bytes;
+    cap_bytes_ = aligned_need;
     metal_bridge::register_gpu_wrapper((float*)data_, &gpu_wrapper_);
   }
 };

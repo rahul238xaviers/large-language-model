@@ -44,6 +44,25 @@ struct TransformerLayer {
   mutable Tensor grad_up_;            // max shape: {B, S, I}
   mutable Tensor grad_ffn_in_;        // max shape: {B, S, H}
   mutable Tensor grad_up_in_;         // max shape: {B, S, H}
+
+  // Persistent BF16 gradients for weight parameters (GPU path)
+  mutable Tensor grad_w_gate_bf16_;
+  mutable Tensor grad_w_up_bf16_;
+  mutable Tensor grad_w_down_bf16_;
+
+  // Persistent forward activation recomputation buffers
+  mutable Tensor attn_in_;
+  mutable Tensor attn_out_;
+  mutable Tensor h_mid_;
+  mutable Tensor ffn_in_;
+  mutable Tensor gate_proj_;
+  mutable Tensor up_proj_;
+  mutable Tensor activated_;
+
+  // Persistent backward intermediate gradient buffers
+  mutable Tensor grad_h_mid_;
+  mutable Tensor grad_attn_in_;
+  mutable Tensor grad_h_in_;
 };
 
 class Transformer {
@@ -82,4 +101,14 @@ private:
   RoPE rope_;
   mutable std::vector<Tensor> h_cache_;
   mutable Tensor logits_;  // persistent logits buffer (reused across steps)
+
+  // Persistent BF16 gradients for output projection and final hidden state
+  mutable Tensor grad_output_projection_bf16_;
+  mutable Tensor grad_final_h_bf16_;
+
+  // Persistent final hidden state activation
+  mutable Tensor final_h_;
+
+  // Persistent layer-wise backpropagation outputs to prevent premature deletion
+  mutable std::vector<Tensor> grad_h_layers_;
 };

@@ -115,23 +115,8 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
 
   // Use the GPU if enabled otherwise CPU
   if (use_gpu) {
-    Tensor dy_bf16 = grad_output.to_dtype(DType::BF16);
-    Tensor g_bf16 = gate.to_dtype(DType::BF16);
-    Tensor u_bf16 = up.to_dtype(DType::BF16);
-    Tensor dg_bf16 = grad_gate.to_dtype(DType::BF16);
-    Tensor du_bf16 = grad_up.to_dtype(DType::BF16);
-
-    metal_bridge::swiglu_backward((const float*)dy_bf16.raw_ptr(), (const float*)g_bf16.raw_ptr(), (const float*)u_bf16.raw_ptr(),
-                                  (float*)dg_bf16.raw_ptr(), (float*)du_bf16.raw_ptr(), n);
-
-    if (grad_gate.dtype() == DType::FP32) {
-      Tensor tmp = dg_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_gate.data(), tmp.data(), tmp.raw_bytes());
-    }
-    if (grad_up.dtype() == DType::FP32) {
-      Tensor tmp = du_bf16.to_dtype(DType::FP32);
-      std::memcpy(grad_up.data(), tmp.data(), tmp.raw_bytes());
-    }
+    metal_bridge::swiglu_backward((const float*)grad_output.raw_ptr(), (const float*)gate.raw_ptr(), (const float*)up.raw_ptr(),
+                                  (float*)grad_gate.raw_ptr(), (float*)grad_up.raw_ptr(), n);
     return;
   }
 
