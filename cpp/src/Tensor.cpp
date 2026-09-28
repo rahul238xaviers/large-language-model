@@ -171,60 +171,133 @@ Tensor Tensor::clone() const {
   return t;
 }
 
+Tensor Tensor::to_dtype(DType target_dtype) const {
+  if (dtype_ == target_dtype) return *this;
+  Tensor res(shape_, target_dtype);
+  size_t n = num_elements();
+  if (buf_ && buf_->bytes() > 0) {
+    if (target_dtype == DType::BF16) {
+      uint16_t *dst = (uint16_t*)res.buf_->data();
+      const float *src = buf_->data_float();
+      for (size_t i = 0; i < n; ++i) dst[i] = float_to_bf16(src[i]);
+    } else {
+      float *dst = res.buf_->data_float();
+      const uint16_t *src = (const uint16_t*)buf_->data();
+      for (size_t i = 0; i < n; ++i) dst[i] = bf16_to_float(src[i]);
+    }
+  }
+  return res;
+}
+
 Tensor Tensor::matmul(const Tensor &other) const {
   if (shape_.ndim < 2 || other.shape_.ndim < 2)
     throw std::invalid_argument("Matmul requires at least 2 dimensions");
 
-  if (other.shape_.ndim == 2 && shape_.ndim != 2) {
-    const size_t K = shape_.back();
-    const size_t N = other.shape_[1];
-    if (K != other.shape_[0])
+  bool run_as_bf16 = (dtype_ == DType::BF16 || other.dtype_ == DType::BF16);
+  DType result_dtype = run_as_bf16 ? DType::BF16 : dtype_;
+
+  size_t rank = shape_.ndim;
+  Shape result_shape = shape_;
+  result_shape.dims[rank - 1] = other.shape_.back();
+
+  const char *gpu_enabled_env = std::getenv("GPU_ENABLED");
+  bool use_gpu = false;
+  if (gpu_enabled_env && std::string(gpu_enabled_env) == "1") {
+    metal_bridge::initialize();
+    if (metal_bridge::is_available()) {
+      use_gpu = true;
+    }
+  }
+
+  if (!use_gpu) {
+    Tensor a_fp32 = to_dtype(DType::FP32);
+    Tensor b_fp32 = other.to_dtype(DType::FP32);
+    Tensor res_fp32(result_shape, 0.0f, DType::FP32);
+
+    if (other.shape().ndim == 2 && shape().ndim != 2) {
+      const size_t K = shape().back();
+      const size_t N = other.shape()[1];
+      size_t M = 1;
+      for (size_t i = 0; i + 1 < shape().ndim; ++i) M *= shape().dims[i];
+
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                  (int)M, (int)N, (int)K,
+                  1.0f, a_fp32.data(), (int)K,
+                  b_fp32.data(), (int)N,
+                  0.0f, res_fp32.data(), (int)N);
+    } else {
+      size_t num_batches = 1;
+      for (size_t i = 0; i + 2 < rank; ++i) num_batches *= a_fp32.shape().dims[i];
+
+      const size_t M = a_fp32.shape().dims[rank - 2];
+      const size_t K = a_fp32.shape().dims[rank - 1];
+      const size_t N = b_fp32.shape().back();
+
+      const size_t batchA = M * K, batchB = K * N, batchC = M * N;
+
+      for (size_t b_idx = 0; b_idx < num_batches; ++b_idx) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)M, (int)N, (int)K,
+                    1.0f, a_fp32.data() + b_idx * batchA, (int)K,
+                    b_fp32.data() + b_idx * batchB, (int)N,
+                    0.0f, res_fp32.data() + b_idx * batchC, (int)N);
+      }
+    }
+    return res_fp32.to_dtype(result_dtype);
+  }
+
+  Tensor a = run_as_bf16 ? to_dtype(DType::BF16) : *this;
+  Tensor b = run_as_bf16 ? other.to_dtype(DType::BF16) : other;
+
+  if (b.shape_.ndim == 2 && a.shape_.ndim != 2) {
+    const size_t K = a.shape_.back();
+    const size_t N = b.shape_[1];
+    if (K != b.shape_[0])
       throw std::invalid_argument("Inner dimensions must match for projection");
 
     size_t M = 1;
-    for (size_t i = 0; i + 1 < shape_.ndim; ++i) M *= shape_.dims[i];
+    for (size_t i = 0; i + 1 < a.shape_.ndim; ++i) M *= a.shape_.dims[i];
 
-    Shape result_shape = shape_;
-    result_shape.dims[shape_.ndim - 1] = N;
-    Tensor result(result_shape, 0.0f, dtype_);
+    Shape res_shape_proj = a.shape_;
+    res_shape_proj.dims[a.shape_.ndim - 1] = N;
+    Tensor result(res_shape_proj, 0.0f, result_dtype);
 
-    metal_bridge::gemm_bf16(buf_->data(), other.buf_->data(), result.buf_->data(),
+    metal_bridge::gemm_bf16(a.buf_->data(), b.buf_->data(), result.buf_->data(),
                             M, N, K, false, false);
-    return result;
+    return run_as_bf16 ? result.to_dtype(dtype_) : result;
   }
 
-  if (shape_.ndim != other.shape_.ndim)
+  if (a.shape_.ndim != b.shape_.ndim)
     throw std::invalid_argument("Batch size must match for matrix multiplication");
 
-  size_t rank = shape_.ndim;
   for (size_t i = 0; i + 2 < rank; ++i)
-    if (shape_.dims[i] != other.shape_.dims[i])
+    if (a.shape_.dims[i] != b.shape_.dims[i])
       throw std::invalid_argument("Batch dimension must match for matmul");
 
-  if (shape_.dims[rank - 1] != other.shape_.dims[rank - 2])
+  if (a.shape_.dims[rank - 1] != b.shape_.dims[rank - 2])
     throw std::invalid_argument("Inner dimensions must match for matmul");
 
-  Shape result_shape = shape_;
-  result_shape.dims[rank - 1] = other.shape_.back();
-  Tensor result(result_shape, 0.0f, dtype_);
+  Shape res_shape_batched = a.shape_;
+  res_shape_batched.dims[rank - 1] = b.shape_.back();
+  Tensor result(res_shape_batched, 0.0f, result_dtype);
 
   size_t num_batches = 1;
-  for (size_t i = 0; i + 2 < rank; ++i) num_batches *= shape_.dims[i];
+  for (size_t i = 0; i + 2 < rank; ++i) num_batches *= a.shape_.dims[i];
 
-  const size_t M = shape_.dims[rank - 2];
-  const size_t K = shape_.dims[rank - 1];
-  const size_t N = other.shape_.back();
+  const size_t M = a.shape_.dims[rank - 2];
+  const size_t K = a.shape_.dims[rank - 1];
+  const size_t N = b.shape_.back();
 
-  const size_t elem = itemsize();
+  const size_t elem = ::itemsize(result_dtype);
   const size_t batchA = M * K * elem, batchB = K * N * elem, batchC = M * N * elem;
-  for (size_t b = 0; b < num_batches; ++b)
+  for (size_t b_idx = 0; b_idx < num_batches; ++b_idx)
     metal_bridge::gemm_bf16(
-        (const char*)buf_->data() + b * batchA,
-        (const char*)other.buf_->data() + b * batchB,
-        (char*)result.buf_->data() + b * batchC,
+        (const char*)a.buf_->data() + b_idx * batchA,
+        (const char*)b.buf_->data() + b_idx * batchB,
+        (char*)result.buf_->data() + b_idx * batchC,
         M, N, K, false, false);
 
-  return result;
+  return run_as_bf16 ? result.to_dtype(dtype_) : result;
 }
 
 Tensor Tensor::transpose() const {

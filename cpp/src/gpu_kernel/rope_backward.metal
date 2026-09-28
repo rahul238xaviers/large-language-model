@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void rope_backward(device float* grad [[buffer(0)]],
+kernel void rope_backward(device bfloat* grad [[buffer(0)]],  // packed BF16
                         device const float* cos_table [[buffer(1)]],
                         device const float* sin_table [[buffer(2)]],
                         constant uint&      batch        [[buffer(3)]],
@@ -26,8 +26,8 @@ kernel void rope_backward(device float* grad [[buffer(0)]],
     float cos_val = cos_table[cos_idx];
     float sin_val = sin_table[cos_idx];
 
-    float x0 = grad[idx_0];
-    float x1 = grad[idx_1];
+    float x0 = (float)grad[idx_0];
+    float x1 = (float)grad[idx_1];
 
     float x0_new = x0 * cos_val + x1 * sin_val;
     float x1_new = x1 * cos_val - x0 * sin_val; 

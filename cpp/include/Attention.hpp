@@ -41,4 +41,24 @@ private:
   Tensor Wk_;
   Tensor Wv_;
   Tensor Wo_;
+
+  // Persistent BF16 gradients for attention heads
+  mutable Tensor grad_q4_bf16_;
+  mutable Tensor grad_k4_bf16_;
+  mutable Tensor grad_v4_bf16_;
+
+  // Persistent BF16 gradients for attention weights
+  mutable Tensor grad_Wq_bf16_;
+  mutable Tensor grad_Wk_bf16_;
+  mutable Tensor grad_Wv_bf16_;
+  mutable Tensor grad_Wo_bf16_;
+
+  // Persistent forward activation recomputation buffers
+  mutable Tensor x_aligned_;
+  mutable Tensor grad_output_aligned_;
+  mutable Tensor q4_;
+  mutable Tensor k4_;
+  mutable Tensor v4_;
+  mutable Tensor attn_output_;
+  mutable Tensor grad_attn_output_;
 };

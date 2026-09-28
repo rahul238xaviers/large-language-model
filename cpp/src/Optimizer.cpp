@@ -14,6 +14,7 @@
 #include "Optimizer.hpp"
 #include "gpu_kernel/MetalBridge.hpp"
 #include <stdexcept>
+#include<iostream>
 #include <vector>
 #include <thread>
 #include <cmath>
@@ -98,9 +99,10 @@ static void adamw_update_parameter(
     float lr, float beta1, float beta2, float eps, float weight_decay,
     float bias_correction1, float bias_correction2) {
   size_t n = param.size();
-  // hACK: param may be BF16 but size() should still return element count
-  fprintf(stderr, "[OPT] param.size()=%zu itemsize=%zu bytes=%zu\n",
-          n, param.itemsize(), param.raw_bytes());
+  if (getenv("DEBUG_OPT")) {
+    fprintf(stderr, "[OPT] param.size()=%zu itemsize=%zu bytes=%zu\n",
+            n, param.itemsize(), param.raw_bytes());
+  }
   float *p_data = param.data();
   const float *g_data = grad.data();
   float *m_data = m.data();
@@ -124,6 +126,38 @@ static void adamw_update_parameter(
   p.bias_correction1 = bias_correction1;
   p.bias_correction2 = bias_correction2;
   p.n = static_cast<uint32_t>(n);
+
+  static size_t opt_call_idx = 0;
+  if (getenv("DEBUG_STATS") && opt_call_idx < 3) {
+    float g0 = g_data ? g_data[0] : 0.0f;
+    float m0 = m_data ? m_data[0] : 0.0f;
+    float v0 = v_data ? v_data[0] : 0.0f;
+    float p0 = 0.0f;
+    if (param.dtype() == DType::BF16) {
+      uint16_t raw = ((const uint16_t*)param.raw_ptr())[0];
+      uint32_t u32 = static_cast<uint32_t>(raw) << 16;
+      std::memcpy(&p0, &u32, sizeof(float));
+    } else {
+      p0 = p_data ? p_data[0] : 0.0f;
+    }
+    float m_next = beta1 * m0 + (1.0f - beta1) * g0;
+    float v_next = beta2 * v0 + (1.0f - beta2) * g0 * g0;
+    float m_hat = m_next / bias_correction1;
+    float v_hat = v_next / bias_correction2;
+    float delta = -lr * (m_hat / (std::sqrt(v_hat) + eps)) - lr * weight_decay * p0;
+    float p_next = p0 + delta;
+
+    std::cout << "\n[ADAMW-DEBUG Param #" << opt_call_idx << "]\n"
+              << "  old_weight:       " << p0 << "\n"
+              << "  grad:             " << g0 << "\n"
+              << "  m (first moment): " << m_next << "\n"
+              << "  v (sec moment):   " << v_next << "\n"
+              << "  lr * update_step: " << delta << "\n"
+              << "  new_weight:       " << p_next << "\n"
+              << "  (lr=" << lr << ", eps=" << eps << ", bc1=" << bias_correction1 << ", bc2=" << bias_correction2 << ")\n"
+              << std::endl;
+    opt_call_idx++;
+  }
 
   metal_bridge::adamw_step(p_data, g_data, m_data, v_data, p);
 }

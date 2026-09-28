@@ -17,11 +17,11 @@ inline float simd_sum_f(float v) {
 }
 
 kernel void fused_backward_add_norm(
-    device const bfloat* grad_output [[buffer(0)]],
-    device const bfloat* input       [[buffer(1)]],
-    device const float*  weight      [[buffer(2)]],
-    device const bfloat* residual    [[buffer(3)]],
-    device bfloat*       grad_input  [[buffer(4)]],
+    device const bfloat* grad_output [[buffer(0)]], // BF16
+    device const bfloat* input       [[buffer(1)]], // BF16
+    device const bfloat*  weight      [[buffer(2)]], // BF16
+    device const bfloat* residual    [[buffer(3)]], // BF16
+    device bfloat*       grad_input  [[buffer(4)]], // BF16
     constant uint&       D           [[buffer(5)]],
     constant float&      eps         [[buffer(6)]],
     uint row_idx [[threadgroup_position_in_grid]],
@@ -31,6 +31,8 @@ kernel void fused_backward_add_norm(
     uint ln_id   [[thread_index_in_simdgroup]]
 ) {
     threadgroup float scratch[8];
+    threadgroup float shared_rms;
+    threadgroup float shared_sum_gwx;
     uint base = row_idx * D;
 
     float local_sq = 0.0f;
@@ -42,11 +44,10 @@ kernel void fused_backward_add_norm(
     if (ln_id == 0) scratch[sg_id] = warp_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float rms;
-    if (sg_id == 0) {
-        float total = (ln_id < 8) ? scratch[ln_id] : 0.0f;
-        total = simd_sum_f(total);
-        if (ln_id == 0) rms = sqrt(total / (float)D + eps);
+    if (tid == 0) {
+        float total = scratch[0] + scratch[1] + scratch[2] + scratch[3] +
+                      scratch[4] + scratch[5] + scratch[6] + scratch[7];
+        shared_rms = sqrt(total / (float)D + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -54,31 +55,30 @@ kernel void fused_backward_add_norm(
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
         float g = (float)grad_output[idx];
-        float w = weight[c];
+        float w = (float)weight[c];
         float x = (float)input[idx];
-        float xhat = x / rms;
+        float xhat = x / shared_rms;
         local_gwx += g * w * xhat;
     }
     float warp_gwx = simd_sum_f(local_gwx);
     if (ln_id == 0) scratch[sg_id] = warp_gwx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float sum_gwx;
-    if (sg_id == 0) {
-        float total = (ln_id < 8) ? scratch[ln_id] : 0.0f;
-        total = simd_sum_f(total);
-        if (ln_id == 0) sum_gwx = total / (float)D;
+    if (tid == 0) {
+        float total = scratch[0] + scratch[1] + scratch[2] + scratch[3] +
+                      scratch[4] + scratch[5] + scratch[6] + scratch[7];
+        shared_sum_gwx = total / (float)D;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
         float g  = (float)grad_output[idx];
-        float w  = weight[c];
+        float w  = (float)weight[c];
         float x  = (float)input[idx];
         float r  = (float)residual[idx];
-        float xhat = x / rms;
-        float dx = (1.0f / rms) * (g * w - xhat * sum_gwx) + r;
+        float xhat = x / shared_rms;
+        float dx = (1.0f / shared_rms) * (g * w - xhat * shared_sum_gwx) + r;
         grad_input[idx] = (bfloat)dx;
     }
 }

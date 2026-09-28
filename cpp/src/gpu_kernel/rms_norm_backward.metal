@@ -111,37 +111,3 @@ kernel void rms_norm_backward_dx(
         inv_rms_buf[row_idx] = 1.0f / rms;
     }
 }
-
-// Pass 2: Compute weight gradient dw parallel across columns (coalesced, non-atomic)
-kernel void rms_norm_backward_dw(
-    device const bfloat* grad_output     [[buffer(0)]],
-    device const bfloat* input           [[buffer(1)]],
-    device const float*  inv_rms_buf     [[buffer(2)]],
-    device bfloat*       grad_weight     [[buffer(3)]],
-    constant uint&       num_rows        [[buffer(4)]],
-    constant uint&       dims            [[buffer(5)]],
-    uint3                ti              [[thread_position_in_threadgroup]]
-) {
-    uint tid = ti.x;
-    uint col_idx = tid * 4;
-    if (col_idx >= dims) return;
-    
-    float4 dw = float4(0.0f);
-    
-    // Loop over all rows (B * S)
-    for (uint i = 0; i < num_rows; ++i) {
-        float inv_rms = inv_rms_buf[i];
-        
-        bfloat4 x_bf  = *((device const bfloat4*)(input + i * dims + col_idx));
-        bfloat4 dy_bf = *((device const bfloat4*)(grad_output + i * dims + col_idx));
-        
-        float4 x = float4(x_bf);
-        float4 dy = float4(dy_bf);
-        
-        float4 xhat = x * inv_rms;
-        dw += dy * xhat;
-    }
-    
-    // Write the final accumulated weight gradient using a single non-atomic store
-    *((device bfloat4*)(grad_weight + col_idx)) = (bfloat4)dw;
-}

@@ -172,26 +172,9 @@ find_program(XCRUN xcrun)
 # 2. Configure maximum sequence length for the GQA shader
 set(MAX_SEQ_LEN 1024 CACHE STRING "Maximum sequence length for GQA attention kernel")
 
-# Tiling configurations for GEMM kernels (can be customized at build time)
-set(FFN_TILE_M 64 CACHE STRING "FFN tile M dimension size")
-set(FFN_TILE_N 64 CACHE STRING "FFN tile N dimension size")
-set(FFN_TILE_K 32 CACHE STRING "FFN tile K dimension size")
-
-set(PROJ_TILE_M 128 CACHE STRING "Projection tile M dimension size")
-set(PROJ_TILE_N 128 CACHE STRING "Projection tile N dimension size")
-set(PROJ_TILE_K 32 CACHE STRING "Projection tile K dimension size")
-
 # 3. Add custom commands to compile our shaders
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/default.metallib
-    COMMAND ${XCRUN} -sdk macosx metal -c
-            -DTILE_M=${FFN_TILE_M} -DTILE_N=${FFN_TILE_N} -DTILE_K=${FFN_TILE_K}
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
-            -o ${CMAKE_BINARY_DIR}/gemm_ffn.air
-    COMMAND ${XCRUN} -sdk macosx metal -c
-            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
-            -o ${CMAKE_BINARY_DIR}/gemm_proj.air
     COMMAND ${XCRUN} -sdk macosx metal -c
             -DMAX_SEQ_LEN=${MAX_SEQ_LEN}
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
@@ -227,14 +210,6 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/cross_entropy.metal
             -o ${CMAKE_BINARY_DIR}/cross_entropy.air
     COMMAND ${XCRUN} -sdk macosx metal -c
-            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_backward.metal
-            -o ${CMAKE_BINARY_DIR}/gemm_backward.air
-    COMMAND ${XCRUN} -sdk macosx metal -c
-            -DTILE_M=${PROJ_TILE_M} -DTILE_N=${PROJ_TILE_N} -DTILE_K=${PROJ_TILE_K}
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
-            -o ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
-    COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_4d.metal
             -o ${CMAKE_BINARY_DIR}/reshape_4d.air
     COMMAND ${XCRUN} -sdk macosx metal -c
@@ -243,9 +218,6 @@ add_custom_command(
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
             -o ${CMAKE_BINARY_DIR}/rope_forward.air
-    COMMAND ${XCRUN} -sdk macosx metal -c
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_forward.metal
-            -o ${CMAKE_BINARY_DIR}/swiglu_forward.air
     COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_attn_bwd.metal
             -o ${CMAKE_BINARY_DIR}/fused_attn_bwd.air
@@ -256,11 +228,15 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16.metal
             -o ${CMAKE_BINARY_DIR}/gemm_bf16.air
     COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16_down.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_bf16_down.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bwd_weight.metal
+            -o ${CMAKE_BINARY_DIR}/gemm_bwd_weight.air
+    COMMAND ${XCRUN} -sdk macosx metal -c
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_swiglu_gemm.metal
             -o ${CMAKE_BINARY_DIR}/fused_swiglu_gemm.air
     COMMAND ${XCRUN} -sdk macosx metallib
-            ${CMAKE_BINARY_DIR}/gemm_ffn.air
-            ${CMAKE_BINARY_DIR}/gemm_proj.air
             ${CMAKE_BINARY_DIR}/gemm_gqa.air
             ${CMAKE_BINARY_DIR}/rms_norm_forward.air
             ${CMAKE_BINARY_DIR}/rms_norm_backward.air
@@ -270,22 +246,19 @@ add_custom_command(
             ${CMAKE_BINARY_DIR}/residual_add.air
             ${CMAKE_BINARY_DIR}/embedding_forward.air
             ${CMAKE_BINARY_DIR}/cross_entropy.air
-            ${CMAKE_BINARY_DIR}/gemm_backward.air
-            ${CMAKE_BINARY_DIR}/gemm_proj_trans_b.air
             ${CMAKE_BINARY_DIR}/reshape_4d.air
             ${CMAKE_BINARY_DIR}/reshape_3d.air
             ${CMAKE_BINARY_DIR}/rope_forward.air
-            ${CMAKE_BINARY_DIR}/swiglu_forward.air
             ${CMAKE_BINARY_DIR}/fused_attn_bwd.air
             ${CMAKE_BINARY_DIR}/gemm_bf16.air
             ${CMAKE_BINARY_DIR}/flash_attn_fwd.air
             ${CMAKE_BINARY_DIR}/fused_add_norm.air
             ${CMAKE_BINARY_DIR}/fused_backward_add_norm.air
             ${CMAKE_BINARY_DIR}/fused_swiglu_gemm.air
+            ${CMAKE_BINARY_DIR}/gemm_bf16_down.air
+            ${CMAKE_BINARY_DIR}/gemm_bwd_weight.air
             -o ${CMAKE_BINARY_DIR}/default.metallib
-    DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_ffn.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
+    DEPENDS ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_gqa.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_forward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rms_norm_backward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_backward.metal
@@ -296,14 +269,13 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_backward_add_norm.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/embedding_forward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/cross_entropy.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_backward.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_proj_trans_b.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_4d.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/reshape_3d.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/rope_forward.metal
-            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/swiglu_forward.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_attn_bwd.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bf16_down.metal
+            ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/gemm_bwd_weight.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/fused_swiglu_gemm.metal
             ${CMAKE_SOURCE_DIR}/cpp/src/gpu_kernel/flash_attn_fwd.metal
 )

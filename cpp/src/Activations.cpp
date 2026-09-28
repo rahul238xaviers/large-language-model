@@ -68,9 +68,11 @@ Tensor swiglu(const Tensor &gate, const Tensor &up) {
   if (gate.shape() != up.shape()) {
     throw std::invalid_argument("Dimension mismatch for SwiGLU activation");
   }
-  Tensor gated = gate;
+  // silu_ uses vDSP (float only); convert if BF16
+  Tensor gated = (gate.dtype() == DType::BF16) ? gate.to_dtype(DType::FP32) : gate;
   silu_(gated);
-  gated.mul_(up);
+  Tensor up_f = (up.dtype() == DType::BF16) ? up.to_dtype(DType::FP32) : up;
+  gated.mul_(up_f);
   return gated;
 }
 
@@ -113,7 +115,8 @@ void swiglu_backward(const Tensor &grad_output, const Tensor &gate,
 
   // Use the GPU if enabled otherwise CPU
   if (use_gpu) {
-    metal_bridge::swiglu_backward(dy_ptr, g_ptr, u_ptr, dg_ptr, du_ptr, n);
+    metal_bridge::swiglu_backward((const float*)grad_output.raw_ptr(), (const float*)gate.raw_ptr(), (const float*)up.raw_ptr(),
+                                  (float*)grad_gate.raw_ptr(), (float*)grad_up.raw_ptr(), n);
     return;
   }
 

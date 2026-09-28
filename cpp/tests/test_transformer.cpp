@@ -215,6 +215,12 @@ int main() {
     double sum_up = 0.0;
     for (size_t i = 0; i < grad_w_gate.size(); ++i) sum_gate += std::abs(grad_w_gate(i));
     for (size_t i = 0; i < grad_w_up.size(); ++i) sum_up += std::abs(grad_w_up(i));
+    std::cout << "[DEBUG] TC-06: sum_gate=" << sum_gate << ", sum_up=" << sum_up << std::endl;
+    if (grad_w_gate.size() > 0) {
+      std::cout << "[DEBUG] TC-06: grad_w_gate prefix:";
+      for (size_t i = 0; i < std::min(grad_w_gate.size(), (size_t)5); ++i) std::cout << " " << grad_w_gate(i);
+      std::cout << std::endl;
+    }
     bool pass = (sum_gate > 1e-6) && (sum_up > 1e-6);
     if (pass) passed_checks++;
     print_test_row("TC-06", "Verify FFN gate & up weight grads non-zero", "Non-Zero",

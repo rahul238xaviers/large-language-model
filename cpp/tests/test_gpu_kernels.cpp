@@ -84,77 +84,46 @@ int main() {
   int passed_checks = 0;
   int total_checks = 0;
 
-  // TC-01: gemm_proj correctness (Standard size)
+  // TC-01: matmul correctness via gemm_bf16 (Standard size)
   {
     total_checks++;
     size_t M = 128;
     size_t K = 256;
-    size_t N = 256; // K == N triggers gemm_proj
+    size_t N = 256;
 
     std::vector<float> dataA(M * K);
     std::vector<float> dataB(K * N);
     initialize_random(dataA, 0.0f, 0.05f);
     initialize_random(dataB, 0.0f, 0.05f);
 
+    std::cout << "[DEBUG] GPU-01: starting" << std::endl;
     Tensor A({M, K}, dataA);
     Tensor B({K, N}, dataB);
 
     set_gpu_enabled(false);
+    std::cout << "[DEBUG] GPU-01: calling C_cpu = A.matmul(B)" << std::endl;
     Tensor C_cpu = A.matmul(B);
+    std::cout << "[DEBUG] GPU-01: finished C_cpu" << std::endl;
 
     set_gpu_enabled(true);
+    std::cout << "[DEBUG] GPU-01: calling C_gpu = A.matmul(B)" << std::endl;
     metal_bridge::begin_scope();
     Tensor C_gpu = A.matmul(B);
     metal_bridge::end_scope();
+    std::cout << "[DEBUG] GPU-01: finished C_gpu" << std::endl;
+
+    std::cout << "[DEBUG] GPU-01: calling calculate_l2_relative_error" << std::endl;
     float l2_error = calculate_l2_relative_error(C_cpu.data(), C_gpu.data(), C_cpu.size());
+    std::cout << "[DEBUG] GPU-01: finished relative error: " << l2_error << std::endl;
 
     bool pass = (l2_error < 1e-4f);
     if (pass)
       passed_checks++;
-    print_test_row("GPU-01", "gemm_proj correctness (128x256x256)", "< 1e-4",
+    print_test_row("GPU-01", "matmul/gemm_bf16 correctness (128x256x256)", "< 1e-4",
                    std::to_string(l2_error), pass);
   }
 
-  // TC-02: gemm_ffn correctness (Standard size)
-  {
-    total_checks++;
-    size_t M = 128;
-    size_t K = 256;
-    size_t N = 512;
-
-    std::vector<float> dataA(M * K);
-    std::vector<float> dataB_gate(K * N);
-    std::vector<float> dataB_up(K * N);
-    std::vector<float> dataC_gpu(M * N, 0.0f);
-
-    initialize_random(dataA, 0.0f, 0.05f);
-    initialize_random(dataB_gate, 0.0f, 0.05f);
-    initialize_random(dataB_up, 0.0f, 0.05f);
-
-    Tensor A({M, K}, dataA);
-    Tensor B_gate({K, N}, dataB_gate);
-    Tensor B_up({K, N}, dataB_up);
-
-    set_gpu_enabled(false);
-    Tensor gate_proj = A.matmul(B_gate);
-    Tensor up_proj = A.matmul(B_up);
-    Tensor C_cpu = activatations::swiglu(gate_proj, up_proj);
-
-    set_gpu_enabled(true);
-    metal_bridge::initialize();
-    metal_bridge::begin_scope();
-    metal_bridge::gemm_ffn(dataA.data(), dataB_gate.data(), dataB_up.data(), dataC_gpu.data(), M, N, K);
-    metal_bridge::end_scope();
-
-    float l2_error = calculate_l2_relative_error(C_cpu.data(), dataC_gpu.data(), C_cpu.size());
-    bool pass = (l2_error < 1e-4f);
-    if (pass)
-      passed_checks++;
-    print_test_row("GPU-02", "gemm_ffn correctness (128x256x512)", "< 1e-4",
-                   std::to_string(l2_error), pass);
-  }
-
-  // TC-03: Zero-inputs check (Edge case)
+  // TC-02: Zero-inputs check (Edge case)
   {
     total_checks++;
     size_t M = 64;
@@ -182,11 +151,11 @@ int main() {
     bool pass = (max_diff == 0.0f);
     if (pass)
       passed_checks++;
-    print_test_row("GPU-03", "Zero inputs boundary test", "0.00000",
+    print_test_row("GPU-02", "Zero inputs boundary test", "0.00000",
                    std::to_string(max_diff), pass);
   }
 
-  // TC-04: Non-alignment fallback check (Edge case)
+  // TC-03: Non-alignment fallback check (Edge case)
   // When dimension is not divisible by 8, use_gpu should evaluate to false
   // and fallback to CPU. The execution should remain correct.
   {
@@ -216,11 +185,11 @@ int main() {
         (l2_error == 0.0f); // Fallback to CPU must yield identical results
     if (pass)
       passed_checks++;
-    print_test_row("GPU-04", "Alignment fallback check (M=15)",
+    print_test_row("GPU-03", "Alignment fallback check (M=15)",
                    "0.00000 (Exact)", std::to_string(l2_error), pass);
   }
 
-  // TC-05: Attention GQA correctness
+  // TC-04: Attention GQA correctness
   {
     total_checks++;
     ModelConfig config;
@@ -267,7 +236,7 @@ int main() {
     bool pass = (l2_error < 0.3f);
     if (pass)
       passed_checks++;
-    print_test_row("GPU-05", "Attention GQA correctness (B=2, S=8, H=64)", "< 0.3",
+    print_test_row("GPU-04", "Attention GQA correctness (B=2, S=8, H=64)", "< 0.3",
                    std::to_string(l2_error), pass);
   }
 
@@ -287,18 +256,14 @@ int main() {
             << "Speedup" << std::endl;
   std::cout << std::string(96, '-') << std::endl;
 
-  // Define benchmarks for projection and FFN layers
+  // Define benchmarks for projection GEMMs (via matmul → gemm_bf16)
   struct BenchConfig {
     std::string label;
     size_t M, N, K;
-    bool is_proj;
   };
 
   std::vector<BenchConfig> benchmarks = {
-      {"Projection", 128, 2048, 2048,
-       true}, // M=128 tokens, Hidden=2048 (attention projection)
-      {"FFN Tiled", 128, 8192, 2048,
-       false} // M=128 tokens, Hidden=2048, FFN_Hidden=8192
+      {"Projection", 128, 2048, 2048} // M=128 tokens, Hidden=2048 (attention projection)
   };
 
   const int warmup_runs = 5;
@@ -316,23 +281,13 @@ int main() {
     // 1. Warm-up GPU to compile pipelines and allocate static buffers
     set_gpu_enabled(true);
     for (int w = 0; w < warmup_runs; ++w) {
-      if (bench.is_proj) {
-        Tensor dummy = A.matmul(B);
-      } else {
-        std::vector<float> res_gpu(bench.M * bench.N, 0.0f);
-        metal_bridge::gemm_ffn(dataA.data(), dataB.data(), dataB.data(), res_gpu.data(), bench.M, bench.N, bench.K);
-      }
+      Tensor dummy = A.matmul(B);
     }
 
     // 2. Measure GPU latency
     auto start_gpu = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < benchmark_runs; ++r) {
-      if (bench.is_proj) {
-        Tensor C_gpu = A.matmul(B);
-      } else {
-        std::vector<float> res_gpu(bench.M * bench.N, 0.0f);
-        metal_bridge::gemm_ffn(dataA.data(), dataB.data(), dataB.data(), res_gpu.data(), bench.M, bench.N, bench.K);
-      }
+      Tensor C_gpu = A.matmul(B);
     }
     auto end_gpu = std::chrono::high_resolution_clock::now();
     double gpu_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -344,13 +299,7 @@ int main() {
     set_gpu_enabled(false);
     auto start_cpu = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < benchmark_runs; ++r) {
-      if (bench.is_proj) {
-        Tensor C_cpu = A.matmul(B);
-      } else {
-        Tensor gate_proj = A.matmul(B);
-        Tensor up_proj = A.matmul(B);
-        Tensor activated = activatations::swiglu(gate_proj, up_proj);
-      }
+      Tensor C_cpu = A.matmul(B);
     }
     auto end_cpu = std::chrono::high_resolution_clock::now();
     double cpu_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(

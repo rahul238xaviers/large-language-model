@@ -5,7 +5,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint BM=128, BN=128, BK=32, SGM=4, SGN=4;
+constant uint BM=64, BN=128, BK=32, SGM=2, SGN=4;
+constant uint NO_LOADS = 0;
 constant uint AR=BM/SGM/8, AC=BN/SGN/8;
 
 kernel void gemm_bf16(
@@ -37,40 +38,24 @@ kernel void gemm_bf16(
     uint tr = BM * tg_id.y, tc = BN * tg_id.x;
 
     auto load_tile = [&](uint slot, uint kb) {
-        for (uint i = 0; i < 2; ++i) {
-            uint base = (tid * 2 + i) * 4;
-            uint r = base / BK, c = base % BK;
-            uint gr = tr + r, gc = kb + c;
-            if (gr < M && gc < Kdim) {
-                float4 v = *((device const float4*)(trA ? &A[gc*M+gr] : &A[gr*Kdim+gc]));
-                shA[slot][r*BK+c+0] = (bfloat)v[0]; shA[slot][r*BK+c+1] = (bfloat)v[1];
-                shA[slot][r*BK+c+2] = (bfloat)v[2]; shA[slot][r*BK+c+3] = (bfloat)v[3];
-            } else {
-                for (uint j = 0; j < 4 && base+j < BM*BK; ++j) {
-                    uint rr = (base+j)/BK, cc = (base+j)%BK;
-                    uint grr = tr+rr, gcc = kb+cc;
-                    shA[slot][base+j] = (grr<M && gcc<Kdim)
-                        ? (bfloat)(trA ? A[gcc*M+grr] : A[grr*Kdim+gcc])
-                        : (bfloat)0;
-                }
+        for (uint i = 0; i < 4; ++i) {
+            uint base = (tid * 4 + i) * 4;
+            for (uint j = 0; j < 4 && base+j < BM*BK; ++j) {
+                uint rr = (base+j)/BK, cc = (base+j)%BK;
+                uint grr = tr+rr, gcc = kb+cc;
+                shA[slot][base+j] = (grr<M && gcc<Kdim)
+                    ? ((NO_LOADS == 1) ? (bfloat)0.01h : A[trA ? (gcc*M+grr) : (grr*Kdim+gcc)])
+                    : (bfloat)0;
             }
         }
-        for (uint i = 0; i < 2; ++i) {
-            uint base = (tid * 2 + i) * 4;
-            uint r = base / BN, c = base % BN;
-            uint gr = kb + r, gc = tc + c;
-            if (gr < Kdim && gc < N) {
-                float4 v = *((device const float4*)(trB ? &B[gc*Kdim+gr] : &B[gr*N+gc]));
-                shB[slot][r*BN+c+0] = (bfloat)v[0]; shB[slot][r*BN+c+1] = (bfloat)v[1];
-                shB[slot][r*BN+c+2] = (bfloat)v[2]; shB[slot][r*BN+c+3] = (bfloat)v[3];
-            } else {
-                for (uint j = 0; j < 4 && base+j < BK*BN; ++j) {
-                    uint rr = (base+j)/BN, cc = (base+j)%BN;
-                    uint grr = kb+rr, gcc = tc+cc;
-                    shB[slot][base+j] = (grr<Kdim && gcc<N)
-                        ? (bfloat)(trB ? B[gcc*Kdim+grr] : B[grr*N+gcc])
-                        : (bfloat)0;
-                }
+        for (uint i = 0; i < 4; ++i) {
+            uint base = (tid * 4 + i) * 4;
+            for (uint j = 0; j < 4 && base+j < BK*BN; ++j) {
+                uint rr = (base+j)/BN, cc = (base+j)%BN;
+                uint grr = kb+rr, gcc = tc+cc;
+                shB[slot][base+j] = (grr<Kdim && gcc<N)
+                    ? ((NO_LOADS == 1) ? (bfloat)0.01h : B[trB ? (gcc*Kdim+grr) : (grr*N+gcc)])
+                    : (bfloat)0;
             }
         }
     };
@@ -90,15 +75,20 @@ kernel void gemm_bf16(
 
     uint NK = (Kdim + BK - 1) / BK;
 
+    // Software prefetch: load tile 0 and tile 1 up front so global loads are
+    // in flight while the first compute runs (overlaps memory latency).
     load_tile(0, 0);
+    if (NK > 1) load_tile(1, BK);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint k = 0; k < NK - 1; ++k) {
+    for (uint k = 0; k < NK; ++k) {
         compute_from(k % 2);
-        load_tile((k + 1) % 2, (k + 1) * BK);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k + 2 < NK) {
+            load_tile(k % 2, (k + 2) * BK);  // refill the slot we just consumed
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
-    compute_from((NK - 1) % 2);
 
     for (uint r = 0; r < AR; ++r) {
         for (uint c = 0; c < AC; ++c) {
@@ -106,7 +96,8 @@ kernel void gemm_bf16(
             uint gcol = tc + sgc * cps + c * 8;
             if (grow >= M || gcol >= N) continue;
             auto vals = acc[r][c].thread_elements();
-            uint lr = ln_id / 4, lc = (ln_id % 4) * 2;
+            uint lr = (ln_id/4 >> 2)*4 + (ln_id/2) % 4;
+            uint lc = (ln_id/4 & 2)*2 + (ln_id%2)*2;
             uint wr = grow + lr, wc = gcol + lc;
             if (wr < M && wc < N) {
                 C[wr * N + wc] = (bfloat)vals[0];

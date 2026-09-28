@@ -23,12 +23,12 @@ inline float warp_sum(float v) {
 }
 
 kernel void fused_add_norm(
-    device float*       x_residual [[buffer(0)]],  // h (in-place, read-write)
-    device const float* residual   [[buffer(1)]],  // attn_out or ffn_out
-    device const float* weight     [[buffer(2)]],  // norm weight [D]
-    device float*       output     [[buffer(3)]],  // normalized output
-    constant uint&      D          [[buffer(4)]],
-    constant float&     eps        [[buffer(5)]],
+    device bfloat*       x_residual [[buffer(0)]],  // h (in-place, read-write, BF16)
+    device const bfloat* residual   [[buffer(1)]],  // attn_out or ffn_out (BF16)
+    device const bfloat* weight     [[buffer(2)]],  // norm weight [D] (BF16)
+    device bfloat*       output     [[buffer(3)]],  // normalized output (BF16)
+    constant uint&       D          [[buffer(4)]],
+    constant float&      eps        [[buffer(5)]],
     uint row_idx [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tpg     [[threads_per_threadgroup]],
@@ -36,16 +36,17 @@ kernel void fused_add_norm(
     uint ln_id   [[thread_index_in_simdgroup]]
 ) {
     threadgroup float shared_sum[8];
+    threadgroup float shared_rms;
     uint base = row_idx * D;
 
     // Phase 1: load x and residual, compute merged value in register
     float local_sq = 0.0f;
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
-        float xv = x_residual[idx];
-        float rv = residual[idx];
+        float xv = (float)x_residual[idx];
+        float rv = (float)residual[idx];
         float nv = xv + rv;
-        x_residual[idx] = nv;   // write back for backward
+        x_residual[idx] = (bfloat)nv;   // write back for backward
         local_sq += nv * nv;
     }
 
@@ -54,19 +55,17 @@ kernel void fused_add_norm(
     if (ln_id == 0) shared_sum[sg_id] = warp_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: final reduction, broadcast rms
-    float rms = 0.0f;
-    if (sg_id == 0) {
-        float total = (ln_id < 8) ? shared_sum[ln_id] : 0.0f;
-        total = warp_sum(total);
-        if (ln_id == 0) rms = rsqrt(total / (float)D + eps);
+    // Phase 3: final reduction, broadcast shared_rms
+    if (tid == 0) {
+        float total = shared_sum[0] + shared_sum[1] + shared_sum[2] + shared_sum[3] +
+                      shared_sum[4] + shared_sum[5] + shared_sum[6] + shared_sum[7];
+        shared_rms = rsqrt(total / (float)D + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 4: re-read merged value from x_residual (L1-cached, no global round-trip)
-    // and write normalized output
+    // Phase 4: re-read merged value from x_residual and write normalized output
     for (uint c = tid; c < D; c += tpg) {
         uint idx = base + c;
-        output[idx] = x_residual[idx] * rms * weight[c];
+        output[idx] = (bfloat)((float)x_residual[idx] * shared_rms * (float)weight[c]);
     }
 }

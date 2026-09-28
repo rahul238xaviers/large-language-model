@@ -35,6 +35,7 @@ struct Shape {
   size_t operator[](size_t i) const { return dims[i]; }
   size_t& operator[](size_t i) { return dims[i]; }
   size_t size() const { return ndim; }
+  size_t num_elements() const { size_t n = 1; for (uint8_t i = 0; i < ndim; ++i) n *= dims[i]; return n; }
   bool empty() const { return ndim == 0; }
   size_t back() const { return dims[ndim ? ndim - 1 : 0]; }
 
@@ -154,18 +155,18 @@ public:
     bytes_ = need;
   }
 
-private:
   void grow(size_t need_bytes) {
+    size_t aligned_need = (need_bytes + 16383) & ~16383;
     char* new_ptr;
-    if (posix_memalign((void**)&new_ptr, 16384, need_bytes) != 0)
+    if (posix_memalign((void**)&new_ptr, 16384, aligned_need) != 0)
       throw std::bad_alloc();
+    release_gpu();
     if (data_) {
       std::memcpy(new_ptr, data_, bytes_ < need_bytes ? bytes_ : need_bytes);
-      metal_bridge::unregister_gpu_wrapper((float*)data_);
       std::free(data_);
     }
     data_ = new_ptr;
-    cap_bytes_ = need_bytes;
+    cap_bytes_ = aligned_need;
     metal_bridge::register_gpu_wrapper((float*)data_, &gpu_wrapper_);
   }
 };
@@ -182,8 +183,8 @@ public:
   const size_t* strides_data() const { return strides_.data(); }
   std::vector<size_t> strides() const { return std::vector<size_t>(strides_.begin(), strides_.begin() + shape_.ndim); }
   size_t itemsize() const { return ::itemsize(dtype_); }
-  size_t size() const { return buf_ ? buf_->num_elements(itemsize()) : 0; }
-  size_t num_elements() const { return buf_ ? buf_->num_elements(itemsize()) : 0; }
+  size_t size() const { return shape_.num_elements(); }
+  size_t num_elements() const { return shape_.num_elements(); }
 
   float* data() { return buf_ ? buf_->data_float() : nullptr; }
   const float* data() const { return buf_ ? buf_->data_float() : nullptr; }
@@ -195,6 +196,7 @@ public:
   size_t raw_bytes() const { return buf_ ? buf_->bytes() : 0; }
 
   Tensor clone() const;
+  Tensor to_dtype(DType target_dtype) const;
 
   void resize_storage(const Shape &new_shape) {
     size_t n = compute_size(new_shape);
