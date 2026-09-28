@@ -78,6 +78,10 @@ test_output.txt
 .DS_Store
 Thumbs.db
 
-# ── Graphify Index ──
+# ── OpenWiki & Knowledge Graphs ──
+openwiki/
 graphify-out/
-
+.graphify*
+*.graph*
+.agents/rules/graphify.md
+.agents/workflows/graphify.md
